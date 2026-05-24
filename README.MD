@@ -30,7 +30,7 @@ Longer prompts generally improve convergence. We utilize a SwinV2 Danbooru tagge
 
 This repository expects data to be pre-processed into sharded HDF5 files containing latents and tokenized prompts.
 
-To generate the dataset required for this training pipeline, please use our companion repository: **[danbooru-dataset-toolkit](https://github.com/aipracticecafe/danbooru-dataset-toolkit)**. It handles sampling, downloading, deduplication, SwinV2 prompt upsampling, and HDF5 latent encoding.
+To generate the dataset required for this training pipeline, please use our companion repository: **[danbooru-dataset-toolkit](https://github.com/deeplearningcafe/danbooru-dataset-toolkit)**. It handles sampling, downloading, deduplication, SwinV2 prompt upsampling, and HDF5 latent encoding.
 
 ## 🚀 Usage
 

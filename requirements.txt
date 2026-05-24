@@ -1,0 +1,14 @@
+bitsandbytes==0.46.1
+h5py==3.13.0
+huggingface_hub==0.29.3
+# numpy==2.3.2
+# Pillow==11.3.0
+safetensors==0.6.2
+toml==0.10.2
+# torch==2.8.0+cu126
+tqdm==4.67.1
+transformers==4.50.0
+triton==3.4.0
+wandb==0.21.2
+hf_transfer==0.1.9
+torch-linear-assignment==0.0.5

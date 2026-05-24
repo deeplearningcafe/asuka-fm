@@ -1,0 +1,15 @@
+*__pycache__
+/prepare_dataset/*
+!/prepare_dataset/shuffle_prompts.py
+*.nsys-rep
+*.qdstrm
+*.json.gz
+*.html
+*.pkl
+*.sqlite
+/profiler/hybrid_checkpointing.py
+/profiler/torch_compile_debug/
+/wandb
+/sampling
+/data
+/models

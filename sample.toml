@@ -1,0 +1,155 @@
+[prompt]
+sample_steps = 30
+
+negative_prompt = "very displeasing, displeasing, bad score, worse score, bad quality,worst quality, worst detail, patreon logo, watermark, signature, blurry, bad hands, bad anatomy, bad fingers, extra fingers, extra limbs, deformed limbs, very displeasing, displeasing, comic, speech bubble, lowres"
+height = 768
+width = 512
+cfg_scale = 6
+batch_size = 16
+
+[[prompt.subset]]
+prompt = "chigusa minori, masterpiece, absurdres, highres, newest, best quality, amazing quality, solo, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, alternate costume, interface headset \\(evangelion\\), interface headset, headgear, black bow, black bowtie, black skirt, blush, bow, bowtie, frilled sleeves, frills, heart, heart o-ring, high-waist skirt, jirai kei, long sleeves, looking at viewer, meme attire, miniskirt, o-ring, o-ring thigh strap, shirt, skirt,studded thigh strap, thigh strap, virgin killer outfit, white shirt, hair ornament, against wall, wall, holding handbag, handbag, standing, cowboy shot, smile, thighs, outdoors, white theme, day, general, masterpiece, good score, absurdres, highres, year 2024, new, best quality, amazing quality, great quality, great quality, very aesthetic, aesthetic"
+seed = 12345
+
+[[prompt.subset]]
+prompt = "1girl, hoshino ai, oshi no ko, dress, gloves, hair ornament, idol, idol clothes, long hair, looking at viewer, microphone, one eye closed, open mouth, pink dress, pink gloves, pointing, purple eyes, purple hair, solo, star-shaped pupils, star, star in eye, symbol-shaped pupils, symbol in eye, anime coloring, black shirt, brooch, frilled gloves, frilled shirt, frilled skirt, frilled sleeves, frills, hair between eyes, heart, heart brooch, jewelry, messy hair, one side up, pink shirt, pleated skirt, rabbit hair ornament, shiny clothes, shiny skin, shirt, short sleeves, skirt, solo, star \\(symbol\\), turtleneck, wing brooch, wings, yellow shirt, general, masterpiece, good score, absurdres, highres, year 2024, new, best quality, amazing quality, great quality, great quality, very aesthetic, aesthetic"
+seed = 46
+
+[[prompt.subset]]
+prompt = "yuyu \\(yuyuworks\\), yd \\(orange maru\\), suyamori, kuroida, solo, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, alternate costume, blue flower, blue skirt, blush, bow, breasts, collared shirt, flower, frills, hair bow, long sleeves, meme attire, red bow, shirt, skirt, smile, virgin killer outfit, white shirt, general, masterpiece, good score, absurdres, highres, year 2024, new, best quality, amazing quality, great quality, great quality, very aesthetic, aesthetic"
+seed = 32
+
+[[prompt.subset]]
+prompt = "yd \\(orange maru\\), solo, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, parted lips, official alternate costume, black eye patch, plugsuit, pilot suit, white bodysuit, gloves, interface headset \\(evangelion\\), plugsuit \\(evangelion\\), mecha pilot suit, white bodysuit, white gloves, interface headset, multicolored clothes, one eye covered, closed mouth, headgear, skin tight, looking at viewer,sitting on throne, castle, indoors, throne,sitting, serious, thighs, head rest, dutch angle, from below, cowboy shot, sensitive, masterpiece, good score, absurdres, highres, year 2024, new, best quality, amazing quality, great quality, great quality, very aesthetic, aesthetic"
+seed = 20
+height = 512
+width = 768
+
+[[prompt.subset]]
+prompt = "1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, solo, long hair, blue eyes, orange hair, parted lips, official alternate costume, black eye patch, plugsuit, pilot suit, white bodysuit, gloves, interface headset \\(evangelion\\), plugsuit \\(evangelion\\), mecha pilot suit, white bodysuit, white gloves, interface headset, multicolored clothes, one eye covered, closed mouth, headgear, skin tight, looking at viewer,sitting on throne, castle, indoors, throne,sitting, serious, thighs, head rest, dutch angle, from below, cowboy shot, z3zz4, sensitive, general, general, masterpiece, good score, absurdres, highres, year 2024, new, best quality, amazing quality, great quality, great quality, very aesthetic, aesthetic"
+seed = 20
+height = 512
+width = 768
+
+[[prompt.subset]]
+prompt = "1girl, albedo \\(overlord\\), overlord \\(maruyama\\),year 2023, demon girl,horns,long hair,yellow eyes,black hair,breasts,demon horns,large breasts,wings,hair between eyes,black wings,feathered wings,slit pupils,ahoge,low wings,very long hair, solo, virtual youtuber, official costume, breasts, parted lips, double v, v over eye, cowboy shot, open mouth, smile, looking at viewer, gradient background, gray background, white background, sensitive, general, masterpiece, good score, absurdres, highres, year 2024, new, best quality, amazing quality, great quality, great quality, very aesthetic, aesthetic"
+seed = 41
+
+[[prompt.subset]]
+prompt = "1girl, souryuu asuka langley \\(neon genesis evangelion\\), neon genesis evangelion,year 2023, long hair, blue eyes, orange hair, solo, virtual youtuber, alternate costume, paw pose, maid, maid apron, maid headdress,frilled apron, frilled wrist cuffs,neck ribbon, nyan,one eye closed, ;d,pink dress, pink wrist cuffs, puffy short sleeves, white apron, wrist cuffs, black ribbon,frills, hair bell, hair ornament,puffy sleeves, ribbon, short sleeves, smile,apron, bell, blush, breasts, dress,looking at viewer, open mouth, upper body, two side up, paw print, paw print background, anime screencap, general, masterpiece, good score, absurdres, highres, year 2024, new, best quality, amazing quality, great quality, great quality, very aesthetic, aesthetic"
+seed = 32
+
+[[prompt.subset]]
+prompt = "2girls, souryuu asuka langley \\(neon genesis evangelion\\), ayanami rei \\(neon genesis evangelion\\), neon genesis evangelion,year 2023, long hair, blue eyes, orange hair, virtual youtuber, smile,heart hand duo ,leaning forward,open mouth, light blush, looking at viewer, yuri, blush, breasts, red eyes, short hair, blue hair, red plugsuit, bodysuit, tokyo-3 middle school uniform, shirt, short sleeves, cowboy shot, simple background, white background, anime screencap, general, masterpiece, good score, absurdres, highres, year 2024, new, best quality, amazing quality, great quality, great quality, very aesthetic, aesthetic"
+seed = 32
+
+[[prompt.subset]]
+prompt = "2girls, souryuu asuka langley \\(neon genesis evangelion\\), ayanami rei \\(neon genesis evangelion\\), neon genesis evangelion, year 2023, long hair, blue eyes, orange hair, virtual youtuber, tokyo-3 middle school uniform, shirt, short sleeves, official alternate costume, breasts, blue hair,red eyes,short hair,breasts,bangs,hair between eyes, heart hand duo, leaning forward, open mouth, light blush, standing, cowboy shot, smile, white background, simple background,masterpiece, best quality, very aesthetic, absurdres, aesthetic, detailed, beautiful color, amazing quality, sensitive"
+seed = 55555
+
+[[prompt.subset]]
+prompt = "takeshima eku, solo, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, parted lips, official alternate costume, scenery, from side, plugsuit, pilot suit, red bodysuit, black eye patch, animal hat, cabbie hat, cat hat, black hat, gloves, hat, hat horns, jacket, mecha pilot suit, bodysuit under clothes, red gloves, red jacket, track jacket, turtleneck, turtleneck jacket, interface headset, multicolored clothes, one eye covered, cowboy shot, closed mouth, expressionless, squatting, cat, petting, headpat, full body, backstreet, cityscape, neon lights, night, moon, detailed background, masterpiece, good score, absurdres, highres, year 2024, new, best quality, amazing quality, great quality, great quality, very aesthetic, aesthetic"
+seed = 12
+
+[[prompt.subset]]
+prompt = "solo, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, official alternate costume, plugsuit \\(evangelion\\), plugsuit, pilot suit, red bodysuit, black eye patch, animal hat, cabbie hat, cat hat, black hat, gloves, hat, hat horns, jacket, mecha pilot suit, bodysuit under clothes, red gloves, red jacket, track jacket, turtleneck, turtleneck jacket, multicolored clothes, one eye covered, skin tight, amplifier, electric guitar, full body, guitar, hair ornament, instrument, long sleeves, looking at viewer, looking over eyewear, marshall amplification, music, playing instrument, skindentation, standing, sunglasses, tinted eyewear, torn clothes, torn thighhighs, torn bodysuit, yamaha pacifica, thighs, cherry blossoms, crosswalk, boom barrier, falling petals, outdoors, petals, railroad crossing, general, masterpiece, good score, absurdres, highres, year 2024, new, best quality, amazing quality, great quality, great quality, very aesthetic, aesthetic"
+seed = 4446
+
+[[prompt.subset]]
+prompt = "takeshima eku, yd \\(orange maru\\), solo, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, official alternate costume, black eye patch, plugsuit, pilot suit, white bodysuit, gloves, interface headset \\(evangelion\\), plugsuit \\(evangelion\\), mecha pilot suit, white bodysuit, white gloves, interface headset, multicolored clothes, one eye covered, closed mouth, groin, hand up, headgear, skin tight, cowboy shot, outdoors, landscape, looking afar, looking ahead, cherry blossoms, three quarter view, petals, tree, sky, clouds, pink petals, light particle, scenery, volumetric lighting, shadow, depth of field, dynamic pose, masterpiece, good score, absurdres, highres, year 2024"
+seed = 444521213
+height = 512
+width = 768
+
+[[prompt.subset]]
+prompt = "1girl, souryuu asuka langley, neon genesis evangelion, long hair, blue eyes, orange hair, solo, alternate costume, fox tail, floral print, multiple tails, animal ears, fur trim, jingle bell, print kimono, flower, looking at viewer, bare shoulders, kitsune, hair ornament, sitting against cherry blossoms in park in front of cityscape,at midnight,moon,full body, cherry blossoms, city, sitting, sensitive, masterpiece, good score, absurdres, highres, year 2024, new, best quality, amazing quality, great quality, great quality, very aesthetic, aesthetic"
+seed = 444521213
+height = 512
+width = 768
+
+[[prompt.subset]]
+prompt = "1girl, kaguya \\(cho kaguya-hime!\\), cho kaguya-hime!, animal ears, blonde hair, brown eyes, brown hair, clothing cutout, crescent, crescent hair ornament, drop shadow, four-finger heart hands, hair ornament, heart, heart hands, heart in heart hands, japanese clothes, kimono, logo, long hair, looking at viewer, nail polish, open mouth, rabbit ears, rabbit girl, red kimono, red nails, shoulder cutout, solo, sensitive, masterpiece, good score, very aesthetic, aesthetic, best quality, amazing quality, absurdres, highres, year 2024, newest"
+seed = 5131
+height = 768
+width = 512
+
+[[prompt.subset]]
+prompt = "miyase mahiru, solo, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, alternate costume, blush, parted lips, anklet, backlighting, bare shoulders, barefoot, bat \\(animal\\), blurry, blurry foreground, bracelet, cleavage, cleavage cutout, clothing cutout, collar, detached collar, dress, eyes visible through hair, fence, flower, full body, full moon, hair between eyes, hair flower, hair ornament, hand up, high heels, holding, holding shoes, holding unworn clothes, jewelry, layered dress, moon, mountain, multiple bracelets, night, open mouth, red collar, red dress, red flower, red rose, red shoes, red sleeves, rose, shoes, single sleeve, sleeveless, sleeveless dress, smile, standing, star \\(sky\\), toenails, toes, unworn shoes, sensitive, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, 2024, newest"
+seed = 225
+
+
+[[prompt.subset]]
+prompt = "takeshima eku, solo, 1girl, souryuu asuka langley, eva 02, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, official alternate costume, blush, parted lips, sitting on the hand of the robot, plugsuit, red bodysuit, gloves, interface headset \\(evangelion\\), plugsuit \\(evangelion\\), mecha pilot suit, red gloves, interface headset, multicolored clothes, skin tight, bodysuit, covered navel, multicolored bodysuit, thighs, turtleneck bodysuit, arm support, knees up, hugging own leg, full body, evangelion \\(mecha\\), serious, sad, closed mouth, robot, night, outdoors, full moon, star \\(sky\\), starry sky, sitting, from side, looking away, general, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, year 2024"
+seed = 4445
+height = 512
+width = 768
+
+
+[[prompt.subset]]
+prompt = "sora 72-iro, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, solo, parted lips, alternate costume, interface headset \\(evangelion\\), interface headset, headgear, white long skirt, black sleeveless shirt, sleeveless, shirt, skirt, long skirt, sleeveless shirt, hair ornament, against wall, wall, holding handbag, handbag, standing, cowboy shot, smile, outdoors, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, year 2024"
+seed = 33
+height = 768
+width = 512
+
+[[prompt.subset]]
+prompt = "classic \\(zildjian33\\), solo, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, official alternate costume, plugsuit \\(evangelion\\), plugsuit, pilot suit, red bodysuit, black eye patch, animal hat, cabbie hat, cat hat, black hat, gloves, hat, hat horns, jacket, mecha pilot suit, bodysuit under clothes, red gloves, red jacket, track jacket, turtleneck, turtleneck jacket, multicolored clothes, one eye covered, skin tight, amplifier, electric guitar, full body, guitar, hair ornament, instrument, long sleeves, looking at viewer, looking over eyewear, marshall amplification, music, playing instrument, skindentation, standing, sunglasses, tinted eyewear, torn clothes, torn thighhighs, torn bodysuit, yamaha pacifica, thighs, cherry blossoms, crosswalk, boom barrier, falling petals, outdoors, petals, railroad crossing, general, masterpiece, good score, very aesthetic, aesthetic, best quality, amazing quality, absurdres, highres, year 2024"
+seed = 4446
+
+[[prompt.subset]]
+prompt = "nekotoufu, solo, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, alternate costume, blush, parted lips, alternate hairstyle, black choker, black scrunchie, black skirt, center frills, choker, ear piercing, earrings, frilled shirt, frills, hair between eyes, hair ornament, hair scrunchie, high-waist skirt, jewelry, jirai kei, long hair between eyes, looking at viewer, open mouth, piercing, pink background, scrunchie, shirt, short sleeves, simple background, skirt, twintails, upper body, white shirt, dutch angle, sensitive, mature female, general, masterpiece, good score, absurdres, highres, year 2024, newest"
+seed = 127128
+
+[[prompt.subset]]
+prompt = "kawase seiki, best quality, amazing quality, masterpiece, solo, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, alternate costume, looking at viewer, grin, v, one eye closed, gyaru, school uniform, thighs, dutch angle, sensitive, mature female, general, masterpiece, good score, absurdres, highres, year 2025, newest"
+seed = 5702
+
+
+[[prompt.subset]]
+prompt = "1girl, tokisaki kurumi, tokisaki kurumi \\(spirit\\), date a live, antique firearm, asymmetrical dual wielding, black hair, breasts, dress, clock eyes, bare shoulders, dress, dual wielding, firelock, flintlock, frilled dress, frilled hairband, gun, hairband, heterochromia, lolita fashion, lolita hairband, long hair, medium breasts, musket, red dress, red eyes, ribbon, smile, symbol-shaped pupils, twintails, two-tone dress, v-shaped eyebrows, weapon, holding, yellow eyes, white background, looking at viewer, solo, general, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, year 2024"
+seed = 445
+height = 768
+width = 512
+
+[[prompt.subset]]
+prompt = "1girl, tokisaki kurumi, tokisaki kurumi \\(spirit\\), date a live, black hair, breasts, clock eyes, heterochromia, low twintails, long hair, medium breasts, red eyes, symbol-shaped pupils, twintails, yellow eyes, black jacket, black pantyhose, blue skirt, cat, hair over one eye, holding cat, neck ribbon, miniskirt, pantyhose, red ribbon, ribbon, school uniform, white shirt, white cat, closed mouth, outdoors, sitting, park bench, very long hair, looking at viewer, solo, general, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, year 2024"
+seed = 445
+height = 512
+width = 768
+
+[[prompt.subset]]
+prompt = "2girls, claire francois, rae taylor, watashi no oshi wa akuyaku reijou, :d, ^ ^, blonde hair, blue eyes, blush, white ascot, bow, brown hair, closed eyes, collared shirt, cropped jacket, drill hair, drill sidelocks, floating hair, frills, gem, hair bow, half updo, high-waist skirt, holding another's arm, jacket, long hair, long sleeves, multiple girls, purple skirt, red bow, red jacket, school uniform, shirt, short hair, skirt, smile, yuri, brown eyes, multiple girls, white shirt, ascot, blue skirt, brooch, frilled jacket, jewelry, medium breasts, very long hair, general, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, year 2024"
+seed = 91
+
+[[prompt.subset]]
+prompt = "2girls, claire francois, rae taylor, watashi no oshi wa akuyaku reijou, :d, blonde hair, blue eyes, blush, white ascot, bow, brown hair, closed eyes, collared shirt, cropped jacket, drill hair, drill sidelocks, floating hair, frills, gem, hair bow, half updo, high-waist skirt, jacket, long hair, long sleeves, multiple girls, purple skirt, red bow, red jacket, school uniform, shirt, short hair, skirt, smile, yuri, brown eyes, multiple girls, white shirt, ascot, blue skirt, brooch, frilled jacket, jewelry, medium breasts, very long hair, bug, butterfly, cowboy shot, drill sidelocks, sidelocks, holding umbrella, umbrella, general, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, year 2024"
+seed = 91999
+
+[[prompt.subset]]
+prompt = "ebifurya, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, parted lips, official alternate costume, plugsuit, pilot suit, red bodysuit, black eye patch, animal hat, cabbie hat, cat hat, black hat, gloves, hat, hat horns, jacket, mecha pilot suit, bodysuit under clothes, red gloves, red jacket, track jacket, turtleneck, turtleneck jacket, interface headset, multicolored clothes, cowboy shot, solo, sensitive, ebifurya, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, newest"
+seed = 413
+
+[[prompt.subset]]
+prompt = "toosaka asagi, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, parted lips, official alternate costume, plugsuit, pilot suit, red bodysuit, black eye patch, animal hat, cabbie hat, cat hat, black hat, gloves, hat, hat horns, jacket, mecha pilot suit, bodysuit under clothes, red gloves, red jacket, track jacket, turtleneck, turtleneck jacket, interface headset, multicolored clothes, cowboy shot, solo, sensitive, toosaka asagi, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, newest"
+seed = 414
+
+
+[[prompt.subset]]
+prompt = "sheya, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, parted lips, official alternate costume, plugsuit, pilot suit, red bodysuit, black eye patch, animal hat, cabbie hat, cat hat, black hat, gloves, hat, hat horns, jacket, mecha pilot suit, bodysuit under clothes, red gloves, red jacket, track jacket, turtleneck, turtleneck jacket, interface headset, multicolored clothes, cowboy shot, solo, sensitive, sheya, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, newest"
+seed = 415
+
+[[prompt.subset]]
+prompt = "tomose shunsaku, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, parted lips, official alternate costume, plugsuit, pilot suit, red bodysuit, black eye patch, animal hat, cabbie hat, cat hat, black hat, gloves, hat, hat horns, jacket, mecha pilot suit, bodysuit under clothes, red gloves, red jacket, track jacket, turtleneck, turtleneck jacket, interface headset, multicolored clothes, cowboy shot, solo, sensitive, tomose shunsaku, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, newest"
+seed = 416
+
+[[prompt.subset]]
+prompt = "ohisashiburi, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, parted lips, official alternate costume, plugsuit, pilot suit, red bodysuit, black eye patch, animal hat, cabbie hat, cat hat, black hat, gloves, hat, hat horns, jacket, mecha pilot suit, bodysuit under clothes, red gloves, red jacket, track jacket, turtleneck, turtleneck jacket, interface headset, multicolored clothes, cowboy shot, solo, sensitive, ohisashiburi, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, newest"
+seed = 417
+
+[[prompt.subset]]
+prompt = "piromizu, 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, parted lips, official alternate costume, interface headset \\(evangelion\\), plugsuit \\(evangelion\\), plugsuit, pilot suit, red bodysuit, black eye patch, red gloves, interface headset, multicolored clothes, one eye covered, headgear, skin tight, sitting on throne, crossed legs, head tilt, holding weapon, lance of longinus \\(evangelion\\), cowboy shot, throne, dominant, solo, sensitive, piromizu, masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, newest"
+seed = 418
+
+[[prompt.subset]]
+prompt = "momoko \\(momopoco\\), 1girl, souryuu asuka langley, neon genesis evangelion, rebuild of evangelion, evangelion: 3.0 you can \\(not\\) redo, long hair, blue eyes, orange hair, breasts, parted lips, official alternate costume, interface headset \\(evangelion\\), plugsuit \\(evangelion\\), plugsuit, pilot suit, red bodysuit, black eye patch, red gloves, interface headset, multicolored clothes, one eye covered, headgear, skin tight, sitting on throne, crossed legs, head tilt, holding weapon, lance of longinus \\(evangelion\\), cowboy shot, throne, dominant, solo, sensitive, momoko \\(momopoco\\), masterpiece, good score, absurdres, highres, very aesthetic, aesthetic, best quality, amazing quality, newest"
+seed = 419
+

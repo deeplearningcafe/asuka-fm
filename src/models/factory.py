@@ -1,6 +1,7 @@
 import torch
 from src.models.unet import Unet, UnetConfig
-from src.models.clip import Clip, ClipConfig
+from src.models.dual_stream import DualStreamDiT
+from src.models.text_encoders.clip import Clip, ClipConfig
 from src.models.vae import Vae, VaeConfig
 from src.utils.ema import EMAModel
 from safetensors.torch import load_file
@@ -10,6 +11,11 @@ import torch.nn as nn
 from functools import partial
 from typing import Any, List, Dict
 import omegaconf
+from src.models.text_encoders.text_encoders import (
+    HFTextEncoder,
+    CLIPTextEncoderWrapper,
+)
+from src.models.text_encoders.tokenizer import HFLLMTokenizer
 
 
 class ModelInspector:
@@ -105,6 +111,8 @@ def load_trainable_model(
     use_ema: bool = True,
     ema_decay: float = 0.99,
     global_rank: int = 0,
+    model_type: str = "unet",
+    model_cfg: omegaconf.DictConfig = None,
 ):
     """
     Loads models (UNet, TE, VAE) and configures them for training (gradients, dtype).
@@ -131,14 +139,67 @@ def load_trainable_model(
             if global_rank == 0:
                 print(f"  -> Found Text Encoder weights: {te_path}")
 
+    hf_te_id = getattr(model_cfg, "hf_text_encoder", None)
+    if hf_te_id:
+        if global_rank == 0:
+            print(f"Loading HuggingFace Text Encoder: {hf_te_id}")
+        text_encoder = HFTextEncoder(
+            hf_te_id,
+            torch_dtype=torch.bfloat16,
+            cache_dir=f"{models_path}/text_encoder",
+        )
+        tokenizer = HFLLMTokenizer(
+            hf_te_id,
+            cache_dir=f"{models_path}/tokenizer",
+        )
+        text_embed_dim = text_encoder.embed_dim
+    else:
+        # TODO: make a wrapper in tokenizers.py
+        raw_clip = Clip.from_pretrained(ClipConfig(), te_path).eval()
+        tokenizer = CLIPTokenizer.from_pretrained(
+            "CompVis/stable-diffusion-v1-4",
+            subfolder="tokenizer",
+            cache_dir=f"{models_path}/tokenizer",
+        )
+        text_encoder = CLIPTextEncoderWrapper(raw_clip, tokenizer)
+        text_embed_dim = 768
+
     if global_rank == 0:
         print(f"Loading model from {models_path}...")
     try:
-        unet = Unet.from_pretrained(
-            UnetConfig(use_checkpointing=use_checkpointing),
-            unet_path,
-            output_head_path=output_head_path,
-        ).eval()
+        if model_type == "dual_stream":
+            hidden_size = getattr(model_cfg, "hidden_size", 768) if model_cfg else 768
+            depth = getattr(model_cfg, "depth", 16) if model_cfg else 16
+            num_heads = getattr(model_cfg, "num_heads", 12) if model_cfg else 12
+            patch_size = getattr(model_cfg, "patch_size", 2) if model_cfg else 2
+            use_rope = (
+                getattr(model_cfg, "use_rope_text_adapter", False)
+                if model_cfg
+                else False
+            )
+
+            # TODO: channels dynamically from vae meta
+            unet = DualStreamDiT(
+                in_channels=4,
+                out_channels=4,
+                patch_size=patch_size,
+                hidden_size=hidden_size,
+                depth=depth,
+                num_heads=num_heads,
+                text_embed_dim=text_embed_dim,
+                use_checkpointing=use_checkpointing,
+                use_rope_text_adapter=use_rope,
+            )
+            # if os.path.exists(unet_path):
+            #     sd = load_file(unet_path, device="cpu")
+            #     sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+            #     unet.load_state_dict(sd, strict=False)
+        else:
+            unet = Unet.from_pretrained(
+                UnetConfig(use_checkpointing=use_checkpointing),
+                unet_path,
+                output_head_path=output_head_path,
+            ).eval()
 
         # Offload to CPU
         actual_use_ema = use_ema and (global_rank == 0)
@@ -153,17 +214,14 @@ def load_trainable_model(
                 print(f"  -> Found EMA weights: {ema_path}")
                 ema.ema_model.load_state_dict(load_file(ema_path, device="cpu"))
 
-        text_encoder = Clip.from_pretrained(ClipConfig(), te_path).eval()
+        # text_encoder = Clip.from_pretrained(ClipConfig(), te_path).eval()
 
+        # TODO: add hf vae support
         vae = Vae.from_pretrained(
             VaeConfig(), f"{models_path}/vae/diffusion_pytorch_model.safetensors"
         ).eval()
-
-        tokenizer = CLIPTokenizer.from_pretrained(
-            "CompVis/stable-diffusion-v1-4",
-            subfolder="tokenizer",
-            cache_dir=f"{models_path}/tokenizer",
-        )
+        # TODO: dynamically move to cpu
+        vae.to(device)
 
         if global_rank == 0:
             print(f"Moving models to {device} and converting to {dtype}")
@@ -259,6 +317,7 @@ def create_optimizer_param_groups(
     unet_backbone_lr_multiplier: float = 1.25,
     unet_low_lr_multiplier: float = 1.0,
     text_encoder_lr_multiplier: float = 0.5,
+    model_type: str = "unet",
 ) -> List[Dict]:
     """Creates parameter groups with specific LRs and Weight Decay rules."""
     no_decay_keywords = ["bias", "norm"]
@@ -283,61 +342,95 @@ def create_optimizer_param_groups(
                     decay.append(param)
         return decay, no_decay
 
-    unet_output_prefixes = ("conv_out.", "conv_norm_out.", "down_blocks.0.")
-    unet_high_lr_prefixes = ("time_embedding.", "down_blocks.1.", "down_blocks.2.")
-    unet_low_lr_prefixes = ("up_blocks.2.", "up_blocks.3.")
+    if model_type == "dual_stream":
+        decay, no_decay = [], []
+        for name, param in unet_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith("_orig_mod."):
+                name = name[len("_orig_mod.") :]
+            if any(k in name for k in no_decay_keywords):
+                no_decay.append(param)
+            else:
+                decay.append(param)
 
-    u_out_d, u_out_nd = [], []
-    u_high_d, u_high_nd = [], []
-    u_low_d, u_low_nd = [], []
-    u_base_d, u_base_nd = [], []
+        param_groups.append(
+            {
+                "params": decay,
+                "lr": base_lr,
+                "weight_decay": weight_decay,
+                "name": "dit_decay",
+            }
+        )
+        param_groups.append(
+            {
+                "params": no_decay,
+                "lr": base_lr,
+                "weight_decay": 0.0,
+                "name": "dit_no_decay",
+            }
+        )
+    else:
+        unet_output_prefixes = ("conv_out.", "conv_norm_out.", "down_blocks.0.")
+        unet_high_lr_prefixes = ("time_embedding.", "down_blocks.1.", "down_blocks.2.")
+        unet_low_lr_prefixes = ("up_blocks.2.", "up_blocks.3.")
 
-    for name, param in unet_model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if name.startswith("_orig_mod."):
-            name = name[len("_orig_mod.") :]
+        u_out_d, u_out_nd = [], []
+        u_high_d, u_high_nd = [], []
+        u_low_d, u_low_nd = [], []
+        u_base_d, u_base_nd = [], []
 
-        is_no_decay = any(k in name for k in no_decay_keywords)
-        target_list = None
+        for name, param in unet_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith("_orig_mod."):
+                name = name[len("_orig_mod.") :]
 
-        if name.startswith(unet_output_prefixes):
-            target_list = u_out_nd if is_no_decay else u_out_d
-        elif name.startswith(unet_high_lr_prefixes):
-            target_list = u_high_nd if is_no_decay else u_high_d
-        elif name.startswith(unet_low_lr_prefixes):
-            target_list = u_low_nd if is_no_decay else u_low_d
-        else:
-            target_list = u_base_nd if is_no_decay else u_base_d
+            is_no_decay = any(k in name for k in no_decay_keywords)
+            target_list = None
 
-        target_list.append(param)
+            if name.startswith(unet_output_prefixes):
+                target_list = u_out_nd if is_no_decay else u_out_d
+            elif name.startswith(unet_high_lr_prefixes):
+                target_list = u_high_nd if is_no_decay else u_high_d
+            elif name.startswith(unet_low_lr_prefixes):
+                target_list = u_low_nd if is_no_decay else u_low_d
+            else:
+                target_list = u_base_nd if is_no_decay else u_base_d
 
-    groups_config = [
-        (u_out_d, u_out_nd, base_lr * unet_output_lr_multiplier, "unet_output"),
-        (u_high_d, u_high_nd, base_lr * unet_high_lr_multiplier, "unet_high"),
-        (u_low_d, u_low_nd, base_lr * unet_low_lr_multiplier, "unet_low"),
-        (u_base_d, u_base_nd, base_lr * unet_backbone_lr_multiplier, "unet_backbone"),
-    ]
+            target_list.append(param)
 
-    for decay, no_decay, lr, name in groups_config:
-        if decay:
-            param_groups.append(
-                {
-                    "params": decay,
-                    "lr": lr,
-                    "weight_decay": weight_decay,
-                    "name": f"{name}_decay",
-                }
-            )
-        if no_decay:
-            param_groups.append(
-                {
-                    "params": no_decay,
-                    "lr": lr,
-                    "weight_decay": 0.0,
-                    "name": f"{name}_no_decay",
-                }
-            )
+        groups_config = [
+            (u_out_d, u_out_nd, base_lr * unet_output_lr_multiplier, "unet_output"),
+            (u_high_d, u_high_nd, base_lr * unet_high_lr_multiplier, "unet_high"),
+            (u_low_d, u_low_nd, base_lr * unet_low_lr_multiplier, "unet_low"),
+            (
+                u_base_d,
+                u_base_nd,
+                base_lr * unet_backbone_lr_multiplier,
+                "unet_backbone",
+            ),
+        ]
+
+        for decay, no_decay, lr, name in groups_config:
+            if decay:
+                param_groups.append(
+                    {
+                        "params": decay,
+                        "lr": lr,
+                        "weight_decay": weight_decay,
+                        "name": f"{name}_decay",
+                    }
+                )
+            if no_decay:
+                param_groups.append(
+                    {
+                        "params": no_decay,
+                        "lr": lr,
+                        "weight_decay": 0.0,
+                        "name": f"{name}_no_decay",
+                    }
+                )
 
     if train_te:
         # Freeze unused last layers
@@ -433,7 +526,9 @@ def create_optim(unet, text_encoder, conf: omegaconf.DictConfig):
 
         optim = AdamW8bitKahan(param_groups, lr=conf.train.lr, betas=(0.9, 0.95))
     else:
-        optim = torch.optim.AdamW(param_groups, lr=conf.train.lr, betas=(0.9, 0.95))
+        optim = torch.optim.AdamW(
+            param_groups, lr=conf.train.lr, betas=(0.9, 0.95), fused=True
+        )
 
     return optim
 

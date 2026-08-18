@@ -24,8 +24,12 @@ train:
     use_ema: False
     ema_decay: 0.999
     use_kahan_sum: False
+    use_cpu_accumulator: False
+    compile_model: True
+    gpu_peak_tflops: 5.0
 
 data:
+    dataset_type: "streaming"
     h5_path: "data" # Path to the folder
     num_workers: 4
     prefetch_factor: 6
@@ -33,8 +37,13 @@ data:
     tag_dropout: 0.1
 
 models:
+    model_type: "dual_stream"
     resume_from_checkpoint: null # Path to a checkpoint folder
     output_head_path: null
+    hf_text_encoder: "LiquidAI/LFM2.5-230M"
+    hidden_size: 512
+    depth: 12
+    num_heads: 8
 
 paths:
     models: "models" # Root path containing unet/, vae/, clip/, tokenizer/

@@ -6,6 +6,7 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as default
 import numpy as np
 import random
 import wandb
@@ -14,7 +15,7 @@ from datetime import datetime
 
 from src.diffusion.schedules import LinearSchedule, DDPMSchedule
 from src.diffusion.objectives import FlowMatchingObjective, DDPMObjective
-from src.diffusion.sampling import generate_samples, encode_tokens_batch
+from src.diffusion.sampling import generate_samples
 from src.models.factory import (
     load_trainable_model,
     create_optim,
@@ -34,6 +35,8 @@ from src.utils.checkpointing import save_checkpoint
 from src.utils.act_grad_checkpointing import (
     patch_unsloth_smart_gradient_checkpointing,
     CPUGradientAccumulator,
+    patch_torch_compile,
+    patch_compiled_autograd,
 )
 
 
@@ -44,8 +47,7 @@ class Trainer:
         self.setup_device()
         self.train_te = cfg.train.train_te
         self.cfg_dropout_prob = cfg.train.cfg_dropout_prob
-
-        self.dataloader = create_dataloader(cfg, self.global_rank)
+        self.model_type = getattr(cfg.models, "model_type", "unet")
 
         self.unet, self.text_encoder, self.vae, self.tokenizer, self.ema = (
             load_trainable_model(
@@ -60,14 +62,37 @@ class Trainer:
                 use_ema=cfg.train.get("use_ema", True),
                 ema_decay=cfg.train.get("ema_decay", 0.99),
                 global_rank=self.global_rank,
+                model_type=self.model_type,
+                model_cfg=cfg.models,
             )
+        )
+        self.dataloader = create_dataloader(
+            cfg, self.global_rank, tokenizer=self.tokenizer
+        )
+
+        # VAE empirical scaling buffers
+        vae_mean = getattr(cfg.models, "vae_mean", 0.0)
+        vae_std = getattr(cfg.models, "vae_std", 1.0 / 0.18215)
+        self.vae_mean = torch.tensor(
+            vae_mean, device=self.device, dtype=self.dtype
+        ).view(1, -1, 1, 1)
+        self.vae_std = torch.tensor(vae_std, device=self.device, dtype=self.dtype).view(
+            1, -1, 1, 1
         )
 
         self.optimizer = create_optim(self.unet, self.text_encoder, cfg)
         self.grad_offloader = None
+        # Default to False (VRAM gradient accumulation for small models <1B params)
+        self.use_cpu_accumulator = self.cfg.train.get("use_cpu_accumulator", False)
         # only for unet and bf16
-        if self.cfg.train.gradient_accumulation_steps > 1 and not self.train_te:
+        if (
+            self.use_cpu_accumulator
+            and self.cfg.train.gradient_accumulation_steps > 1
+            and not self.train_te
+        ):
             self.grad_offloader = CPUGradientAccumulator(self.unet)
+
+        # TODO: how compute total steps with streaming datasets? use compute like nanomagi
         self.lr_scheduler = create_scheduler(self.optimizer, self.dataloader, cfg)
 
         # Resume Training State (Epoch, Step, Optim State)
@@ -85,11 +110,17 @@ class Trainer:
             self.ema.step = self.global_step
 
         if cfg.train.objective == "flow_matching":
-            self.schedule = LinearSchedule(device=self.device)
+            # not invert
+            self.schedule = LinearSchedule(
+                device=self.device,
+            )
+            timestep_sampling = self.cfg.train.get("timestep_fn", "uniform")
             self.objective = FlowMatchingObjective(
                 self.schedule,
+                timestep_sampling=timestep_sampling,
                 shift=cfg.train.shift,
                 use_ot=cfg.train.get("use_ot", False),
+                use_unet_mult=False if self.model_type == "dual_stream" else True,
             )
         else:
             self.schedule = DDPMSchedule(device=self.device)
@@ -107,19 +138,37 @@ class Trainer:
                     device_ids=[self.local_rank],
                     output_device=self.local_rank,
                 )
+            self.model.register_comm_hook(state=None, hook=default.bf16_compress_hook)
+
+        self.compile_model = cfg.train.get("compile_model", True)
+        if hasattr(torch, "compile") and self.compile_model:
+            patch_torch_compile()
+            patch_compiled_autograd()
+            if self.global_rank == 0:
+                print("Compiling model and loss step with torch.compile...")
+            # TODO: compile text_encoder and vae
+            self.unet = torch.compile(self.unet)
+            # self.text_encoder = torch.compile(self.text_encoder)
+            self.vae = torch.compile(self.vae)
+            if hasattr(self.objective, "_compiled_loss_step"):
+                self.objective._compiled_loss_step = torch.compile(
+                    self.objective._compiled_loss_step
+                )
 
         # Precision & Utils
-        self.dtype = torch.bfloat16 if cfg.train.dtype == "bf16" else torch.float32
         self.scaler = (
             torch.cuda.amp.GradScaler() if self.dtype == torch.float16 else None
         )
 
-        # Precompute unconditional embeddings for CFG
-        self.uncond_tokens_dict = (
-            self._precompute_uncond() if cfg.train.cfg_dropout_prob > 0 else {}
-        )
-
         self.sample_configs = self._load_sample_configs()
+
+        unet_base = self.unet.module if self.is_ddp else self.unet
+        self.patch_size = getattr(unet_base, "patch_size", 2)
+        self.num_params = sum(
+            p.numel() for p in unet_base.parameters() if p.requires_grad
+        )
+        self.peak_tflops = cfg.train.get("gpu_peak_tflops", 165.2)
+        self.flops_factor = 7 if cfg.train.get("use_checkpointing", True) else 6
 
     def setup_device(self):
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -157,7 +206,7 @@ class Trainer:
 
         self.autocast_dtype = torch.bfloat16
         if capability[0] >= 7 and capability[0] < 8:
-            self.autocast_dtype = torch.float16
+            self.autocast_dtype = torch.float32
             torch.set_float32_matmul_precision("high")
             print("Using high precision for float32 matmul (tensor cores).")
         elif capability[0] >= 8:
@@ -174,7 +223,7 @@ class Trainer:
             )
 
         print(f"Using {self.autocast_dtype} for autocast")
-        patch_unsloth_smart_gradient_checkpointing(self.autocast_dtype)
+        # patch_unsloth_smart_gradient_checkpointing(self.autocast_dtype)
 
     def _load_sample_configs(self):
         configs = []
@@ -193,81 +242,66 @@ class Trainer:
                     configs.append(c)
         return configs
 
-    def _precompute_uncond(self):
-        # Helper to compute empty prompt embeddings for CFG
-        uncond_dict = {}
-        for tier in [77, 152, 227]:
-            tokens = self.tokenizer(
-                [""],
-                padding="max_length",
-                max_length=tier,
-                truncation=True,
-                return_tensors="pt",
-            ).input_ids
-
-            with torch.autocast(
-                device_type="cuda", dtype=self.autocast_dtype, enabled=True
-            ):
-                with torch.no_grad():
-                    te = (
-                        self.text_encoder.module
-                        if isinstance(self.text_encoder, DDP)
-                        else self.text_encoder
-                    )
-                    embeds = encode_tokens_batch(
-                        tokens.to(self.device), te, self.tokenizer, tier, self.device
-                    )
-                    uncond_dict[tier] = embeds.detach()
-        return uncond_dict
+    @torch.no_grad()
+    def _encode_vae_latents(self, images: torch.Tensor) -> torch.Tensor:
+        """In-place VAE encoding with dynamic batch slicing."""
+        latents = []
+        chunk_size = 64
+        for i in range(0, images.shape[0], chunk_size):
+            chunk = images[i : i + chunk_size].to(self.device, non_blocking=True)
+            # dist = self.vae.encode(chunk).latent_dist
+            # latents.append(dist.sample())
+            dist = self.vae.encode(chunk)
+            latents.append(dist)
+        lat = torch.cat(latents, dim=0)
+        return (lat - self.vae_mean) / self.vae_std
 
     def train_step(self, batch):
-        latents = (
-            batch[0].to(self.device, dtype=self.dtype, non_blocking=True) * 0.18215
-        )
-        # this are the tokens not the embeddings
-        cond = batch[1].to(self.device, non_blocking=True)
-        tag_weights = batch[2].to(self.device, dtype=self.dtype, non_blocking=True)
-        attention_mask = batch[3].to(self.device, non_blocking=True)
+        pos_map = None
+        # Check if raw image streaming batch (len >= 5) or precomputed latents
+        if len(batch) >= 5:
+            images, cond, mask, pos_map, tag_weights, *rest = batch
+            torch._dynamo.maybe_mark_dynamic(images, 0)
+            with torch.no_grad():
+                with torch.autocast(
+                    device_type="cuda", dtype=self.autocast_dtype, enabled=True
+                ):
+                    latents = self._encode_vae_latents(images)
+            attention_mask = mask.to(self.device, non_blocking=True)
+            pos_map = pos_map.to(self.device, non_blocking=True)
+            tag_weights = tag_weights.to(
+                self.device, dtype=self.dtype, non_blocking=True
+            )
+        else:
+            latents = (
+                batch[0].to(self.device, dtype=self.dtype, non_blocking=True) * 0.18215
+            )
+            cond = batch[1]
+            tag_weights = batch[2].to(self.device, dtype=self.dtype, non_blocking=True)
+            attention_mask = batch[3].to(self.device, non_blocking=True)
+
+        # mark as dynamic batch size, not resolution
+        torch._dynamo.maybe_mark_dynamic(latents, 0)
+        torch._dynamo.maybe_mark_dynamic(cond, 1)
+        torch._dynamo.maybe_mark_dynamic(attention_mask, 1)
+
+        bs = latents.shape[0]
+        # TODO: cache embeds of cfg
+        drop_mask = None
+        if self.cfg_dropout_prob > 0:
+            drop_mask = torch.rand(bs, device=self.device) < self.cfg_dropout_prob
 
         with torch.autocast(
             device_type="cuda", dtype=self.autocast_dtype, enabled=True
         ):
             with torch.set_grad_enabled(self.train_te):
-                te_model = (
-                    self.text_encoder.module
-                    if isinstance(self.text_encoder, DDP)
-                    else self.text_encoder
-                )
-                encoder_hidden_states = encode_tokens_batch(
+                encoder_hidden_states, attention_mask = self.text_encoder(
                     cond,
-                    te_model,
-                    self.tokenizer,
-                    max_length=cond.shape[-1],
-                    device=self.device,
+                    mask=attention_mask,
+                    drop_mask=drop_mask,
                 )
-
-                # replace cond embeds with the pre-computed uncond embed
-                tier = encoder_hidden_states.shape[1]
-
-                if self.cfg_dropout_prob > 0:
-                    # random mask for dropping prompts
-                    bs = encoder_hidden_states.shape[0]
-                    drop_mask = (
-                        torch.rand(bs, device=self.device) < self.cfg_dropout_prob
-                    )
-
-                    uncond_to_use = self.uncond_tokens_dict[tier].expand(bs, tier, -1)
-
-                    encoder_hidden_states[drop_mask] = uncond_to_use[drop_mask]
+                if drop_mask is not None and drop_mask.any():
                     tag_weights[drop_mask] = 1.0
-
-                    # empty prompt only has 2 valid tokens: BOS and EOS.
-                    # mask out the rest to prevent padding dilution
-                    empty_prompt_mask = torch.zeros(
-                        tier, dtype=torch.bool, device=self.device
-                    )
-                    empty_prompt_mask[0:2] = True
-                    attention_mask[drop_mask] = empty_prompt_mask
 
             loss, metrics = self.objective.forward(
                 self.unet,
@@ -275,6 +309,7 @@ class Trainer:
                 encoder_hidden_states,
                 tag_weights,
                 attention_mask=attention_mask,
+                pos_map=pos_map,
             )
             scaled_loss = loss / self.cfg.train.gradient_accumulation_steps
 
@@ -282,7 +317,6 @@ class Trainer:
             self.scaler.scale(scaled_loss).backward()
         else:
             scaled_loss.backward()
-        del scaled_loss
 
         return metrics
 
@@ -353,6 +387,7 @@ class Trainer:
 
                 batch_size_accum = 0
                 num_batches_epoch = 0
+                epoch_tokens_accum = 0
                 pbar = tqdm(
                     self.dataloader,
                     desc=f"Epoch {epoch + 1}/{self.cfg.train.epochs}",
@@ -378,7 +413,13 @@ class Trainer:
                     else:
                         context = contextlib.nullcontext()
 
-                    batch_size_accum += batch[0].shape[0] * self.world_size
+                    bsz = batch[0].shape[0] * self.world_size
+                    batch_size_accum += bsz
+
+                    h_dim, w_dim = batch[0].shape[2], batch[0].shape[3]
+                    img_tokens = (h_dim // self.patch_size) * (w_dim // self.patch_size)
+                    text_tokens = batch[3].sum().item()
+                    epoch_tokens_accum += bsz * img_tokens + text_tokens
 
                     with context:
                         metrics = self.train_step(batch)
@@ -524,15 +565,38 @@ class Trainer:
                                 if cumulative_time > 0
                                 else 0
                             )
+                            model_flops = 6 * self.num_params * epoch_tokens_accum
+                            hw_flops = (
+                                self.flops_factor * self.num_params * epoch_tokens_accum
+                            )
+                            tflops = (model_flops / elapsed) / 1e12
+                            hw_tflops = (hw_flops / elapsed) / 1e12
+                            mfu = (
+                                (tflops / self.peak_tflops) * 100.0
+                                if self.peak_tflops > 0
+                                else 0.0
+                            )
+                            hfu = (
+                                (hw_tflops / self.peak_tflops) * 100.0
+                                if self.peak_tflops > 0
+                                else 0.0
+                            )
                             if self.global_rank == 0:
                                 print(
                                     f"Ep {epoch + 1}, Step {self.global_step:06d}, "
                                     f"Step imgs/sec: {imagesps}, Avg imgs/sec: {avg_imagesps}"
+                                    f"mfu: {mfu}, hfu: {hfu}"
                                 )
 
                                 log_payload = {
                                     "train/imagesps": imagesps,
                                     "train/avg_imagesps": avg_imagesps,
+                                    "train/tflops": tflops,
+                                    "train/mfu": mfu,
+                                    "train/hfu": hfu,
+                                    "train/tokens_per_sec": (
+                                        epoch_tokens_accum / elapsed
+                                    ),
                                 }
                                 log_metrics(
                                     log_payload, step=self.global_step, commit=False

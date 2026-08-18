@@ -1,18 +1,334 @@
-import torch
-from torch.utils.data import Sampler
-from torch.utils.data.distributed import DistributedSampler
-from typing import List, Dict, Iterator, Optional
+import math
 import warnings
+from abc import ABC, abstractmethod
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+from tqdm import tqdm
+
+import torch
+from torch.utils.data import Dataset, Sampler
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import IterableDataset
 
 from src.data.dataset import (
     H5LatentDataset,
-    TIER_LENGTHS,
     LENGTH_TO_TIER_IDX,
     NUM_TIERS,
+    TIER_LENGTHS,
 )
 
+AESTHETIC_TIER_MAP = {-1: 4, 0: 0, 1: 1, 2: 2, 3: 3}
 
-class BucketBatchSampler(Sampler[List[int]]):
+
+class BaseBatchSampler(Sampler[List[int]], ABC):
+    """
+    Abstract base class for batch samplers with DDP rank partitioning
+    and reproducible epoch-based seed management.
+    """
+
+    def __init__(
+        self,
+        dataset_len: int,
+        dataset_ref: Optional[Dataset] = None,
+        world_size: int = 1,
+        rank: int = 0,
+        seed: Optional[int] = None,
+        drop_last: bool = False,
+    ):
+        self.world_size = world_size
+        self.rank = rank
+        self.drop_last = drop_last
+        self.epoch = 0
+
+        self.generator = torch.Generator()
+        self.seed = seed if seed is not None else torch.seed()
+        self.generator.manual_seed(self.seed + rank)
+
+        if dataset_len == 0:
+            raise ValueError("Dataset cannot be empty.")
+
+        self.num_samples_total = dataset_len
+        if world_size > 1:
+            if dataset_ref is not None:
+                sampler = DistributedSampler(
+                    dataset_ref,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False,
+                    seed=self.seed,
+                )
+                self.indices = list(sampler)
+            else:
+                indices_all = list(range(dataset_len))
+                self.indices = indices_all[rank::world_size]
+            self.num_samples = len(self.indices)
+        else:
+            self.indices = list(range(dataset_len))
+            self.num_samples = len(self.indices)
+
+    def set_epoch(self, epoch: int):
+        """Updates epoch state to vary pseudorandom shuffling per epoch."""
+        self.epoch = epoch
+        self.generator.manual_seed(self.seed + self.rank + epoch)
+
+    @abstractmethod
+    def __iter__(self) -> Iterator[List[int]]:
+        """Yields batches of integer indices."""
+        pass
+
+    @abstractmethod
+    def __len__(self) -> int:
+        """Returns the estimated number of batches per epoch."""
+        pass
+
+
+class StreamingTokenTierBatchSampler(IterableDataset):
+    """
+    Streaming tier batch sampler wrapping an IterableDataset. Buffers
+    samples from streaming shards, groups strictly by token sequence
+    length tier to eliminate padding waste, applies dynamic batch sizing,
+    and executes aesthetic curriculum sampling.
+    """
+
+    AESTHETIC_TIER_MAP = AESTHETIC_TIER_MAP
+
+    def __init__(
+        self,
+        dataset: IterableDataset,
+        base_batch_size: int,
+        tier_lengths: Optional[List[int]] = None,
+        base_sequence_length: Optional[int] = None,
+        length_penalty_power: float = 0.0,
+        drop_last: bool = False,
+        seed: Optional[int] = None,
+        world_size: int = 1,
+        rank: int = 0,
+        aesthetic_curriculum: bool = True,
+        min_batch_size: Optional[int] = None,
+        buffer_size: int = 10000,
+    ):
+        super().__init__()
+        self.dataset = dataset
+        self.base_batch_size = base_batch_size
+        self.tier_lengths = sorted(tier_lengths or TIER_LENGTHS)
+        self.num_tiers = len(self.tier_lengths)
+        self.tier_to_idx = {length: i for i, length in enumerate(self.tier_lengths)}
+        self.base_sequence_length = base_sequence_length or self.tier_lengths[0]
+        self.length_penalty_power = length_penalty_power
+        self.drop_last = drop_last
+        self.seed = seed if seed is not None else torch.seed()
+        self.world_size = world_size
+        self.rank = rank
+        self.aesthetic_curriculum = aesthetic_curriculum
+        self.min_batch_size = (
+            min_batch_size
+            if min_batch_size is not None
+            else max(1, base_batch_size // 3)
+        )
+        self.buffer_size = buffer_size
+        self.num_aesthetic_tiers = 5
+        self.epoch = 0
+
+        self.generator = torch.Generator()
+        self.generator.manual_seed(self.seed + self.rank)
+
+    def set_epoch(self, epoch: int):
+        """Updates epoch seed and propagates to underlying dataset."""
+        self.epoch = epoch
+        self.generator.manual_seed(self.seed + self.rank + epoch)
+        if hasattr(self.dataset, "set_epoch"):
+            self.dataset.set_epoch(epoch)
+        elif hasattr(getattr(self.dataset, "hf_dataset", None), "set_epoch"):
+            self.dataset.hf_dataset.set_epoch(epoch)
+
+    def _determine_tier_idx(self, seq_len: int) -> int:
+        """Maps token sequence length to closest matching tier index."""
+        if seq_len in self.tier_to_idx:
+            return self.tier_to_idx[seq_len]
+        for idx, max_len in enumerate(self.tier_lengths):
+            if seq_len <= max_len:
+                return idx
+        return self.num_tiers - 1
+
+    def _calculate_batch_size(self, tier_idx: int) -> int:
+        """
+        Calculates dynamic batch size based on sequence length.
+        Longer prompt sequences require a smaller batch size to avoid OOM.
+        """
+        if self.length_penalty_power <= 0.0:
+            return self.base_batch_size
+        tier_length = self.tier_lengths[tier_idx]
+        scale = (
+            self.base_sequence_length / max(tier_length, 1)
+        ) ** self.length_penalty_power
+        return max(1, int(round(self.base_batch_size * min(scale, 1.0))))
+
+    def _collate_batch(
+        self, batch_samples: List[Tuple[torch.Tensor, ...]]
+    ) -> Tuple[torch.Tensor, ...]:
+        """Stacks individual sample tensors into aligned batch tensors."""
+        processed_batchs = []
+        for sample in batch_samples:
+            processed_batchs.append(self.dataset._process_sample(sample))
+        images = torch.stack([s[0] for s in processed_batchs], dim=0)
+        tokens = torch.stack([s[1] for s in processed_batchs], dim=0)
+        mask = torch.stack([s[2] for s in processed_batchs], dim=0)
+        pos_map = torch.stack([s[3] for s in processed_batchs], dim=0)
+        tag_weights = torch.stack(
+            [s[4] if s[4].ndim > 0 else s[4].unsqueeze(0) for s in processed_batchs],
+            dim=0,
+        ).squeeze(-1)
+        aes_tier = torch.stack(
+            [s[5] if s[5].ndim > 0 else s[5].unsqueeze(0) for s in processed_batchs],
+            dim=0,
+        ).squeeze(-1)
+
+        return images, tokens, mask, pos_map, tag_weights, aes_tier
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, ...]]:
+        stream_iter = (
+            self.dataset.iter_raw()
+            if hasattr(self.dataset, "iter_raw")
+            else iter(self.dataset)
+        )
+        exhausted = False
+
+        while not exhausted:
+            # Fast fill buffer with raw sample
+            buffer_samples = []
+            for _ in range(self.buffer_size):
+                try:
+                    sample = next(stream_iter)
+                    buffer_samples.append(sample)
+                except StopIteration:
+                    exhausted = True
+                    break
+
+            if not buffer_samples:
+                break
+
+            # [tier_idx][aesthetic_tier_idx]
+            bins: List[List[List[Any]]] = [
+                [[] for _ in range(self.num_aesthetic_tiers)]
+                for _ in range(self.num_tiers)
+            ]
+            tier_counts = [0] * self.num_tiers
+            aes_counts = [[0] * self.num_aesthetic_tiers for _ in range(self.num_tiers)]
+
+            for sample in buffer_samples:
+                if isinstance(sample, dict):
+                    tier_val = int(sample.get("tier", self.tier_lengths[-1]))
+                    aes_raw = int(sample.get("aesthetic_tier", -1))
+                elif isinstance(sample, (tuple, list)):
+                    tokens = sample[1]
+                    aes_val = sample[5]
+                    tier_val = (
+                        tokens.shape[-1] if hasattr(tokens, "shape") else len(tokens)
+                    )
+                    aes_raw = (
+                        int(aes_val.item())
+                        if hasattr(aes_val, "item")
+                        else int(aes_val)
+                    )
+                else:
+                    tier_val = self.tier_lengths[-1]
+                    aes_raw = -1
+
+                tier_idx = self._determine_tier_idx(tier_val)
+                aes_idx = self.AESTHETIC_TIER_MAP.get(aes_raw, 4)
+
+                bins[tier_idx][aes_idx].append(sample)
+                aes_counts[tier_idx][aes_idx] += 1
+                tier_counts[tier_idx] += 1
+
+            # Shuffle indices (tier, aesthetic)
+            for t_idx in range(self.num_tiers):
+                for a_idx in range(self.num_aesthetic_tiers):
+                    items = bins[t_idx][a_idx]
+                    if items:
+                        perm = torch.randperm(len(items), generator=self.generator)
+                        bins[t_idx][a_idx] = [items[i] for i in perm.tolist()]
+
+            total_rem = sum(tier_counts)
+            initial_total = max(1, total_rem)
+
+            while total_rem > 0:
+                active_tiers = [i for i, c in enumerate(tier_counts) if c > 0]
+                if not active_tiers:
+                    break
+
+                tier_weights = torch.tensor(
+                    [tier_counts[i] for i in active_tiers],
+                    dtype=torch.float32,
+                )
+                tier_probs = tier_weights / tier_weights.sum()
+                chosen_slot = torch.multinomial(
+                    tier_probs, 1, generator=self.generator
+                ).item()
+                chosen_tier = active_tiers[chosen_slot]
+
+                target_bs = self._calculate_batch_size(chosen_tier)
+                actual_bs = min(target_bs, tier_counts[chosen_tier])
+
+                if self.drop_last and actual_bs < target_bs:
+                    tier_counts[chosen_tier] = 0
+                    total_rem = sum(tier_counts)
+                    continue
+
+                batch_samples = []
+                while len(batch_samples) < actual_bs:
+                    avail_aes = [
+                        a
+                        for a in range(self.num_aesthetic_tiers)
+                        if aes_counts[chosen_tier][a] > 0
+                    ]
+                    if not avail_aes:
+                        break
+
+                    if self.aesthetic_curriculum:
+                        prog = 1.0 - (total_rem / initial_total)
+                        p_simple = (1.0 - prog) * 0.4 + prog * 0.25
+                        p_complex = (1.0 - prog) * 0.1 + prog * 0.25
+                        weights = [
+                            p_simple if a in (1, 2) else p_complex for a in avail_aes
+                        ]
+                    else:
+                        weights = [float(aes_counts[chosen_tier][a]) for a in avail_aes]
+
+                    aes_tensor = torch.tensor(weights, dtype=torch.float32)
+                    aes_probs = aes_tensor / aes_tensor.sum()
+                    aes_slot = torch.multinomial(
+                        aes_probs, 1, generator=self.generator
+                    ).item()
+                    chosen_aes = avail_aes[aes_slot]
+
+                    num_needed = actual_bs - len(batch_samples)
+                    num_avail = aes_counts[chosen_tier][chosen_aes]
+                    take = min(num_needed, num_avail)
+
+                    src = bins[chosen_tier][chosen_aes]
+                    for _ in range(take):
+                        batch_samples.append(src.pop())
+
+                    aes_counts[chosen_tier][chosen_aes] -= take
+
+                tier_counts[chosen_tier] -= len(batch_samples)
+                total_rem -= len(batch_samples)
+
+                if len(batch_samples) >= self.min_batch_size or not self.drop_last:
+                    yield self._collate_batch(batch_samples)
+
+    def __len__(self) -> int:
+        num_samples = getattr(
+            self.dataset,
+            "num_samples",
+            getattr(self.dataset, "total_samples", 0),
+        )
+        if num_samples == 0:
+            return 0
+        return (num_samples + self.base_batch_size - 1) // max(1, self.base_batch_size)
+
+
+class BucketBatchSampler(BaseBatchSampler):
     """
     A batch sampler that groups samples by aspect ratio bucket, prompt
     length tier, and aesthetic tier. Supports dynamic batch sizing and
@@ -53,23 +369,14 @@ class BucketBatchSampler(Sampler[List[int]]):
             low_res_focus_factor: Probability multiplier for low-res.
             low_res_area_percentile: Cutoff percentile for low-res.
         """
-        super().__init__(dataset)
-        if world_size > 1:
-            # DistributedSampler logic for subsetting indices per rank
-            sampler = DistributedSampler(
-                dataset, num_replicas=world_size, rank=rank, shuffle=False, seed=seed
-            )
-            self.num_samples_total = len(dataset)
-            self.indices = list(sampler)
-            self.num_samples = len(self.indices)
-            print(
-                f"[Rank {rank}] DDP Sampler: Using {self.num_samples} / "
-                f"{self.num_samples_total} samples."
-            )
-        else:
-            self.indices = list(range(len(dataset)))
-            self.num_samples = len(dataset)
-            self.num_samples_total = self.num_samples
+        super().__init__(
+            dataset_len=len(dataset),
+            dataset_ref=dataset,
+            world_size=world_size,
+            rank=rank,
+            seed=seed,
+            drop_last=drop_last,
+        )
 
         self.dataset = dataset
         self.base_batch_size = base_batch_size
@@ -81,17 +388,7 @@ class BucketBatchSampler(Sampler[List[int]]):
             )
         self.base_sequence_length = base_sequence_length
         self.length_penalty_power = length_penalty_power
-        self.drop_last = drop_last
-        self.generator = torch.Generator()
-        self.seed = seed if seed is not None else torch.seed()
-        self.generator.manual_seed(self.seed + rank)
         self.max_batch_size_ratio = max_batch_size_ratio
-        self.world_size = world_size
-        self.rank = rank
-        self.epoch = 0
-
-        if self.num_samples == 0:
-            raise ValueError("Dataset is empty.")
 
         self.buckets_idx_list = [bucket["bucket_idx"] for bucket in dataset.bucket_info]
         self.num_buckets = len(dataset.bucket_info)
@@ -101,7 +398,6 @@ class BucketBatchSampler(Sampler[List[int]]):
         self.num_tiers = NUM_TIERS
         self.tier_lengths = TIER_LENGTHS
         self.num_aesthetic_tiers = 5
-        AESTHETIC_TIER_MAP = {-1: 4, 0: 0, 1: 1, 2: 2, 3: 3}
 
         self.bucket_id_to_internal_idx: Dict[int, int] = {}
         self.bucket_latent_areas = []

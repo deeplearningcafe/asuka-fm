@@ -12,3 +12,4 @@ triton==3.4.0
 wandb==0.21.2
 hf_transfer==0.1.9
 torch-linear-assignment==0.0.5
+omegaconf

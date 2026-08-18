@@ -32,10 +32,19 @@ class LinearSchedule(BaseSchedule):
     (Assuming t=0 is Data, t=1 is Noise)
     """
 
+    def __init__(self, device="cpu", is_inverted: bool = False):
+        super().__init__(device)
+        self.is_inverted = is_inverted
+
     def get_coefficients(self, t: torch.Tensor):
-        # t is expected to be [0, 1]
-        alpha = 1.0 - t
-        sigma = t
+        if not self.is_inverted:
+            # alpha = t, sigma = 1-t
+            alpha = t
+            sigma = 1.0 - t
+        else:
+            alpha = 1.0 - t
+            sigma = t
+
         d_alpha = -torch.ones_like(t)
         d_sigma = torch.ones_like(t)
         return alpha, sigma, d_alpha, d_sigma

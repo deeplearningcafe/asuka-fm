@@ -1,7 +1,46 @@
+import math
 import torch
 import torch.nn.functional as F
 from abc import ABC, abstractmethod
 from src.diffusion.schedules import BaseSchedule
+
+
+def logit_normal_sample(n, device, mean=0.0, std=1.0, shift=1.0):
+    """
+    Samples t from a Logit-Normal distribution.
+    Applies timeshift mathematically by adding log(shift) to the mean.
+    """
+    # For t=0 (Data), FLUX shifts logit by log(s).
+    mean = math.log(shift) if shift != 1.0 else 0.0
+    s = torch.randn(n, device=device) * std + mean
+    return torch.sigmoid(s)
+
+
+def log_normal_sigma(n, device, P_mean=-1.2, P_std=1.2, sigma_data=0.5):
+    rnd_normal = torch.randn(n, device=device)
+    sigma = (rnd_normal * P_std + P_mean).exp()
+    return sigma
+
+
+def uniform_timesteps(n, device):
+    """Standard Uniform sampling t ~ U[0, 1]"""
+    timesteps = torch.rand((n,), device=device)
+    return timesteps
+
+
+def get_timestep_sampling_fn(timestep_sampling):
+    if timestep_sampling == "logit-normal":
+
+        def sample_fn(n, device, shift=1.0):
+            return logit_normal_sample(n, device, mean=0.0, std=1.0, shift=shift)
+
+        return sample_fn
+    elif timestep_sampling == "uniform":
+
+        def sample_fn(n, device, shift=1.0):
+            return uniform_timesteps(n, device)
+
+        return sample_fn
 
 
 # based on https://github.com/bluvoll/sd-scripts-f2vae/blob/main/library/train_util.py
@@ -67,82 +106,118 @@ class DiffusionObjective(ABC):
 
 class FlowMatchingObjective(DiffusionObjective):
     """
-    Conditional Flow Matching Loss.
-    Target: Velocity v = dx/dt.
+    Conditional Flow Matching Loss supporting torch.compile optimization.
+    Target: Velocity v = dx/dt = d_alpha * x_start + d_sigma * epsilon.
     """
 
     def __init__(
-        self, schedule: BaseSchedule, shift: float = 1.0, use_ot: bool = False
+        self,
+        schedule: BaseSchedule,
+        timestep_sampling: str = "logit-normal",
+        shift: float = 1.0,
+        use_ot: bool = False,
+        use_unet_mult: bool = True,
     ):
         super().__init__(schedule)
         self.shift = shift
         self.use_ot = use_ot
+        self.use_unet_mult = use_unet_mult
+        self.timestep_sampling_fn = get_timestep_sampling_fn(timestep_sampling)
 
-    def forward(self, model, x_start, condition, weights=None, attention_mask=None):
-        b, c, h, w = x_start.shape
+    def _compute_ot_eps(self, x_start: torch.Tensor, epsilon: torch.Tensor):
+        """Computes Optimal Transport assignment in eager mode."""
+        b = x_start.shape[0]
+        data_flat = x_start.view(b, -1)
+        eps_flat = epsilon.view(b, -1)
+        _, (row_idx, col_idx) = euclidean_optimal_transport(data_flat, eps_flat)
+        eps_sorted = torch.empty_like(epsilon)
+        eps_sorted[row_idx] = epsilon[col_idx]
+        return eps_sorted
+
+    def _compiled_loss_step(
+        self,
+        model,
+        x_start,
+        condition,
+        epsilon,
+        weights=None,
+        attention_mask=None,
+        pos_map=None,
+    ):
+        """Compilable forward loss step free of graph breaks."""
+        b = x_start.shape[0]
         device = x_start.device
 
-        nt = torch.randn((b,), device=device)
-        t = torch.sigmoid(nt)
-        t = time_snr_shift(t, self.shift)
-
-        alpha, sigma, d_alpha, d_sigma = self.schedule.get_coefficients(t)
-
-        alpha = alpha.view(b, 1, 1, 1)
-        sigma = sigma.view(b, 1, 1, 1)
-
-        epsilon = torch.randn_like(x_start)
-
-        # Minibatch Optimal Transport
-        if self.use_ot:
-            data_flat = x_start.view(b, -1)
-            eps_flat = epsilon.view(b, -1)
-
-            _, (row_idx, col_idx) = euclidean_optimal_transport(data_flat, eps_flat)
-
-            # Reorder eps
-            eps_sorted = torch.empty_like(epsilon)
-            eps_sorted[row_idx] = epsilon[col_idx]
-            epsilon = eps_sorted
+        t = self.timestep_sampling_fn(b, device, shift=self.shift)
+        t_view = t.view(-1, *([1] * (x_start.ndim - 1)))
+        alpha, sigma, d_alpha, d_sigma = self.schedule.get_coefficients(t_view)
 
         x_t = alpha * x_start + sigma * epsilon
-
-        # v = d_alpha * x_start + d_sigma * epsilon
-        d_alpha = d_alpha.view(b, 1, 1, 1)
-        d_sigma = d_sigma.view(b, 1, 1, 1)
         v_target = d_alpha * x_start + d_sigma * epsilon
 
-        # SD1.5 UNet expects timesteps [0, 1000].
-        t_input = t * 1000.0
+        t_input = t
+        if self.use_unet_mult:
+            t_input = t_input * 1000
 
-        model_output = model(
-            x_t, t_input, encoder_hidden_states=condition, attention_mask=attention_mask
+        model_kwargs = {
+            "encoder_hidden_states": condition,
+            "attention_mask": attention_mask,
+        }
+        if pos_map is not None:
+            model_kwargs["pos_map"] = pos_map
+
+        model_output = model(x_t, t_input, **model_kwargs)
+
+        loss = F.mse_loss(
+            model_output.to(torch.float32),
+            v_target.to(torch.float32),
+            reduction="none",
         )
-
-        v_pred_metrics = []
-        v_true_metrics = []
-        loss = F.mse_loss(model_output, v_target, reduction="none")
-        with torch.no_grad():
-            v_pred_metrics.append(torch.norm(model_output.detach()))
-            v_true_metrics.append(torch.norm(v_target.detach()))
-            v_pred_metrics.append(torch.mean(torch.abs(model_output.detach())))
-            v_true_metrics.append(torch.mean(torch.abs(v_target.detach())))
-
         raw_loss = loss.mean(dim=[1, 2, 3])
 
-        loss = raw_loss
+        final_loss = raw_loss
         if weights is not None:
-            loss = loss * weights
-        loss = loss.mean()
+            final_loss = final_loss * weights
+        final_loss = final_loss.mean()
 
-        return loss, {
-            "loss": loss.detach(),
+        pred_norm = torch.norm(model_output.detach())
+        target_norm = torch.norm(v_target.detach())
+        pred_abs = torch.mean(torch.abs(model_output.detach()))
+        target_abs = torch.mean(torch.abs(v_target.detach()))
+
+        metrics = {
+            "loss": final_loss.detach(),
             "raw_loss": raw_loss.mean().detach(),
-            "pred_norm": v_pred_metrics[0],
-            "pred_mean_abs": v_pred_metrics[1],
-            "target_norm": v_true_metrics[0],
-            "target_mean_abs": v_true_metrics[1],
+            "pred_norm": pred_norm,
+            "pred_mean_abs": pred_abs,
+            "target_norm": target_norm,
+            "target_mean_abs": target_abs,
         }
+
+        return final_loss, metrics
+
+    def forward(
+        self,
+        model,
+        x_start,
+        condition,
+        weights=None,
+        attention_mask=None,
+        pos_map=None,
+    ):
+        epsilon = torch.randn_like(x_start)
+        if self.use_ot:
+            epsilon = self._compute_ot_eps(x_start, epsilon)
+
+        return self._compiled_loss_step(
+            model,
+            x_start,
+            condition,
+            epsilon,
+            weights=weights,
+            attention_mask=attention_mask,
+            pos_map=pos_map,
+        )
 
 
 class DDPMObjective(DiffusionObjective):

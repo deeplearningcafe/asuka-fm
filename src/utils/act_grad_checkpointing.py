@@ -1,6 +1,5 @@
 import torch
-import threading
-import queue
+import os
 from torch.utils.checkpoint import (
     _infer_device_type,
     _get_autocast_kwargs,
@@ -18,95 +17,99 @@ import warnings
 
 
 class CPUGradientAccumulator:
+    """
+    High-performance CPU Gradient Accumulator using CUDA streams and
+    pinned memory buffers. Eliminates background worker threads and queues
+    to prevent GPU starvation under high host CPU utilization.
+    """
+
     def __init__(self, model):
         self.model = model
         self.grad_buffers = {}
+        self.staging_buffers = {}
 
-        # Stream for async memory transfers
         self.copy_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
-        # Queue and worker thread for background CPU accumulation
-        self.accumulation_queue = queue.Queue()
-        self.worker_thread = threading.Thread(
-            target=self._accumulation_worker, daemon=True
-        )
-        self.worker_thread.start()
-        # The problem with the grad accum is that it's completely cpu dependant
-        # if other process is using 100% cpu then this grad accum is ultra slow
+        self.trainable_params = [p for p in model.parameters() if p.requires_grad]
+        self.num_params = len(self.trainable_params)
+        self.hook_counter = 0
+        self.micro_step = 0
 
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.grad_buffers[param] = torch.zeros(
-                    param.shape, dtype=torch.float32, device="cpu", pin_memory=True
-                )
+        for param in self.trainable_params:
+            # Pre-allocate pinned CPU buffers for zero-copy DMA transfers
+            self.grad_buffers[param] = torch.zeros(
+                param.shape,
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=True,
+            )
+            self.staging_buffers[param] = torch.zeros(
+                param.shape,
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=True,
+            )
 
-                param.register_post_accumulate_grad_hook(self._make_hook(param))
-
-    def _accumulation_worker(self):
-        """
-        Background thread that waits for GPU transfers to finish
-        and then safely adds the gradients to the CPU buffers.
-        """
-        while True:
-            task = self.accumulation_queue.get()
-            if task is None:
-                self.accumulation_queue.task_done()
-                break
-
-            grad_cpu, param, event = task
-
-            if event is not None:
-                # CPU thread waits for the async CUDA transfer to finish.
-                event.synchronize()
-
-            self.grad_buffers[param].add_(grad_cpu)
-
-            # Mark task as complete so we can join() later
-            self.accumulation_queue.task_done()
+            param.register_post_accumulate_grad_hook(self._make_hook(param))
 
     def _make_hook(self, param):
         def hook_fn(p):
             if p.grad is not None:
                 if self.copy_stream:
-                    # 1. Make copy stream wait for the compute stream to finish the gradient
+                    # Align copy stream with compute stream execution
                     self.copy_stream.wait_stream(torch.cuda.current_stream())
 
                     with torch.cuda.stream(self.copy_stream):
-                        grad_cpu = p.grad.to("cpu", non_blocking=True).float()
+                        if self.micro_step == 0:
+                            # Direct DMA copy to main CPU buffer on step 0
+                            self.grad_buffers[p].copy_(p.grad, non_blocking=True)
+                        else:
+                            # DMA copy to staging buffer on microstep > 0
+                            self.staging_buffers[p].copy_(p.grad, non_blocking=True)
 
-                        # Record an event to track when the copy completes
-                        event = torch.cuda.Event()
-                        event.record(self.copy_stream)
-
-                    # Prevent caching allocator from freeing p.grad before copy completes
+                    # Tell allocator memory is in use by copy_stream
                     p.grad.record_stream(self.copy_stream)
 
-                    # Queue the CPU addition for the background thread
-                    self.accumulation_queue.put((grad_cpu, p, event))
+                    if self.micro_step > 0:
+                        self.copy_stream.synchronize()
+                        self.grad_buffers[p].add_(self.staging_buffers[p])
                 else:
-                    grad_cpu = p.grad.to("cpu").float()
-                    self.accumulation_queue.put((grad_cpu, p, None))
+                    if self.micro_step == 0:
+                        self.grad_buffers[p].copy_(p.grad)
+                    else:
+                        self.grad_buffers[p].add_(p.grad.to("cpu"))
 
+                # Free GPU gradient tensor memory immediately
                 p.grad = None
+
+                self.hook_counter += 1
+                if self.hook_counter == self.num_params:
+                    self.hook_counter = 0
+                    self.micro_step += 1
 
         return hook_fn
 
     def finalize_and_step(self, optimizer, scaler=None, max_norm=1.0):
-        # Wait for all background accumulations to finish before stepping!
-        self.accumulation_queue.join()
+        if self.copy_stream:
+            # Wait for any remaining microstep DMA transfers to finish
+            self.copy_stream.synchronize()
 
-        for param, cpu_grad in self.grad_buffers.items():
-            if param.grad is None:
-                # Use zeros_like instead of empty_like to prevent uninitialized memory (NaNs)
-                param.grad = torch.zeros_like(param)
+            # Copy CPU accumulated gradients to GPU asynchronously
+            with torch.cuda.stream(self.copy_stream):
+                for param, cpu_grad in self.grad_buffers.items():
+                    param.grad = torch.empty_like(param)
+                    param.grad.copy_(cpu_grad, non_blocking=True)
 
-            # Use non_blocking=False. Since we immediately zero the CPU buffer below,
-            # an async copy (non_blocking=True) creates a race condition where cpu_grad is
-            # zeroed before the DMA transfer completes, sending zeroes to the GPU.
-            param.grad.copy_(cpu_grad, non_blocking=False)
+            # Synchronize CUDA streams on GPU side (0 CPU waiting)
+            torch.cuda.current_stream().wait_stream(self.copy_stream)
+        else:
+            for param, cpu_grad in self.grad_buffers.items():
+                param.grad = cpu_grad.to(param.device)
 
-            cpu_grad.zero_()
+        self.hook_counter = 0
+        self.micro_step = 0
 
+        # Synchronize gradients across DDP ranks if active
         if torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
             for param in self.grad_buffers.keys():
@@ -116,7 +119,9 @@ class CPUGradientAccumulator:
                     )
                     param.grad.div_(world_size)
 
-        # Calculate Norm & Coef on GPU
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+
         total_norm = torch.nn.utils.clip_grad_norm_(self.grad_buffers.keys(), max_norm)
 
         if scaler:
@@ -125,7 +130,6 @@ class CPUGradientAccumulator:
         else:
             optimizer.step()
 
-        # Clear GPU VRAM
         optimizer.zero_grad(set_to_none=True)
         return total_norm
 
@@ -219,35 +223,47 @@ def initialize_unsloth_gradient_checkpointing(dtype=None):
         CPU_BUFFERS.append(x)
     pass
 
-    # Allocate buffers to how many GPUs
+    # Determine total visible GPUs in the environment
     n_gpus = (
         torch.cuda.device_count() if DEVICE_TYPE == "cuda" else torch.xpu.device_count()
     )
-    GPU_BUFFERS = tuple(
-        [
-            torch.empty(2 * 256 * 2048, dtype=dtype, device=f"{DEVICE_TYPE}:{i}")
-            for i in range(n_gpus)
-        ]
+
+    # Fetch the active device index set for the current process
+    if DEVICE_TYPE == "cuda":
+        current_device_idx = torch.cuda.current_device()
+    elif DEVICE_TYPE == "xpu":
+        current_device_idx = torch.xpu.current_device()
+    else:
+        current_device_idx = 0
+
+    # Initialize a sparse container to allocate buffers only on the active GPU
+    GPU_BUFFERS = [None] * n_gpus
+    GPU_BUFFERS[current_device_idx] = torch.empty(
+        2 * 256 * 2048, dtype=dtype, device=f"{DEVICE_TYPE}:{current_device_idx}"
     )
+    GPU_BUFFERS = tuple(GPU_BUFFERS)
 
     BACKWARD_PASS = True
-    EXTRA_STREAMS = tuple(
-        [
-            torch.cuda.Stream() if DEVICE_TYPE == "cuda" else torch.xpu.Stream()
-            for i in range(n_gpus)
-        ]
-    )
+
+    # Allocate a stream only on the process's active GPU
+    EXTRA_STREAMS = [None] * n_gpus
     if DEVICE_TYPE == "cuda":
-        MAIN_STREAMS = tuple(
-            [
-                torch.cuda.default_stream(torch.device(f"cuda:{i}"))
-                for i in range(n_gpus)
-            ]
+        EXTRA_STREAMS[current_device_idx] = torch.cuda.Stream(device=current_device_idx)
+    elif DEVICE_TYPE == "xpu":
+        EXTRA_STREAMS[current_device_idx] = torch.xpu.Stream(device=current_device_idx)
+    EXTRA_STREAMS = tuple(EXTRA_STREAMS)
+
+    # Bind default streams exclusively on the process's active GPU
+    MAIN_STREAMS = [None] * n_gpus
+    if DEVICE_TYPE == "cuda":
+        MAIN_STREAMS[current_device_idx] = torch.cuda.default_stream(
+            torch.device(f"cuda:{current_device_idx}")
         )
     elif DEVICE_TYPE == "xpu":
-        MAIN_STREAMS = tuple(
-            [torch.xpu.current_stream(torch.device(f"xpu:{i}")) for i in range(n_gpus)]
+        MAIN_STREAMS[current_device_idx] = torch.xpu.current_stream(
+            torch.device(f"xpu:{current_device_idx}")
         )
+    MAIN_STREAMS = tuple(MAIN_STREAMS)
 
     # Minimum size to enable Unsloth GC is 2MB -> 32 layers = 64MB
     n_bytes = torch.finfo(dtype).bits // 8
@@ -757,6 +773,224 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         torch.utils.checkpoint, "_old_checkpoint"
     ):
         torch.utils.checkpoint.checkpoint = torch.utils.checkpoint._old_checkpoint
+
+
+pass
+
+
+# from https://github.com/unslothai/unsloth-zoo/blob/main/unsloth_zoo/patching_utils.py
+def patch_torch_compile(debug=False, O3=False, ignore_errors=True):
+    # All Unsloth Zoo code licensed under LGPLv3
+    assert type(debug) is bool
+    assert type(O3) is bool
+    import logging
+
+    if debug:
+        DEBUGGING = " with debugging"
+        os.environ["TORCHDYNAMO_VERBOSE"] = "1"
+        os.environ["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"
+        # os.environ["TORCH_LOGS"] = "dynamo,graph_breaks,recompiles,graph_code,aot_joint_graph,aot_graphs,compiled_autograd_verbose"
+        os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+        torch._logging.set_logs(
+            dynamo=logging.WARN,
+            inductor=logging.WARN,
+            graph_breaks=True,
+            recompiles=True,
+            recompiles_verbose=True,
+            compiled_autograd_verbose=False,  # Produces too much code
+            aot_joint_graph=False,  # Produces too much code
+            aot_graphs=False,  # Produces too much code
+            perf_hints=True,  # Performance improvement hints
+        )
+        torch._dynamo.config.verbose = True
+    else:
+        DEBUGGING = ""
+        os.environ.pop("TORCHDYNAMO_VERBOSE", None)
+        os.environ.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
+        os.environ.pop("TORCHINDUCTOR_FORCE_DISABLE_CACHES", None)
+        os.environ.pop("TORCH_LOGS", None)
+        torch._logging.set_logs(all=logging.CRITICAL)
+        torch._dynamo.config.verbose = False
+    pass
+    try:
+        print(
+            f"🦥 Unsloth Zoo will now patch everything{DEBUGGING} to make training faster!"
+        )
+    except:
+        print(
+            f"Unsloth Zoo will now patch everything{DEBUGGING} to make training faster!"
+        )
+    pass
+
+    os.environ["UNSLOTH_PATCHED"] = "1"
+    # See https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html
+    # Caches kernel generations for faster restarts
+    # https://dev-discuss.pytorch.org/t/impact-of-multithreading-and-local-caching-on-torch-compile/2498/3
+    os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+    os.environ["TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE"] = "1"
+    os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
+
+    # Duplicate functions will cause hashing issues
+    # os.environ["TORCHINDUCTOR_CACHE_DIR"] = UNSLOTH_COMPILE_LOCATION
+
+    # https://github.com/sayakpaul/diffusers-torchao?tab=readme-ov-file#things-to-keep-in-mind-when-benchmarking
+    os.environ["ENABLE_AOT_AUTOGRAD_CACHE"] = "1"
+
+    # Torch compile arguments
+    torch_compile_arguments = [
+        f"config.debug = {debug}",
+        "config.dce = True",
+        "config.memory_planning = True",
+        # Using 'combined' memory pool will cause re-compiles for dynamic shapres. We just re-use already allocated memory pools
+        "config.memory_pool = 'none'",
+        "config.efficient_conv_bn_eval_fx_passes = True",  # Reduces stability a little bit
+        "config.dynamic_scale_rblock = True",  # Scale down RBLOCK for better occupancy
+        # Disable reorder_for_compute_comm_overlap since it errors for non multi GPU systems
+        # "config.reorder_for_compute_comm_overlap = True", # # enable reordering pass for increasing overlap between compute and communication
+        f"config.max_autotune = {O3}",  # enable slow autotuning passes to select algorithms
+        f"config.max_autotune_pointwise = {O3}",  # enable slow autotuning passes to select pointwise/reductions algorithms
+        f"config.max_autotune_gemm = False",  # GEMM is unnecessary
+        "config.max_autotune_gemm_backends = 'ATEN,TRITON,CPP'",  # Not much faster
+        "config.autotune_fallback_to_aten = True",  # Fallback to ATEN backend
+        "config.autotune_multi_device = True",  # If autotuning in subprocess, whether to use multiple devices
+        f"config.coordinate_descent_tuning = {O3}",
+        f"config.aggressive_fusion = {O3}",  # Careful changes results!
+        # [TODO] COMBO KERNELS makes everything slower!
+        # "config.combo_kernels = True", # Experimental - enable the combo kernel that combines data-independent kernels
+        # "config.combo_kernel_foreach_dynamic_shapes = True",
+        "config.freezing = False",  # Freezes weights --> ** only useful for inference **
+        # f"config.triton.multi_kernel = {O3}", # use tuning to pick between different subkernels
+        "config.cuda.enable_cuda_lto = True",
+        "config.cuda.use_fast_math = True",
+        f"config.cuda.compile_opt_level = {'-O2' if O3 else '-O1'}",
+        # See torch.compile, the missing manual
+        # https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8
+        # f"config.emulate_precision_casts = {not debug}", # Force X.to(f32).to(f16) instead of X.to(f16)
+        # when setting to not debug aka True, we get errors on torch2.6
+        # TypeError: ValueRangeAnalysis.to_dtype() got an unexpected keyword argument 'use_compute_types'
+        # this keyword exists in torch2.7.0 but not in torch2.6.0 so set to False until torch2.6.0 is deprecated.
+    ]
+    # Torch dynamo arguments
+    torch_dynamo_arguments = [
+        "config.accumulated_cache_size_limit = 1024",  # Bump up a bit from 256
+        f"config.suppress_errors = {not debug and ignore_errors}",  # Supress errors for now
+        f"config.do_not_emit_runtime_asserts = {not debug}",
+        "config.inline_inbuilt_nn_modules = True",  # Torch 2.5 Regional recompilation
+        "config.numpy_default_float = 'float32'",
+        # FAILS for Gemma!
+        "config.compiled_autograd = False",  # New Torch 2.4 feature which can compile backwards passes
+        # https://pytorch.org/tutorials/intermediate/compiled_autograd_tutorial.html
+        # [NOTE] recompile_limit and cache_size_limit are equivalent!
+        "config.recompile_limit = 1024",  # Increase recompile amounts to 1024 - then will do eager
+        "config.cache_size_limit = 1024",  # Flex Attention
+        # f"config.fail_on_recompile_limit_hit = {not debug and ignore_errors}", # Ignore recompiles CANNOT be used in tandem with suppress_errors
+        "config.allow_unspec_int_on_nn_module = True",  # Integers in modules will auto wrap torch.tensor(self.vocab_size)
+        f"config.optimize_ddp = {not debug}",  # Optimizes DDP, but can error out so disable on debug
+        # Captures .item() for eg
+        # n_chunks = int(torch.ceil((torch.tensor(vocab_size) / 262144) * 8))
+        "config.capture_scalar_outputs = True",
+        # Capture torch.arange(...), torch.zeros(...)
+        "config.capture_dynamic_output_shape_ops = True",
+    ]
+    if not debug and ignore_errors:
+        # Have to explicitly set it!
+        torch._dynamo.config.suppress_errors = True
+    pass
+    import torch._inductor.config as config
+
+    for _try_compile_argument in torch_compile_arguments:
+        try:
+            exec(_try_compile_argument)
+        except:
+            pass
+    pass
+    import torch._dynamo.config as config
+
+    for _try_dynamo_argument in torch_dynamo_arguments:
+        try:
+            exec(_try_dynamo_argument)
+        except:
+            pass
+    pass
+
+
+pass
+
+
+def patch_compiled_autograd():
+    # Fixes double compilation of functions during gradient checkpointing
+    # See https://github.com/pytorch/pytorch/issues/135298
+    # All Unsloth Zoo code licensed under LGPLv3
+    import inspect, re
+
+    # From https://github.com/pytorch/pytorch/pull/135795/files
+    import torch._dynamo.compiled_autograd
+
+    fx = torch._dynamo.compiled_autograd.AutogradCompilerInstance.end_capture
+    if fx.__name__ == "unsloth_end_capture":
+        return
+    source = inspect.getsource(fx)
+    if "with disable()" in source:
+        return
+    spaces = source.find("def")
+    source = source.split("\n")
+    source = "\n".join(x[spaces:] for x in source)
+    old = "return compiled_fn(inputs, sizes, scalars, hooks)"
+    match = re.search(r"\n([ ]{1,})return compiled_fn", source)
+    n = len(match.group(1)) if match else 0
+    source = source.replace(old, f"with disable():\n{' ' * (n + 4)}{old}")
+    source = source.replace("def end_capture", "def unsloth_end_capture", 1)
+
+    # Import items to make the function executable
+    all_items = dir(torch._dynamo.compiled_autograd)
+    good_items = [x for x in all_items if x in source]
+    exec(
+        "from torch._dynamo.compiled_autograd import ("
+        + ", ".join(x for x in good_items)
+        + ")",
+        globals(),
+    )
+    exec(source, globals())
+    torch._dynamo.compiled_autograd.AutogradCompilerInstance.end_capture = (
+        unsloth_end_capture
+    )
+
+    # From https://github.com/pytorch/pytorch/pull/135795/files
+    try:
+        import torch._dynamo.variables.misc
+
+        fx = torch._dynamo.variables.misc.AutogradEngineVariable.call_method
+    except:
+        return
+    if fx.__name__ == "unsloth_call_method":
+        return
+    source = inspect.getsource(fx)
+    if "in_compiled_autograd_region" in source:
+        return
+    spaces = source.find("def")
+    source = source.split("\n")
+    source = "\n".join(x[spaces:] for x in source)
+    source = source.replace(
+        "torch._dynamo.compiled_autograd.compiled_autograd_enabled",
+        "torch._dynamo.compiled_autograd.in_compiled_autograd_region",
+        1,
+    )
+    source = source.replace("def call_method", "def unsloth_call_method", 1)
+
+    # Import items to make the function executable
+    all_items = dir(torch._dynamo.variables.misc)
+    good_items = [x for x in all_items if x in source]
+    exec(
+        "from torch._dynamo.variables.misc import ("
+        + ", ".join(x for x in good_items)
+        + ")",
+        globals(),
+    )
+    exec(source, globals())
+    torch._dynamo.variables.misc.AutogradEngineVariable.call_method = (
+        unsloth_call_method
+    )
+    return
 
 
 pass

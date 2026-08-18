@@ -6,23 +6,72 @@ from src.data.dataset import (
     _close_h5_handles_worker,
     WORKER_H5_HANDLES,
 )
-from src.data.batch_sampler import BucketBatchSampler
+from src.data.batch_sampler import StreamingTokenTierBatchSampler, BucketBatchSampler
+from src.data.streaming_dataset import StreamingImageDataset
 
 
-def create_dataloader(cfg, rank) -> DataLoader:
-    """
-    Creates and configures a PyTorch DataLoader utilizing aspect-ratio
-    bucketing and custom sequence length / aesthetic scheduling.
-    """
+def create_dataloader(cfg, rank, tokenizer=None) -> DataLoader:
+    """Instantiates DataLoader based on dataset_type (h5 vs streaming)."""
+    dataset_type = getattr(cfg.data, "dataset_type", "h5")
+
+    if dataset_type == "streaming":
+        dataset = StreamingImageDataset(
+            dataset_name=cfg.data.streaming_dataset_name,
+            dataset_path=cfg.data.get("dataset_path", None),
+            resolution=cfg.data.get("resolution", 512),
+            patch_size=cfg.data.get("patch_size", 2),
+            vae_downsample_factor=cfg.data.get("vae_downsample_factor", 8),
+            max_seq_len=cfg.data.get("max_seq_len", 256),
+            tokenizer=tokenizer,
+            cfg_dropout_prob=getattr(cfg.train, "cfg_dropout_prob", 0.0),
+            tag_dropout_prob=getattr(cfg.data, "tag_dropout", 0.0),
+            shuffle_tags=getattr(cfg.data, "shuffle_tags", True),
+            rank=rank,
+            world_size=getattr(cfg.train, "world_size", 1),
+        )
+
+        tier_lengths = cfg.data.get(
+            "tier_lengths", getattr(dataset, "length_tiers", [77, 152, 227])
+        )
+        batched_stream = StreamingTokenTierBatchSampler(
+            dataset=dataset,
+            base_batch_size=cfg.train.batch_size,
+            tier_lengths=tier_lengths,
+            base_sequence_length=cfg.data.get("base_sequence_length", 77),
+            length_penalty_power=cfg.data.get("length_penalty_power", 0.0),
+            drop_last=cfg.data.get("drop_last", False),
+            seed=cfg.train.seed,
+            world_size=getattr(cfg.train, "world_size", 1),
+            rank=rank,
+            aesthetic_curriculum=cfg.data.get("aesthetic_curriculum", True),
+            buffer_size=cfg.data.get("buffer_size", dataset.samples_per_shard),
+        )
+
+        dataloader = DataLoader(
+            batched_stream,
+            batch_size=None,
+            num_workers=cfg.data.num_workers,
+            pin_memory=cfg.data.get("pin_memory", True),
+            prefetch_factor=(
+                cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None
+            ),
+            persistent_workers=(
+                cfg.data.get("persistent_workers", True)
+                if cfg.data.num_workers > 0
+                else False
+            ),
+        )
+        return dataloader
+
     metadata_path = f"{cfg.data.h5_path}/metadata.json"
-    base_area = 64 * 96
-    length_penalty = 0.1
-    drop_last = False
-    pin_memory = True
-    persistent_workers = True
-    initial_epoch_focus_low_res = 2
-    low_res_focus_factor = 3.0
-    low_res_area_percentile = 0.4
+    base_area = cfg.data.get("base_resolution_area", 64 * 64)
+    length_penalty = cfg.data.get("length_penalty_power", 0.1)
+    drop_last = cfg.data.get("drop_last", False)
+    pin_memory = cfg.data.get("pin_memory", True)
+    persistent_workers = cfg.data.get("persistent_workers", True)
+    initial_epoch_focus_low_res = cfg.data.get("initial_epoch_focus_low_res", 0)
+    low_res_focus_factor = cfg.data.get("low_res_focus_factor", 1.0)
+    low_res_area_percentile = cfg.data.get("low_res_area_percentile", 0.33)
 
     dataset = H5LatentDataset(
         metadata_path=metadata_path,

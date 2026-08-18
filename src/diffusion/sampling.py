@@ -1,3 +1,4 @@
+import math
 import torch
 from typing import List, Dict, Any, Optional
 from PIL import Image
@@ -73,6 +74,44 @@ def encode_tokens_batch(
     return text_embeddings
 
 
+def compute_inference_pos_map(
+    height: int,
+    width: int,
+    patch_size: int = 2,
+    vae_scale: int = 8,
+    zoom: float = 1.0,
+    x_shift: float = 0.0,
+    y_shift: float = 0.0,
+    device: torch.device | str = "cuda",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Computes continuous 2D RoPE position map for arbitrary aspect ratio
+
+    and viewport camera parameters (zoom, x_shift, y_shift).
+    """
+    num_h = (height // vae_scale) // patch_size
+    num_w = (width // vae_scale) // patch_size
+
+    # Normalized aspect ratio bounds: r_h * r_w = 1.0 and r_h / r_w = H / W
+    r_h = math.sqrt(height / width)
+    r_w = math.sqrt(width / height)
+
+    y_centers = (torch.arange(num_h, dtype=torch.float32, device=device) + 0.5) / num_h
+    x_centers = (torch.arange(num_w, dtype=torch.float32, device=device) + 0.5) / num_w
+
+    y_norm = y_centers * (2.0 * r_h) - r_h
+    x_norm = x_centers * (2.0 * r_w) - r_w
+
+    grid_y, grid_x = torch.meshgrid(y_norm, x_norm, indexing="ij")
+
+    # Apply camera shifts and zoom transformations
+    grid_y = (grid_y + y_shift) / zoom
+    grid_x = (grid_x + x_shift) / zoom
+
+    pos_map = torch.stack((grid_y, grid_x), dim=-1).flatten(0, 1)
+    return pos_map.to(dtype=dtype)
+
+
 class CFGModelWrapper:
     """
     Wraps the UNet to handle Classifier-Free Guidance (CFG) and timestep formatting.
@@ -87,6 +126,8 @@ class CFGModelWrapper:
         autocast_dtype: torch.dtype,
         is_ddpm: bool = False,
         attention_mask: Optional[torch.Tensor] = None,
+        use_unet_mult: bool = True,
+        pos_map: Optional[torch.Tensor] = None,
     ):
         self.unet = unet
         self.combined_embeddings = combined_embeddings
@@ -95,6 +136,8 @@ class CFGModelWrapper:
         self.autocast_dtype = autocast_dtype
         self.is_ddpm = is_ddpm
         self.attention_mask = attention_mask
+        self.use_unet_mult = use_unet_mult
+        self.pos_map = pos_map
 
     def __call__(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
@@ -106,12 +149,18 @@ class CFGModelWrapper:
         x_in = torch.cat([x] * 2)
         t_in = torch.cat([t] * 2)
 
-        if self.is_ddpm:
-            # DDPM expects discrete indices [0, 999]
-            # t=0 -> 0, t=1 -> 999
-            t_model = (t_in * 999.0).long().clamp(0, 999)
-        else:
-            t_model = t_in * 1000.0
+        t_model = t_in
+        if self.use_unet_mult:
+            if self.is_ddpm:
+                # DDPM expects discrete indices [0, 999]
+                # t=0 -> 0, t=1 -> 999
+                t_model = (t_in * 999.0).long().clamp(0, 999)
+            else:
+                t_model = t_in * 1000.0
+
+        model_kwargs = {}
+        if self.pos_map is not None:
+            model_kwargs["pos_map"] = torch.cat([self.pos_map] * 2, dim=0)
 
         with torch.autocast(
             device_type="cuda", dtype=self.autocast_dtype, enabled=True
@@ -121,6 +170,7 @@ class CFGModelWrapper:
                 t_model,
                 encoder_hidden_states=self.combined_embeddings,
                 attention_mask=self.attention_mask,
+                **model_kwargs,
             )
 
         out_uncond, out_cond = out.chunk(2)
@@ -243,6 +293,7 @@ def generate_samples(
     device: str = "cuda",
     dtype: torch.dtype = torch.float32,
     autocast_dtype: torch.dtype = torch.bfloat16,
+    use_unet_mult: bool = True,
 ) -> List[Image.Image]:
     """
     Main entry point for generating samples during training.
@@ -272,6 +323,11 @@ def generate_samples(
         seed = batch_configs[0].get("seed", 42)
         shift = batch_configs[0].get("shift", 1.0)
 
+        # Viewport camera manipulation parameters
+        zoom = batch_configs[0].get("zoom", 1.0)
+        x_shift = batch_configs[0].get("x_shift", 0.0)
+        y_shift = batch_configs[0].get("y_shift", 0.0)
+
         curr_bs = len(batch_configs)
 
         with torch.no_grad():
@@ -281,58 +337,66 @@ def generate_samples(
                 (curr_bs, 4, H // 8, W // 8), device=device, generator=gen, dtype=dtype
             )
 
-            # 2. Encode Text
+            # 2. Polymorphic Text Tokenization & Encoding
             full_prompts = batch_neg + batch_prompts
-            tokens = tokenizer(
-                full_prompts, padding="longest", truncation=False, return_tensors="pt"
-            ).input_ids
 
-            seq_len = tokens.shape[-1]
+            lengths = [tokenizer.get_length(p) for p in full_prompts]
+            max_p_len = max(lengths) if lengths else 77
             target_len = 77
-            for tier_len in [77, 152, 227]:
-                if seq_len <= tier_len:
+            for tier_len in [77, 152, 227, 256]:
+                if max_p_len <= tier_len:
                     target_len = tier_len
                     break
             else:
-                target_len = 227
-                tokens = tokens[:, :227]
-                # Ensure the last token is EOS
-                tokens[:, -1] = tokenizer.eos_token_id
+                target_len = max(256, max_p_len)
 
-            if tokens.shape[-1] < target_len:
-                padding_length = target_len - tokens.shape[-1]
-                padding_tensor = torch.full(
-                    (tokens.shape[0], padding_length),
-                    tokenizer.eos_token_id,
-                    dtype=tokens.dtype,
-                    device=tokens.device,
+            tokens_list, mask_list = [], []
+            for p in full_prompts:
+                tok, m = tokenizer.encode(
+                    p,
+                    max_len=target_len,
+                    cfg_dropout_prob=0.0,
+                    tag_dropout_prob=0.0,
+                    shuffle_tags=False,
                 )
-                tokens = torch.cat([tokens, padding_tensor], dim=-1)
+                tokens_list.append(tok)
+                mask_list.append(m)
+            tokens = torch.stack(tokens_list).to(device)
+            attention_mask = torch.stack(mask_list).to(device)
+            embeddings, attention_mask = text_encoder(tokens, mask=attention_mask)
 
-            # Generate attention mask
-            not_pad_mask = tokens != tokenizer.eos_token_id
-            shifted_mask = torch.roll(not_pad_mask, shifts=1, dims=1)
-            shifted_mask[:, 0] = True
+            # 3. Build Continuous 2D RoPE Position Map for DiT
+            pos_map = None
+            patch_size = getattr(unet, "patch_size", None)
+            if patch_size is None and hasattr(unet, "module"):
+                patch_size = getattr(unet.module, "patch_size", None)
 
-            attention_mask = not_pad_mask | shifted_mask
-            attention_mask = attention_mask.to(device)
-
-            embeddings = encode_tokens_batch(
-                tokens,
-                text_encoder,
-                tokenizer,
-                max_length=tokens.shape[-1],
-                device=device,
-            )
+            has_camera_control = zoom != 1.0 or x_shift != 0.0 or y_shift != 0.0
+            if patch_size is not None or has_camera_control:
+                p_size = patch_size if patch_size is not None else 2
+                single_pos = compute_inference_pos_map(
+                    height=H,
+                    width=W,
+                    patch_size=p_size,
+                    vae_scale=8,
+                    zoom=zoom,
+                    x_shift=x_shift,
+                    y_shift=y_shift,
+                    device=device,
+                    dtype=dtype,
+                )
+                pos_map = single_pos.unsqueeze(0).expand(curr_bs, -1, -1)
 
             model_wrapper = CFGModelWrapper(
-                unet,
-                embeddings,
-                cfg_scale,
-                device,
-                autocast_dtype,
+                unet=unet,
+                combined_embeddings=embeddings,
+                cfg_scale=cfg_scale,
+                device=device,
+                autocast_dtype=autocast_dtype,
                 is_ddpm=(diffusion_type == "ddpm"),
                 attention_mask=attention_mask,
+                use_unet_mult=use_unet_mult,
+                pos_map=pos_map,
             )
 
             if diffusion_type == "ddpm":
@@ -344,6 +408,8 @@ def generate_samples(
             # Decode one by one to save VRAM
             for j, latent in enumerate(latents):
                 latent = latent.unsqueeze(0).to(torch.float32) / 0.18215
+                torch._dynamo.maybe_mark_dynamic(latent, 1)
+                torch._dynamo.maybe_mark_dynamic(latent, 2)
                 image = vae.decode(latent)
                 image = (image / 2 + 0.5).clamp(0, 1)
                 image = image.cpu().permute(0, 2, 3, 1).numpy()[0]
@@ -351,6 +417,6 @@ def generate_samples(
 
                 all_images[i + j] = Image.fromarray(image)
 
-    vae.to("cpu")
+    # vae.to("cpu")
 
     return [all_images[k] for k in range(total_samples)]

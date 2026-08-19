@@ -95,20 +95,21 @@ class StreamingImageDataset(IterableDataset):
             "cache_type": "readahead",
         }
 
-        dataset_path = Path(dataset_path)
-        if dataset_path.is_dir():
-            print(f"Reading data from {dataset_path}")
-            parquet_files = sorted([str(p) for p in dataset_path.glob("*.parquet")])
-            if not parquet_files:
-                raise FileNotFoundError(
-                    f"No parquet files found in directory: {dataset_name}"
+        if dataset_path is not None:
+            dataset_path = Path(dataset_path)
+            if dataset_path.is_dir():
+                print(f"Reading data from {dataset_path}")
+                parquet_files = sorted([str(p) for p in dataset_path.glob("*.parquet")])
+                if not parquet_files:
+                    raise FileNotFoundError(
+                        f"No parquet files found in directory: {dataset_name}"
+                    )
+                self.hf_dataset = load_dataset(
+                    "parquet",
+                    data_files={"train": parquet_files},
+                    split="train",
+                    streaming=True,
                 )
-            self.hf_dataset = load_dataset(
-                "parquet",
-                data_files={"train": parquet_files},
-                split="train",
-                streaming=True,
-            )
         else:
             self.hf_dataset = load_dataset(
                 dataset_name,

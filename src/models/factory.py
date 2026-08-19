@@ -41,8 +41,9 @@ class ModelInspector:
             self.gradient_tensors[name] = grad.detach()
 
     def register_hooks(self, model: nn.Module):
-        # Strategic subset of layers to monitor
+        # Strategic subset of layers to monitor across UNet and DualStreamDiT
         target_layer_names = {
+            # --- UNet Target Layers ---
             "down_blocks.0.resnets.0",
             "down_blocks.0.attentions.0",
             "down_blocks.2.attentions.1",
@@ -57,15 +58,43 @@ class ModelInspector:
             "up_blocks.3.attentions.2",
             "conv_out",
             "conv_in",
+            # --- DualStreamDiT Target Layers ---
+            "x_embedder",
+            "time_token_proj",
+            "text_adapter.proj_in",
+            "text_adapter.blocks.0.ff",
+            "text_adapter.blocks.1.ff",
+            "in_blocks.0.attn",
+            "in_blocks.0.mlp_image",
+            "in_blocks.0.mlp_text",
+            "in_blocks.2.attn",
+            "in_blocks.2.mlp_image",
+            "in_blocks.3.attn",
+            "in_blocks.3.mlp_image",
+            "mid_block.attn",
+            "mid_block.mlp_image",
+            "mid_block.mlp_text",
+            "out_blocks.0.skip_linear_image",
+            "out_blocks.0.attn",
+            "out_blocks.0.mlp_image",
+            "out_blocks.2.attn",
+            "out_blocks.2.mlp_image",
+            "out_blocks.3.attn",
+            "out_blocks.3.mlp_image",
+            "norm_final",
+            "proj_out",
         }
 
         for name, module in model.named_modules():
-            if name in target_layer_names:
-                if name.startswith("_orig_mod."):
-                    name = name[len("_orig_mod.") :]
-                f_hook = module.register_forward_hook(partial(self._forward_hook, name))
+            clean_name = (
+                name[len("_orig_mod.") :] if name.startswith("_orig_mod.") else name
+            )
+            if clean_name in target_layer_names:
+                f_hook = module.register_forward_hook(
+                    partial(self._forward_hook, clean_name)
+                )
                 b_hook = module.register_full_backward_hook(
-                    partial(self._backward_hook, name)
+                    partial(self._backward_hook, clean_name)
                 )
                 self.hooks.extend([f_hook, b_hook])
 
@@ -172,6 +201,9 @@ def load_trainable_model(
             depth = getattr(model_cfg, "depth", 16) if model_cfg else 16
             num_heads = getattr(model_cfg, "num_heads", 12) if model_cfg else 12
             patch_size = getattr(model_cfg, "patch_size", 2) if model_cfg else 2
+            skip_checkpointing_layers = (
+                getattr(model_cfg, "skip_checkpointing_layers", 0) if model_cfg else 0
+            )
             use_rope = (
                 getattr(model_cfg, "use_rope_text_adapter", False)
                 if model_cfg
@@ -189,6 +221,7 @@ def load_trainable_model(
                 text_embed_dim=text_embed_dim,
                 use_checkpointing=use_checkpointing,
                 use_rope_text_adapter=use_rope,
+                skip_checkpointing_layers=skip_checkpointing_layers,
             )
             # if os.path.exists(unet_path):
             #     sd = load_file(unet_path, device="cpu")

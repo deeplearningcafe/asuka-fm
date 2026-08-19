@@ -206,7 +206,7 @@ class Trainer:
 
         self.autocast_dtype = torch.bfloat16
         if capability[0] >= 7 and capability[0] < 8:
-            self.autocast_dtype = torch.float32
+            self.autocast_dtype = torch.float16
             torch.set_float32_matmul_precision("high")
             print("Using high precision for float32 matmul (tensor cores).")
         elif capability[0] >= 8:
@@ -361,6 +361,7 @@ class Trainer:
         with ThreadPoolExecutor(max_workers=1) as io_executor:
             cumulative_images, cumulative_time = 0.0, 0.0
             images_total, last_images = 0, 0
+            tokens_total, last_tokens = 0, 0
 
             # CUDA-specific timing setup
             t_start = torch.cuda.Event(enable_timing=True)
@@ -413,13 +414,30 @@ class Trainer:
                     else:
                         context = contextlib.nullcontext()
 
-                    bsz = batch[0].shape[0] * self.world_size
+                    # Batch size and token calculations
+                    # TODO: clean logic and optimize
+                    is_raw_image = len(batch) >= 5
+                    raw_bsz = batch[0].shape[0]
+                    bsz = raw_bsz * self.world_size
                     batch_size_accum += bsz
 
                     h_dim, w_dim = batch[0].shape[2], batch[0].shape[3]
-                    img_tokens = (h_dim // self.patch_size) * (w_dim // self.patch_size)
-                    text_tokens = batch[3].sum().item()
-                    epoch_tokens_accum += bsz * img_tokens + text_tokens
+                    if is_raw_image:
+                        h_lat, w_lat = h_dim // 8, w_dim // 8
+                        img_tokens = (h_lat // self.patch_size) * (
+                            w_lat // self.patch_size
+                        )
+                        text_tokens = batch[2].bool().sum().item()
+                    else:
+                        # Precomputed latents
+                        img_tokens = (h_dim // self.patch_size) * (
+                            w_dim // self.patch_size
+                        )
+                        text_tokens = batch[3].bool().sum().item()
+
+                    batch_tokens = (bsz * img_tokens) + (text_tokens * self.world_size)
+                    tokens_total += batch_tokens
+                    epoch_tokens_accum += batch_tokens
 
                     with context:
                         metrics = self.train_step(batch)
@@ -555,7 +573,11 @@ class Trainer:
 
                             images_interval = images_total - last_images
                             last_images = images_total
-                            imagesps = images_interval / elapsed if elapsed > 0 else 0
+                            imagesps = images_interval / elapsed
+
+                            tokens_interval = tokens_total - last_tokens
+                            last_tokens = tokens_total
+                            tokensps = tokens_interval / elapsed
 
                             cumulative_images += images_interval
                             cumulative_time += elapsed
@@ -565,26 +587,32 @@ class Trainer:
                                 if cumulative_time > 0
                                 else 0
                             )
-                            model_flops = 6 * self.num_params * epoch_tokens_accum
+
+                            # Total peak TFLOPS across all GPUs in DDP
+                            total_peak_tflops = self.peak_tflops * self.world_size
+
+                            model_flops = 6 * self.num_params * tokens_interval
                             hw_flops = (
-                                self.flops_factor * self.num_params * epoch_tokens_accum
+                                self.flops_factor * self.num_params * tokens_interval
                             )
                             tflops = (model_flops / elapsed) / 1e12
                             hw_tflops = (hw_flops / elapsed) / 1e12
+
                             mfu = (
-                                (tflops / self.peak_tflops) * 100.0
-                                if self.peak_tflops > 0
+                                (tflops / total_peak_tflops) * 100.0
+                                if total_peak_tflops > 0
                                 else 0.0
                             )
                             hfu = (
-                                (hw_tflops / self.peak_tflops) * 100.0
-                                if self.peak_tflops > 0
+                                (hw_tflops / total_peak_tflops) * 100.0
+                                if total_peak_tflops > 0
                                 else 0.0
                             )
+
                             if self.global_rank == 0:
                                 print(
                                     f"Ep {epoch + 1}, Step {self.global_step:06d}, "
-                                    f"Step imgs/sec: {imagesps}, Avg imgs/sec: {avg_imagesps}"
+                                    f"Step imgs/sec: {imagesps}, Avg imgs/sec: {avg_imagesps}, "
                                     f"mfu: {mfu}, hfu: {hfu}"
                                 )
 
@@ -594,9 +622,7 @@ class Trainer:
                                     "train/tflops": tflops,
                                     "train/mfu": mfu,
                                     "train/hfu": hfu,
-                                    "train/tokens_per_sec": (
-                                        epoch_tokens_accum / elapsed
-                                    ),
+                                    "train/tokens_per_sec": tokensps,
                                 }
                                 log_metrics(
                                     log_payload, step=self.global_step, commit=False

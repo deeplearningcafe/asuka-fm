@@ -17,10 +17,10 @@ train:
     use_bitsandbytes: True
     train_only_output: False # train only output head
     skip_save_n_times: 4
-    run_stability_check: True
+    run_stability_check: False # breaks torch compile use for debug only
     world_size: 2
     use_cos_scheduler: False
-    use_ot: True
+    use_ot: False
     use_ema: False
     ema_decay: 0.999
     use_kahan_sum: False
@@ -31,19 +31,28 @@ train:
 data:
     dataset_type: "streaming"
     h5_path: "data" # Path to the folder
+    streaming_dataset_name: "aipracticecafe/test-danbooru"
     num_workers: 4
     prefetch_factor: 6
     load_into_ram: True
     tag_dropout: 0.1
+    use_shift_crop: True
+    resolution: 256
 
 models:
-    model_type: "dual_stream"
+    model_type: "sprint_dual"
     resume_from_checkpoint: null # Path to a checkpoint folder
     output_head_path: null
     hf_text_encoder: "LiquidAI/LFM2.5-230M"
     hidden_size: 512
     depth: 12
     num_heads: 8
+    encoder_depth: 2
+    decoder_depth: 2
+    drop_ratio: 0.75
+    drop_target: "image"
+    residual_type: "concat_linear"
+    cfg_mask_prob: 0.0
 
 paths:
     models: "models" # Root path containing unet/, vae/, clip/, tokenizer/

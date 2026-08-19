@@ -169,6 +169,8 @@ class Trainer:
         )
         self.peak_tflops = cfg.train.get("gpu_peak_tflops", 165.2)
         self.flops_factor = 7 if cfg.train.get("use_checkpointing", True) else 6
+        if self.global_rank == 0:
+            print(f"Training {self.num_params / 1e6}M parameters")
 
     def setup_device(self):
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -573,6 +575,13 @@ class Trainer:
 
                             images_interval = images_total - last_images
                             last_images = images_total
+                            # if sprint multi images tokens by drop_ratio
+                            # TODO: take into account enc and dec layers and drop target
+                            images_interval = (
+                                images_interval * self.cfg.models.drop_ratio
+                                if self.model_type == "sprint_dual"
+                                else images_interval
+                            )
                             imagesps = images_interval / elapsed
 
                             tokens_interval = tokens_total - last_tokens
@@ -613,7 +622,7 @@ class Trainer:
                                 print(
                                     f"Ep {epoch + 1}, Step {self.global_step:06d}, "
                                     f"Step imgs/sec: {imagesps}, Avg imgs/sec: {avg_imagesps}, "
-                                    f"mfu: {mfu}, hfu: {hfu}"
+                                    f"mfu: {mfu}, hfu: {hfu}, tokens/s {tokensps}"
                                 )
 
                                 log_payload = {
@@ -699,6 +708,7 @@ class Trainer:
                 print(
                     f"Ep {epoch + 1}, Step {self.global_step:06d}, "
                     f"Step imgs/sec: {imagesps}, Avg imgs/sec: {avg_imagesps}"
+                    f"Trained {images_total} images, Tokens {tokens_total}"
                 )
 
                 log_payload = {

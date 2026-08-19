@@ -1,6 +1,7 @@
 import torch
 from src.models.unet import Unet, UnetConfig
 from src.models.dual_stream import DualStreamDiT
+from src.models.sprint import SprintDualStreamDiT
 from src.models.text_encoders.clip import Clip, ClipConfig
 from src.models.vae import Vae, VaeConfig
 from src.utils.ema import EMAModel
@@ -194,22 +195,19 @@ def load_trainable_model(
         text_embed_dim = 768
 
     if global_rank == 0:
-        print(f"Loading model from {models_path}...")
+        print(f"Loading {model_type} model from {models_path}...")
     try:
+        hidden_size = getattr(model_cfg, "hidden_size", 768) if model_cfg else 768
+        depth = getattr(model_cfg, "depth", 16) if model_cfg else 16
+        num_heads = getattr(model_cfg, "num_heads", 12) if model_cfg else 12
+        patch_size = getattr(model_cfg, "patch_size", 2) if model_cfg else 2
+        skip_checkpointing_layers = (
+            getattr(model_cfg, "skip_checkpointing_layers", 0) if model_cfg else 0
+        )
+        use_rope = (
+            getattr(model_cfg, "use_rope_text_adapter", False) if model_cfg else False
+        )
         if model_type == "dual_stream":
-            hidden_size = getattr(model_cfg, "hidden_size", 768) if model_cfg else 768
-            depth = getattr(model_cfg, "depth", 16) if model_cfg else 16
-            num_heads = getattr(model_cfg, "num_heads", 12) if model_cfg else 12
-            patch_size = getattr(model_cfg, "patch_size", 2) if model_cfg else 2
-            skip_checkpointing_layers = (
-                getattr(model_cfg, "skip_checkpointing_layers", 0) if model_cfg else 0
-            )
-            use_rope = (
-                getattr(model_cfg, "use_rope_text_adapter", False)
-                if model_cfg
-                else False
-            )
-
             # TODO: channels dynamically from vae meta
             unet = DualStreamDiT(
                 in_channels=4,
@@ -227,6 +225,44 @@ def load_trainable_model(
             #     sd = load_file(unet_path, device="cpu")
             #     sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
             #     unet.load_state_dict(sd, strict=False)
+        elif model_type == "sprint_dual":
+            encoder_depth = getattr(model_cfg, "encoder_depth", 2) if model_cfg else 2
+            decoder_depth = getattr(model_cfg, "decoder_depth", 2) if model_cfg else 2
+            drop_ratio = getattr(model_cfg, "drop_ratio", 0.75) if model_cfg else 0.0
+            drop_target = (
+                getattr(model_cfg, "drop_target", "image") if model_cfg else "image"
+            )
+            residual_type = (
+                getattr(model_cfg, "residual_type", "concat_linear")
+                if model_cfg
+                else "concat_linear"
+            )
+            cfg_mask_prob = (
+                getattr(model_cfg, "cfg_mask_prob", 0.1) if model_cfg else 0.0
+            )
+            use_random_drop = (
+                getattr(model_cfg, "use_random_drop", True) if model_cfg else True
+            )
+
+            unet = SprintDualStreamDiT(
+                in_channels=4,
+                out_channels=4,
+                patch_size=patch_size,
+                hidden_size=hidden_size,
+                depth=depth,
+                num_heads=num_heads,
+                text_embed_dim=text_embed_dim,
+                encoder_depth=encoder_depth,
+                decoder_depth=decoder_depth,
+                drop_ratio=drop_ratio,
+                drop_target=drop_target,
+                residual_type=residual_type,
+                cfg_mask_prob=cfg_mask_prob,
+                use_checkpointing=use_checkpointing,
+                use_rope_text_adapter=use_rope,
+                skip_checkpointing_layers=skip_checkpointing_layers,
+                use_random_drop=use_random_drop,
+            )
         else:
             unet = Unet.from_pretrained(
                 UnetConfig(use_checkpointing=use_checkpointing),

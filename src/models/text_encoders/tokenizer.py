@@ -30,6 +30,10 @@ class BaseTokenizer(abc.ABC):
         """Returns vocabulary dictionary if available."""
         pass
 
+    @abc.abstractmethod
+    def decode(self, tokens):
+        pass
+
 
 class CommaSeparatedTokenizer(BaseTokenizer):
     """Rule-based tag tokenizer with shuffling and dropout."""
@@ -139,3 +143,7 @@ class HFLLMTokenizer(BaseTokenizer):
         return encoded["input_ids"].squeeze(0), encoded["attention_mask"].squeeze(
             0
         ).bool()
+
+    def decode(self, tokens):
+        prompts = self.tokenizer.decode(tokens, skip_special_tokens=True)
+        return prompts

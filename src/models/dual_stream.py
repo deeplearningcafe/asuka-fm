@@ -295,7 +295,9 @@ class DualStreamDiT(nn.Module):
         # 4. 3D RoPE
         head_dim = hidden_size // num_heads
         axes_dims = _default_rope_axes_dims(head_dim)
-        self.rope_embedder = MultimodalRopeEmbedder(axes_dims)
+        self.rope_embedder = MultimodalRopeEmbedder(
+            axes_dims,
+        )
 
         # 5. Dual Stream Blocks (with Long Skip Connections)
         num_in_blocks = depth // 2
@@ -375,9 +377,10 @@ class DualStreamDiT(nn.Module):
         image_time = text_lengths[:, None].expand(bsz, num_image_tokens)
 
         if pos_map is not None:
-            # pos_map shape: [B, num_image_tokens, 2] continuous coordinates
             if pos_map.ndim == 4:
                 pos_map = pos_map.flatten(1, 2)
+            if pos_map.ndim == 2:
+                pos_map = pos_map.unsqueeze(0).expand(bsz, -1, -1)
             pos_map = pos_map.to(device, dtype=torch.float32)
             row_coords = pos_map[..., 0]
             col_coords = pos_map[..., 1]

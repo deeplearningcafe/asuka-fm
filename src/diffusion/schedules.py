@@ -38,15 +38,15 @@ class LinearSchedule(BaseSchedule):
 
     def get_coefficients(self, t: torch.Tensor):
         if not self.is_inverted:
-            # alpha = t, sigma = 1-t
             alpha = t
             sigma = 1.0 - t
+            d_alpha = torch.ones_like(t)
+            d_sigma = -torch.ones_like(t)
         else:
             alpha = 1.0 - t
             sigma = t
-
-        d_alpha = -torch.ones_like(t)
-        d_sigma = torch.ones_like(t)
+            d_alpha = -torch.ones_like(t)
+            d_sigma = torch.ones_like(t)
         return alpha, sigma, d_alpha, d_sigma
 
 

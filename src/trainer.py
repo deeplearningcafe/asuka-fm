@@ -64,6 +64,7 @@ class Trainer:
                 global_rank=self.global_rank,
                 model_type=self.model_type,
                 model_cfg=cfg.models,
+                autocast_dtype=self.autocast_dtype,
             )
         )
         self.dataloader = create_dataloader(
@@ -109,18 +110,20 @@ class Trainer:
         if self.ema is not None and self.ema.use_ema:
             self.ema.step = self.global_step
 
+        self.is_dit = self.model_type in ["dual_stream", "sprint_dual"]
         if cfg.train.objective == "flow_matching":
             # not invert
             self.schedule = LinearSchedule(
                 device=self.device,
             )
             timestep_sampling = self.cfg.train.get("timestep_fn", "uniform")
+
             self.objective = FlowMatchingObjective(
                 self.schedule,
                 timestep_sampling=timestep_sampling,
                 shift=cfg.train.shift,
                 use_ot=cfg.train.get("use_ot", False),
-                use_unet_mult=False if self.model_type == "dual_stream" else True,
+                use_unet_mult=False if self.is_dit else True,
             )
         else:
             self.schedule = DDPMSchedule(device=self.device)
@@ -657,6 +660,7 @@ class Trainer:
                                         diffusion_type=self.cfg.train.objective,
                                         device=self.device,
                                         dtype=self.dtype,
+                                        use_unet_mult=False if self.is_dit else True,
                                     )
                                     prompts = [
                                         c.get("prompt") for c in self.sample_configs
@@ -731,6 +735,7 @@ class Trainer:
                         diffusion_type=self.cfg.train.objective,
                         device=self.device,
                         dtype=self.dtype,
+                        use_unet_mult=False if self.is_dit else True,
                     )
                 prompts = [c.get("prompt") for c in self.sample_configs]
                 io_executor.submit(log_image, images, prompts, epoch, self.global_step)

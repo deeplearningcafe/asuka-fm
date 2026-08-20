@@ -23,23 +23,17 @@ def compute_aspect_coordinates(
     crop_size: int,
     patch_size: int,
 ) -> torch.Tensor:
-    """Computes continuous 2D RoPE position map for cropped patch."""
-    r_h = math.sqrt(target_h / target_w)
-    r_w = math.sqrt(target_w / target_h)
+    """Computes continuous patch-unit 2D RoPE position map for cropped patch."""
+    num_patches_h = crop_size // patch_size
+    num_patches_w = crop_size // patch_size
 
-    num_patches = crop_size // patch_size
-    y_centers = (
-        torch.arange(num_patches, dtype=torch.float32) + 0.5
-    ) * patch_size + crop_y
-    x_centers = (
-        torch.arange(num_patches, dtype=torch.float32) + 0.5
-    ) * patch_size + crop_x
+    crop_y_patch = crop_y / float(patch_size)
+    crop_x_patch = crop_x / float(patch_size)
 
-    # Normalize to [-r_h, r_h] and [-r_w, r_w]
-    y_norm = (y_centers / target_h) * (2.0 * r_h) - r_h
-    x_norm = (x_centers / target_w) * (2.0 * r_w) - r_w
+    y_pos = torch.arange(num_patches_h, dtype=torch.float32) + crop_y_patch
+    x_pos = torch.arange(num_patches_w, dtype=torch.float32) + crop_x_patch
 
-    grid_y, grid_x = torch.meshgrid(y_norm, x_norm, indexing="ij")
+    grid_y, grid_x = torch.meshgrid(y_pos, x_pos, indexing="ij")
     return torch.stack((grid_y, grid_x), dim=-1).flatten(0, 1)
 
 

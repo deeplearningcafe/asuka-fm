@@ -143,6 +143,7 @@ def load_trainable_model(
     global_rank: int = 0,
     model_type: str = "unet",
     model_cfg: omegaconf.DictConfig = None,
+    autocast_dtype=torch.float32,
 ):
     """
     Loads models (UNet, TE, VAE) and configures them for training (gradients, dtype).
@@ -175,7 +176,7 @@ def load_trainable_model(
             print(f"Loading HuggingFace Text Encoder: {hf_te_id}")
         text_encoder = HFTextEncoder(
             hf_te_id,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=autocast_dtype,
             cache_dir=f"{models_path}/text_encoder",
         )
         tokenizer = HFLLMTokenizer(
@@ -325,7 +326,7 @@ def load_trainable_model(
         text_encoder.train()
     else:
         print("Freezing Text Encoder (converting to bf16)")
-        text_encoder.to(dtype=torch.bfloat16)
+        text_encoder.to(dtype=autocast_dtype)
         for param in text_encoder.parameters():
             param.requires_grad = False
         text_encoder.eval()

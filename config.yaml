@@ -53,6 +53,8 @@ models:
     drop_target: "image"
     residual_type: "concat_linear"
     cfg_mask_prob: 0.0
+    skip_checkpointing_layers: 0
+    use_random_drop: False
 
 paths:
     models: "models" # Root path containing unet/, vae/, clip/, tokenizer/

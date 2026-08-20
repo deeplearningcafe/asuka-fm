@@ -532,10 +532,8 @@ class MultimodalRopeEmbedder(nn.Module):
         max_text_len: int = 512,
         max_spatial_dim: int = 128,
         theta: float = 10000.0,
-        use_continuous: bool = True,
     ) -> None:
         super().__init__()
-        self.use_continuous = use_continuous
         axes_lens = (max_text_len, max_spatial_dim, max_spatial_dim)
 
         cos_tables = []
@@ -561,38 +559,15 @@ class MultimodalRopeEmbedder(nn.Module):
             [nn.Parameter(f, requires_grad=False) for f in inv_freqs]
         )
 
-        # Method binding in __init__ prevents graph breaks during torch.compile
-        if self.use_continuous:
-            self.forward = self._forward_continuous
-        else:
-            self.forward = self._forward_discrete
-
-    def _forward_continuous(
-        self, position_ids: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Continuous coordinate rotary embedding via on-the-fly math."""
+    def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculates rotary embeddings for integer or floating coordinates."""
         cos = []
         sin = []
         pos_float = position_ids.float()
         for axis_idx, inv_freq in enumerate(self.inv_freqs):
             pos = pos_float[:, :, axis_idx]
             # Outer product: [B, SeqLen, 1] * [1, 1, Dim // 2]
-            angles = pos.unsqueeze(-1) * inv_freq.unsqueeze(0).unsqueeze(0)
+            angles = pos.unsqueeze(-1) * inv_freq.to(pos.device).view(1, 1, -1)
             cos.append(angles.cos())
             sin.append(angles.sin())
-        return torch.cat(cos, dim=-1), torch.cat(sin, dim=-1)
-
-    def _forward_discrete(
-        self, position_ids: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Legacy table lookup rotary embedding for integer index grids."""
-        cos = []
-        sin = []
-        pos_long = position_ids.long()
-        for axis_idx, (cos_table, sin_table) in enumerate(
-            zip(self.cos_tables, self.sin_tables)
-        ):
-            pos = pos_long[:, :, axis_idx].clamp(0, cos_table.shape[0] - 1)
-            cos.append(F.embedding(pos, cos_table))
-            sin.append(F.embedding(pos, sin_table))
         return torch.cat(cos, dim=-1), torch.cat(sin, dim=-1)

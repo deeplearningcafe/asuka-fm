@@ -85,28 +85,22 @@ def compute_inference_pos_map(
     device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Computes continuous 2D RoPE position map for arbitrary aspect ratio
+    """Computes patch-unit 2D RoPE position map for arbitrary aspect ratio
 
-    and viewport camera parameters (zoom, x_shift, y_shift).
+    and viewport camera controls.
     """
     num_h = (height // vae_scale) // patch_size
     num_w = (width // vae_scale) // patch_size
 
-    # Normalized aspect ratio bounds: r_h * r_w = 1.0 and r_h / r_w = H / W
-    r_h = math.sqrt(height / width)
-    r_w = math.sqrt(width / height)
+    y_pos = torch.arange(num_h, dtype=torch.float32, device=device)
+    x_pos = torch.arange(num_w, dtype=torch.float32, device=device)
+    grid_y, grid_x = torch.meshgrid(y_pos, x_pos, indexing="ij")
 
-    y_centers = (torch.arange(num_h, dtype=torch.float32, device=device) + 0.5) / num_h
-    x_centers = (torch.arange(num_w, dtype=torch.float32, device=device) + 0.5) / num_w
-
-    y_norm = y_centers * (2.0 * r_h) - r_h
-    x_norm = x_centers * (2.0 * r_w) - r_w
-
-    grid_y, grid_x = torch.meshgrid(y_norm, x_norm, indexing="ij")
-
-    # Apply camera shifts and zoom transformations
-    grid_y = (grid_y + y_shift) / zoom
-    grid_x = (grid_x + x_shift) / zoom
+    # Center-anchored zoom and normalized shift scaled to patch count
+    center_y = (num_h - 1.0) / 2.0
+    center_x = (num_w - 1.0) / 2.0
+    grid_y = (grid_y - center_y) / zoom + center_y + y_shift * num_h
+    grid_x = (grid_x - center_x) / zoom + center_x + x_shift * num_w
 
     pos_map = torch.stack((grid_y, grid_x), dim=-1).flatten(0, 1)
     return pos_map.to(dtype=dtype)
@@ -114,7 +108,8 @@ def compute_inference_pos_map(
 
 class CFGModelWrapper:
     """
-    Wraps the UNet to handle Classifier-Free Guidance (CFG) and timestep formatting.
+    Wraps the model for CFG. When cfg_scale <= 1.0 or unconditional
+    embeddings are uninitialized, it executes a single conditional pass.
     """
 
     def __init__(
@@ -128,6 +123,7 @@ class CFGModelWrapper:
         attention_mask: Optional[torch.Tensor] = None,
         use_unet_mult: bool = True,
         pos_map: Optional[torch.Tensor] = None,
+        is_conditional: bool = True,
     ):
         self.unet = unet
         self.combined_embeddings = combined_embeddings
@@ -138,43 +134,56 @@ class CFGModelWrapper:
         self.attention_mask = attention_mask
         self.use_unet_mult = use_unet_mult
         self.pos_map = pos_map
+        self.is_conditional = is_conditional
 
     def __call__(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Latents [B, C, H, W]
-            t: Timesteps [B], in range [0, 1] (0=Data, 1=Noise)
-        """
-        # inputs for CFG: uncond, cond
-        x_in = torch.cat([x] * 2)
-        t_in = torch.cat([t] * 2)
+        batch_size = x.shape[0]
 
-        t_model = t_in
-        if self.use_unet_mult:
-            if self.is_ddpm:
-                # DDPM expects discrete indices [0, 999]
-                # t=0 -> 0, t=1 -> 999
-                t_model = (t_in * 999.0).long().clamp(0, 999)
-            else:
-                t_model = t_in * 1000.0
+        if self.is_conditional and self.cfg_scale > 1.0:
+            x_in = torch.cat([x] * 2, dim=0)
+            t_in = torch.cat([t] * 2, dim=0)
+            t_model = t_in * 1000.0 if self.use_unet_mult else t_in
 
-        model_kwargs = {}
-        if self.pos_map is not None:
-            model_kwargs["pos_map"] = torch.cat([self.pos_map] * 2, dim=0)
+            model_kwargs = {}
+            if self.pos_map is not None:
+                model_kwargs["pos_map"] = torch.cat([self.pos_map] * 2, dim=0)
 
-        with torch.autocast(
-            device_type="cuda", dtype=self.autocast_dtype, enabled=True
-        ):
-            out = self.unet(
-                x_in,
-                t_model,
-                encoder_hidden_states=self.combined_embeddings,
-                attention_mask=self.attention_mask,
-                **model_kwargs,
-            )
+            with torch.autocast(
+                device_type="cuda", dtype=self.autocast_dtype, enabled=True
+            ):
+                out = self.unet(
+                    x_in,
+                    t_model,
+                    encoder_hidden_states=self.combined_embeddings,
+                    attention_mask=self.attention_mask,
+                    **model_kwargs,
+                )
+            out_uncond, out_cond = out.chunk(2, dim=0)
+            return out_uncond + self.cfg_scale * (out_cond - out_uncond)
+        else:
+            t_model = t * 1000.0 if self.use_unet_mult else t
+            model_kwargs = {}
+            if self.pos_map is not None:
+                model_kwargs["pos_map"] = self.pos_map
 
-        out_uncond, out_cond = out.chunk(2)
-        return out_uncond + self.cfg_scale * (out_cond - out_uncond)
+            # If combined embeddings contain both [uncond, cond], pick cond
+            emb = self.combined_embeddings
+            mask = self.attention_mask
+            if emb is not None and emb.shape[0] == batch_size * 2:
+                emb = emb[batch_size:]
+                if mask is not None:
+                    mask = mask[batch_size:]
+
+            with torch.autocast(
+                device_type="cuda", dtype=self.autocast_dtype, enabled=True
+            ):
+                return self.unet(
+                    x,
+                    t_model,
+                    encoder_hidden_states=emb,
+                    attention_mask=mask,
+                    **model_kwargs,
+                )
 
 
 def linear_shift_schedule(steps, shift=1.0):
@@ -184,6 +193,36 @@ def linear_shift_schedule(steps, shift=1.0):
 
     sigmas = torch.flip(sigmas, dims=[0])
     return sigmas
+
+
+@torch.no_grad()
+def sample_euler(
+    model_wrapper: CFGModelWrapper,
+    x: torch.Tensor,
+    num_steps: int = 25,
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """
+    Standard Forward Euler ODE Solver integrating t=0 (Noise) -> t=1 (Data).
+    """
+    device = x.device
+    z = x.clone()
+
+    t_grid = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+    if shift != 1.0:
+        t_grid = t_grid / (shift - (shift - 1.0) * t_grid)
+
+    dt_steps = t_grid[1:] - t_grid[:-1]
+
+    for i in range(num_steps):
+        t_curr = t_grid[i]
+        dt = dt_steps[i]
+
+        t_input = torch.full((z.shape[0],), t_curr, device=device)
+        v_pred = model_wrapper(z, t_input)
+        z = z + v_pred * dt
+
+    return z
 
 
 @torch.no_grad()
@@ -367,25 +406,33 @@ def generate_samples(
 
             # 3. Build Continuous 2D RoPE Position Map for DiT
             pos_map = None
-            patch_size = getattr(unet, "patch_size", None)
-            if patch_size is None and hasattr(unet, "module"):
-                patch_size = getattr(unet.module, "patch_size", None)
+            if "pos_map" in batch_configs[0] and (
+                batch_configs[0]["pos_map"] is not None
+            ):
+                pos_maps = [c["pos_map"] for c in batch_configs]
+                pos_map = torch.cat(pos_maps, dim=0).to(device=device)
+                print("Using Pos map with camera control")
+            else:
+                patch_size = getattr(unet, "patch_size", None)
+                if patch_size is None and hasattr(unet, "module"):
+                    patch_size = getattr(unet.module, "patch_size", None)
 
-            has_camera_control = zoom != 1.0 or x_shift != 0.0 or y_shift != 0.0
-            if patch_size is not None or has_camera_control:
-                p_size = patch_size if patch_size is not None else 2
-                single_pos = compute_inference_pos_map(
-                    height=H,
-                    width=W,
-                    patch_size=p_size,
-                    vae_scale=8,
-                    zoom=zoom,
-                    x_shift=x_shift,
-                    y_shift=y_shift,
-                    device=device,
-                    dtype=dtype,
-                )
-                pos_map = single_pos.unsqueeze(0).expand(curr_bs, -1, -1)
+                has_camera = zoom != 1.0 or x_shift != 0.0 or y_shift != 0.0
+                if patch_size is not None or has_camera:
+                    print("Using Pos map with camera control")
+                    p_size = patch_size if patch_size is not None else 2
+                    single_pos = compute_inference_pos_map(
+                        height=H,
+                        width=W,
+                        patch_size=p_size,
+                        vae_scale=8,
+                        zoom=zoom,
+                        x_shift=x_shift,
+                        y_shift=y_shift,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    pos_map = single_pos.unsqueeze(0).expand(curr_bs, -1, -1)
 
             model_wrapper = CFGModelWrapper(
                 unet=unet,
@@ -403,7 +450,10 @@ def generate_samples(
                 latents = sample_ddpm(model_wrapper, schedule, latents, steps)
             else:
                 sigmas = linear_shift_schedule(steps, shift=shift).to(device)
-                latents = sample_res_multistep(model_wrapper, latents, sigmas)
+                # latents = sample_res_multistep(model_wrapper, latents, sigmas)
+                latents = sample_euler(
+                    model_wrapper, latents, num_steps=steps, shift=shift
+                )
 
             # Decode one by one to save VRAM
             for j, latent in enumerate(latents):

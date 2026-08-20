@@ -7,11 +7,11 @@ from src.diffusion.schedules import BaseSchedule
 
 def logit_normal_sample(n, device, mean=0.0, std=1.0, shift=1.0):
     """
-    Samples t from a Logit-Normal distribution.
-    Applies timeshift mathematically by adding log(shift) to the mean.
+    Samples t from a Logit-Normal distribution for t=0 (Noise) -> t=1 (Data).
+    Shifts the mean by -log(shift) to concentrate samples towards noise (t=0).
     """
     # For t=0 (Data), FLUX shifts logit by log(s).
-    mean = math.log(shift) if shift != 1.0 else 0.0
+    mean = -math.log(shift) if shift != 1.0 else 0.0
     s = torch.randn(n, device=device) * std + mean
     return torch.sigmoid(s)
 

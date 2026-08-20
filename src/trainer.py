@@ -12,6 +12,7 @@ import random
 import wandb
 from omegaconf import DictConfig, OmegaConf
 from datetime import datetime
+import logging
 
 from src.diffusion.schedules import LinearSchedule, DDPMSchedule
 from src.diffusion.objectives import FlowMatchingObjective, DDPMObjective
@@ -148,7 +149,7 @@ class Trainer:
             patch_torch_compile()
             patch_compiled_autograd()
             if self.global_rank == 0:
-                print("Compiling model and loss step with torch.compile...")
+                logging.info("Compiling model and loss step with torch.compile...")
             # TODO: compile text_encoder and vae
             self.unet = torch.compile(self.unet)
             # self.text_encoder = torch.compile(self.text_encoder)
@@ -173,7 +174,7 @@ class Trainer:
         self.peak_tflops = cfg.train.get("gpu_peak_tflops", 165.2)
         self.flops_factor = 7 if cfg.train.get("use_checkpointing", True) else 6
         if self.global_rank == 0:
-            print(f"Training {self.num_params / 1e6}M parameters")
+            logging.info(f"Training {self.num_params / 1e6}M parameters")
 
     def setup_device(self):
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -182,7 +183,7 @@ class Trainer:
         self.is_ddp = self.world_size > 1
 
         if self.is_ddp and not dist.is_initialized():
-            print(
+            logging.info(
                 f"Initializing DDP: Rank {self.global_rank}/{self.world_size}, Local Rank {self.local_rank}"
             )
             dist.init_process_group(backend="nccl")
@@ -196,14 +197,14 @@ class Trainer:
         np.random.seed(current_seed)
 
         if self.global_rank == 0:
-            print(
+            logging.info(
                 f"Training on {self.world_size} GPUs. Precision: {self.cfg.train.dtype}"
             )
 
-        print(f"CUDA version: {torch.version.cuda}")
+        logging.info(f"CUDA version: {torch.version.cuda}")
         capability = torch.cuda.get_device_capability()
         if self.dtype == torch.bfloat16 and capability[0] < 8:
-            print(
+            logging.info(
                 f"Warning: bfloat16 specified but GPU capability "
                 f"({capability[0]}.{capability[1]}) may not fully support it. "
                 f"Consider float16 or float32."
@@ -213,21 +214,21 @@ class Trainer:
         if capability[0] >= 7 and capability[0] < 8:
             self.autocast_dtype = torch.float16
             torch.set_float32_matmul_precision("high")
-            print("Using high precision for float32 matmul (tensor cores).")
+            logging.info("Using high precision for float32 matmul (tensor cores).")
         elif capability[0] >= 8:
             torch.set_float32_matmul_precision("medium")
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
             torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-            print("Using half precision for float32 matmul (tensor cores).")
+            logging.info("Using half precision for float32 matmul (tensor cores).")
         else:
-            print(
+            logging.info(
                 "Tensor cores for float32 matmul not optimally supported "
                 "or GPU is older."
             )
 
-        print(f"Using {self.autocast_dtype} for autocast")
+        logging.info(f"Using {self.autocast_dtype} for autocast")
         # patch_unsloth_smart_gradient_checkpointing(self.autocast_dtype)
 
     def _load_sample_configs(self):
@@ -236,7 +237,9 @@ class Trainer:
             self.cfg.sampling.config_file
         ):
             if self.global_rank == 0:
-                print(f"Loading sample configs from {self.cfg.sampling.config_file}")
+                logging.info(
+                    f"Loading sample configs from {self.cfg.sampling.config_file}"
+                )
             with open(self.cfg.sampling.config_file, "r") as f:
                 toml_conf = toml.load(f)
                 defaults = toml_conf.get("prompt", {})
@@ -325,11 +328,16 @@ class Trainer:
 
         return metrics
 
-    def fit(self):
+    def fit(self, timestamp=None):
         # Prepare W&B run name and config
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         current_run_name = f"{self.cfg.logging.wandb_run_name_prefix}-{timestamp}"
+        base_save_dir = self.cfg.logging.get("save_dir", "results")
+        self.output_dir = os.path.join(base_save_dir, "train", timestamp)
+        self.sample_dir = os.path.join(self.output_dir, "samples")
         if self.global_rank == 0:
+            os.makedirs(self.sample_dir, exist_ok=True)
             config = {
                 **OmegaConf.to_container(self.cfg.logging),
                 **OmegaConf.to_container(self.cfg.data),
@@ -501,11 +509,23 @@ class Trainer:
                                 / self.cfg.train.gradient_accumulation_steps
                             )
 
+                            cpu_avg_grad_loss = avg_grad_loss.detach().item()
+                            cpu_norm_unet = norm_unet.detach().item()
+                            actual_lr = self.optimizer.param_groups[0]["lr"]
+
+                            # Update progress bar locally (independent of W&B)
+                            pbar.set_postfix(
+                                {
+                                    "loss": f"{cpu_avg_grad_loss:.4f}",
+                                    "norm": f"{cpu_norm_unet:.3f}",
+                                    "lr": f"{actual_lr:.2e}",
+                                }
+                            )
                             log_payload = {
-                                "train/loss_step": avg_grad_loss.detach().item(),
+                                "train/loss_step": cpu_avg_grad_loss,
                                 "train/unscaled_loss_step": avg_grad_unscaled_loss.detach().item(),
-                                "train/grad_norm_unet_step": norm_unet.detach().item(),
-                                "learning_rate": self.optimizer.param_groups[0]["lr"],
+                                "train/grad_norm_unet_step": cpu_norm_unet,
+                                "learning_rate": actual_lr,
                                 "batch_size": batch_size_accum,
                             }
                             if norm_text_encoder:
@@ -622,7 +642,7 @@ class Trainer:
                             )
 
                             if self.global_rank == 0:
-                                print(
+                                logging.info(
                                     f"Ep {epoch + 1}, Step {self.global_step:06d}, "
                                     f"Step imgs/sec: {imagesps}, Avg imgs/sec: {avg_imagesps}, "
                                     f"mfu: {mfu}, hfu: {hfu}, tokens/s {tokensps}"
@@ -640,7 +660,7 @@ class Trainer:
                                     log_payload, step=self.global_step, commit=False
                                 )
 
-                                print(
+                                logging.info(
                                     f"Generating samples at step {self.global_step}..."
                                 )
                                 unet_infer = (
@@ -667,7 +687,13 @@ class Trainer:
                                     ]
                                 # Offload upload to thread
                                 io_executor.submit(
-                                    log_image, images, prompts, epoch, self.global_step
+                                    log_image,
+                                    images,
+                                    prompts,
+                                    epoch,
+                                    self.global_step,
+                                    False,
+                                    self.sample_dir,
                                 )
                                 self.unet.train()
                                 if self.train_te:
@@ -682,7 +708,7 @@ class Trainer:
                 else float("inf")
             )
             if self.global_rank == 0:
-                print(
+                logging.info(
                     f"End of Epoch {epoch + 1}/{self.cfg.train.epochs}: Avg Train Loss: {avg_epoch_loss:.4f}"
                 )
                 log_metrics(
@@ -709,7 +735,7 @@ class Trainer:
                 cumulative_images / cumulative_time if cumulative_time > 0 else 0
             )
             if self.global_rank == 0:
-                print(
+                logging.info(
                     f"Ep {epoch + 1}, Step {self.global_step:06d}, "
                     f"Step imgs/sec: {imagesps}, Avg imgs/sec: {avg_imagesps}"
                     f"Trained {images_total} images, Tokens {tokens_total}"
@@ -721,7 +747,7 @@ class Trainer:
                 }
                 log_metrics(log_payload, step=self.global_step, commit=False)
 
-                print(f"Generating samples at step {self.global_step}...")
+                logging.info(f"Generating samples at step {self.global_step}...")
                 unet_infer = self.unet.module if self.is_ddp else self.unet
                 del batch
 
@@ -766,5 +792,5 @@ class Trainer:
         if inspector:
             inspector.remove_hooks()
         if self.global_rank == 0:
-            print("Training Complete.")
+            logging.info("Training Complete.")
             wandb.finish()

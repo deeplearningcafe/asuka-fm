@@ -1,10 +1,5 @@
 import torch
-from src.models.unet import Unet, UnetConfig
-from src.models.dual_stream import DualStreamDiT
-from src.models.sprint import SprintDualStreamDiT
-from src.models.text_encoders.clip import Clip, ClipConfig
-from src.models.vae import Vae, VaeConfig
-from src.utils.ema import EMAModel
+import logging
 from safetensors.torch import load_file
 from transformers import CLIPTokenizer
 import os
@@ -12,6 +7,12 @@ import torch.nn as nn
 from functools import partial
 from typing import Any, List, Dict
 import omegaconf
+from src.models.unet import Unet, UnetConfig
+from src.models.dual_stream import DualStreamDiT
+from src.models.sprint import SprintDualStreamDiT
+from src.models.text_encoders.clip import Clip, ClipConfig
+from src.models.vae import Vae, VaeConfig
+from src.utils.ema import EMAModel
 from src.models.text_encoders.text_encoders import (
     HFTextEncoder,
     CLIPTextEncoderWrapper,
@@ -99,7 +100,7 @@ class ModelInspector:
                 )
                 self.hooks.extend([f_hook, b_hook])
 
-        print(f"Registered {len(self.hooks)} hooks for stability checks.")
+        logging.info(f"Registered {len(self.hooks)} hooks for stability checks.")
 
     def log_stats(self, step: int):
         if not self.activation_tensors and not self.gradient_tensors:
@@ -126,7 +127,7 @@ class ModelInspector:
         for hook in self.hooks:
             hook.remove()
         self.hooks.clear()
-        print("Removed all stability check hooks.")
+        logging.info("Removed all stability check hooks.")
 
 
 def load_trainable_model(
@@ -154,7 +155,7 @@ def load_trainable_model(
 
     if resume_from_checkpoint and os.path.isdir(resume_from_checkpoint):
         if global_rank == 0:
-            print(
+            logging.info(
                 f"Attempting to load weights from checkpoint: {resume_from_checkpoint}"
             )
         ckpt_unet_path = os.path.join(resume_from_checkpoint, "unet.safetensors")
@@ -163,17 +164,17 @@ def load_trainable_model(
         if os.path.exists(ckpt_unet_path):
             unet_path = ckpt_unet_path
             if global_rank == 0:
-                print(f"  -> Found UNet weights: {unet_path}")
+                logging.info(f"  -> Found UNet weights: {unet_path}")
 
         if train_te and os.path.exists(ckpt_te_path):
             te_path = ckpt_te_path
             if global_rank == 0:
-                print(f"  -> Found Text Encoder weights: {te_path}")
+                logging.info(f"  -> Found Text Encoder weights: {te_path}")
 
     hf_te_id = getattr(model_cfg, "hf_text_encoder", None)
     if hf_te_id:
         if global_rank == 0:
-            print(f"Loading HuggingFace Text Encoder: {hf_te_id}")
+            logging.info(f"Loading HuggingFace Text Encoder: {hf_te_id}")
         text_encoder = HFTextEncoder(
             hf_te_id,
             torch_dtype=autocast_dtype,
@@ -196,7 +197,7 @@ def load_trainable_model(
         text_embed_dim = 768
 
     if global_rank == 0:
-        print(f"Loading {model_type} model from {models_path}...")
+        logging.info(f"Loading {model_type} model from {models_path}...")
     try:
         hidden_size = getattr(model_cfg, "hidden_size", 768) if model_cfg else 768
         depth = getattr(model_cfg, "depth", 16) if model_cfg else 16
@@ -281,7 +282,7 @@ def load_trainable_model(
             ema_path = os.path.join(resume_from_checkpoint, "unet_ema.safetensors")
             # Only rank 0 has ema.use_ema = True
             if os.path.exists(ema_path) and ema.use_ema:
-                print(f"  -> Found EMA weights: {ema_path}")
+                logging.info(f"  -> Found EMA weights: {ema_path}")
                 ema.ema_model.load_state_dict(load_file(ema_path, device="cpu"))
 
         # text_encoder = Clip.from_pretrained(ClipConfig(), te_path).eval()
@@ -294,7 +295,7 @@ def load_trainable_model(
         vae.to(device)
 
         if global_rank == 0:
-            print(f"Moving models to {device} and converting to {dtype}")
+            logging.info(f"Moving models to {device} and converting to {dtype}")
         unet.to(device)
         text_encoder.to(device)
 
@@ -303,7 +304,7 @@ def load_trainable_model(
             text_encoder.to(dtype=dtype)
 
     except Exception as e:
-        print(f"ERROR: Could not load model: {e}")
+        logging.info(f"ERROR: Could not load model: {e}")
         raise
 
     param_grad = not train_only_output
@@ -311,7 +312,7 @@ def load_trainable_model(
         param.requires_grad = param_grad
 
     if train_only_output:
-        print("Configuring for Output Head training only.")
+        logging.info("Configuring for Output Head training only.")
         unet.conv_norm_out.bias.requires_grad = True
         unet.conv_norm_out.weight.requires_grad = True
         unet.conv_out.bias.requires_grad = True
@@ -325,7 +326,7 @@ def load_trainable_model(
             param.requires_grad = True
         text_encoder.train()
     else:
-        print("Freezing Text Encoder (converting to bf16)")
+        logging.info("Freezing Text Encoder (converting to bf16)")
         text_encoder.to(dtype=autocast_dtype)
         for param in text_encoder.parameters():
             param.requires_grad = False
@@ -349,7 +350,7 @@ def load_training_state(
         return optimizer, scheduler, start_epoch, global_step
 
     if global_rank == 0:
-        print(f"Resuming training state from: {checkpoint_path}")
+        logging.info(f"Resuming training state from: {checkpoint_path}")
 
     # Load Epoch/Step
     state_path = os.path.join(checkpoint_path, "training_state.pt")
@@ -358,19 +359,21 @@ def load_training_state(
         start_epoch = state.get("epoch", 0)
         global_step = state.get("global_step", 0)
         if global_rank == 0:
-            print(f"  -> Resuming from epoch {start_epoch}, global step {global_step}")
+            logging.info(
+                f"  -> Resuming from epoch {start_epoch}, global step {global_step}"
+            )
 
     optimizer_path = os.path.join(checkpoint_path, "optimizer.pt")
     if os.path.exists(optimizer_path):
         optimizer.load_state_dict(torch.load(optimizer_path, map_location=device))
         if global_rank == 0:
-            print("  -> Optimizer state loaded.")
+            logging.info("  -> Optimizer state loaded.")
 
     scheduler_path = os.path.join(checkpoint_path, "scheduler.pt")
     if scheduler and os.path.exists(scheduler_path):
         scheduler.load_state_dict(torch.load(scheduler_path, map_location=device))
         if global_rank == 0:
-            print("  -> Scheduler state loaded.")
+            logging.info("  -> Scheduler state loaded.")
 
     torch.cuda.empty_cache()
     return optimizer, scheduler, start_epoch, global_step
@@ -618,13 +621,13 @@ def create_scheduler(optim, train_loader, conf: omegaconf.DictConfig):
     )
 
     if conf.train.get("use_cos_scheduler", False):
-        print("Using cosine lr scheduler")
+        logging.info("Using cosine lr scheduler")
         cosine_steps = max(1, total_steps - warmup_steps)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optim, T_max=cosine_steps, eta_min=conf.train.lr * 0.1
         )
     else:
-        print("Using constant lr scheduler")
+        logging.info("Using constant lr scheduler")
         constant_steps = max(1, total_steps - warmup_steps)
         scheduler = torch.optim.lr_scheduler.ConstantLR(
             optim, factor=1.0, total_iters=constant_steps

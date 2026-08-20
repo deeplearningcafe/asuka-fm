@@ -1,5 +1,6 @@
 import torch
 import warnings
+import logging
 from torch.utils.data import DataLoader
 from src.data.dataset import (
     H5LatentDataset,
@@ -114,7 +115,7 @@ def worker_init_fn(worker_id: int):
     Initializes individual worker processes, invoking internal state setup
     for worker-exclusive H5 handle generation.
     """
-    print(f"Initializing worker {worker_id}")
+    logging.info(f"Initializing worker {worker_id}")
     worker_info = torch.utils.data.get_worker_info()
     if worker_info:
         dataset = worker_info.dataset
@@ -125,7 +126,7 @@ def worker_init_fn(worker_id: int):
                 f"Worker {worker_id} received unexpected dataset type: {type(dataset)}"
             )
     else:
-        print("Running in main process, worker_init_fn called.")
+        logging.info("Running in main process, worker_init_fn called.")
 
 
 def cleanup_h5_handles():
@@ -134,8 +135,8 @@ def cleanup_h5_handles():
     unmanaged system level resource leakage.
     """
     global WORKER_H5_HANDLES
-    print("Attempting to clean up H5 handles...")
+    logging.info("Attempting to clean up H5 handles...")
     worker_ids = list(WORKER_H5_HANDLES.keys())
     for worker_id in worker_ids:
         _close_h5_handles_worker(worker_id)
-    print(f"Cleanup finished for workers: {worker_ids}")
+    logging.info(f"Cleanup finished for workers: {worker_ids}")

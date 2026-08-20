@@ -1,3 +1,4 @@
+import os
 import wandb
 from huggingface_hub import HfApi
 from PIL import Image
@@ -65,6 +66,7 @@ def log_image(
     epoch_num: int,
     step: int,
     commit: bool = False,
+    output_dir: str = "results/samples",
 ):
     """
     Logs an image to W&B with explicit step and commit control.
@@ -75,6 +77,7 @@ def log_image(
         caption (str, optional): Caption for the image.
         step (int, optional): The current step.
         commit (bool): Whether to commit the log immediately.
+        output_dir (str): Destination folder when saving locally.
     """
     if _wandb_run:
         try:
@@ -97,6 +100,21 @@ def log_image(
         except Exception as e:
             print(f"Error logging image to W&B: {e}")
             print(f"Image key: {image_key}, Step: {step}")
+    else:
+        try:
+            save_folder = os.path.join(
+                output_dir, f"epoch_{epoch_num:03d}_step_{step:06d}"
+            )
+            os.makedirs(save_folder, exist_ok=True)
+            for i, (img, prompt) in enumerate(zip(imgs, prompts)):
+                img_path = os.path.join(save_folder, f"sample_{i:02d}.png")
+                img.save(img_path)
+                txt_path = os.path.join(save_folder, f"sample_{i:02d}.txt")
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(f"Epoch: {epoch_num} | Step: {step}\nPrompt: {prompt}\n")
+            print(f"Saved {len(imgs)} sample images locally to: {save_folder}")
+        except Exception as e:
+            print(f"Error saving images to disk: {e}")
 
 
 def finish_wandb():

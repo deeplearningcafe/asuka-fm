@@ -1,11 +1,3 @@
-"""
-Overfit One Batch Script for ASUKA-FM.
-
-Validates convergence, parameter capacity, and sampling fidelity by
-memorizing a single batch. Fully compatible with DualStreamDiT,
-SprintDualStreamDiT, and SD1.5 UNet architectures.
-"""
-
 import os
 import math
 import random
@@ -13,6 +5,7 @@ import logging
 import argparse
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+from src.utils.logging_utils import Logger
 
 import torch
 import numpy as np
@@ -82,16 +75,19 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if cfg.train.dtype == "bf16" else torch.float32
 
+    model_type = getattr(cfg.models, "model_type", "unet")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     save_dir = os.path.join("results", "overfit", timestamp)
-    os.makedirs(save_dir, exist_ok=True)
-
+    Logger.setup_logging(
+        save_dir=save_dir,
+        logging_name=f"{model_type}_loss_{cfg.train['objective']}",
+    )
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
     random.seed(cfg.train.seed)
 
-    model_type = getattr(cfg.models, "model_type", "unet")
     logging.info(f"Initializing model architecture: {model_type}")
+    logging.info(cfg)
 
     unet, text_encoder, vae, tokenizer, ema = load_trainable_model(
         models_path=cfg.paths.models,
@@ -141,7 +137,6 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
                 dist = vae.encode(images)
                 latents = dist.sample() if hasattr(dist, "sample") else dist
                 latents = (latents - vae_mean) / vae_std
-                print(torch.isnan(latents).any())
         attention_mask = mask.to(device)
         pos_map = pos_map.to(device, dtype=dtype)
         tag_weights = tag_weights.to(device, dtype=dtype)
@@ -179,8 +174,8 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
         }
         if pos_map is not None:
             cfg_dict["pos_map"] = pos_map[i : i + 1]
+        logging.info(cfg_dict["prompt"])
         sample_configs.append(cfg_dict)
-    print(sample_configs)
 
     num_steps = args.steps
     sample_interval = args.sample_interval
@@ -193,7 +188,6 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
                 cond, mask=attention_mask, drop_mask=None
             )
 
-    print(torch.isnan(encoder_hidden_states).any())
     for step in range(num_steps):
         optimizer.zero_grad(set_to_none=True)
 

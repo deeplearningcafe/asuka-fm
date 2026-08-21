@@ -134,15 +134,30 @@ class Trainer:
 
         if self.is_ddp:
             self.unet = DDP(
-                self.unet, device_ids=[self.local_rank], output_device=self.local_rank
+                self.unet,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                gradient_as_bucket_view=True,
             )
             if cfg.train.train_te:
                 self.text_encoder = DDP(
                     self.text_encoder,
                     device_ids=[self.local_rank],
                     output_device=self.local_rank,
+                    gradient_as_bucket_view=True,
                 )
-            self.model.register_comm_hook(state=None, hook=default.bf16_compress_hook)
+            # Select DDP communication hook based on autocast precision
+            if self.autocast_dtype == torch.bfloat16:
+                comm_hook = default.bf16_compress_hook
+            elif self.autocast_dtype == torch.float16:
+                comm_hook = default.fp16_compress_hook
+            else:
+                comm_hook = None
+
+            if comm_hook is not None:
+                self.unet.register_comm_hook(state=None, hook=comm_hook)
+                if cfg.train.train_te:
+                    self.text_encoder.register_comm_hook(state=None, hook=comm_hook)
 
         self.compile_model = cfg.train.get("compile_model", True)
         if hasattr(torch, "compile") and self.compile_model:

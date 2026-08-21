@@ -112,7 +112,7 @@ class StreamingImageDataset(IterableDataset):
                 storage_options=storage_options,
             )
 
-        if world_size > 1:
+        if self.world_size > 1:
             self.hf_dataset = split_dataset_by_node(
                 self.hf_dataset, rank=rank, world_size=world_size
             )

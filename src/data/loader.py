@@ -34,6 +34,10 @@ def create_dataloader(cfg, rank, tokenizer=None) -> DataLoader:
         tier_lengths = cfg.data.get(
             "tier_lengths", getattr(dataset, "length_tiers", [77, 152, 227])
         )
+        # 10K uses a lot of ram
+        default_buf = min(1024, dataset.samples_per_shard)
+        buffer_size = cfg.data.get("buffer_size", default_buf)
+
         batched_stream = StreamingTokenTierBatchSampler(
             dataset=dataset,
             base_batch_size=cfg.train.batch_size,
@@ -45,7 +49,7 @@ def create_dataloader(cfg, rank, tokenizer=None) -> DataLoader:
             world_size=getattr(cfg.train, "world_size", 1),
             rank=rank,
             aesthetic_curriculum=cfg.data.get("aesthetic_curriculum", True),
-            buffer_size=cfg.data.get("buffer_size", dataset.samples_per_shard),
+            buffer_size=buffer_size,
         )
 
         dataloader = DataLoader(

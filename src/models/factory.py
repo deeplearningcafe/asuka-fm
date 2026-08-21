@@ -307,16 +307,25 @@ def load_trainable_model(
         logging.info(f"ERROR: Could not load model: {e}")
         raise
 
-    param_grad = not train_only_output
-    for param in unet.parameters():
-        param.requires_grad = param_grad
-
     if train_only_output:
         logging.info("Configuring for Output Head training only.")
-        unet.conv_norm_out.bias.requires_grad = True
-        unet.conv_norm_out.weight.requires_grad = True
-        unet.conv_out.bias.requires_grad = True
-        unet.conv_out.weight.requires_grad = True
+        # nn.module default is true
+        for param in unet.parameters():
+            param.requires_grad = False
+
+        if hasattr(unet, "proj_out"):
+            # DiT / Sprint
+            for param in unet.proj_out.parameters():
+                param.requires_grad = True
+            if hasattr(unet, "norm_final"):
+                for param in unet.norm_final.parameters():
+                    param.requires_grad = True
+        elif hasattr(unet, "conv_out"):
+            # UNet
+            unet.conv_norm_out.bias.requires_grad = True
+            unet.conv_norm_out.weight.requires_grad = True
+            unet.conv_out.bias.requires_grad = True
+            unet.conv_out.weight.requires_grad = True
 
     unet.train()
 
@@ -415,7 +424,7 @@ def create_optimizer_param_groups(
                     decay.append(param)
         return decay, no_decay
 
-    if model_type == "dual_stream":
+    if model_type in ["dual_stream", "sprint_dual"]:
         decay, no_decay = [], []
         for name, param in unet_model.named_parameters():
             if not param.requires_grad:

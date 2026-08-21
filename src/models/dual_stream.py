@@ -344,6 +344,14 @@ class DualStreamDiT(nn.Module):
         self.norm_final = nn.RMSNorm(hidden_size, eps=eps)
         self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
 
+        # Freeze dead text path in the final decoder block (output is discarded)
+        if len(self.out_blocks) > 0:
+            last_block = self.out_blocks[-1]
+            for p in last_block.attn.proj_text.parameters():
+                p.requires_grad = False
+            for p in last_block.mlp_text.parameters():
+                p.requires_grad = False
+
         self._zero_initialize_output()
 
     def _zero_initialize_output(self):

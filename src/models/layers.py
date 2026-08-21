@@ -536,35 +536,20 @@ class MultimodalRopeEmbedder(nn.Module):
         super().__init__()
         axes_lens = (max_text_len, max_spatial_dim, max_spatial_dim)
 
-        cos_tables = []
-        sin_tables = []
-        inv_freqs = []
-        for dim, axis_len in zip(axes_dims, axes_lens):
+        for i, (dim, axis_len) in enumerate(zip(axes_dims, axes_lens)):
             steps = torch.arange(0, dim, 2, dtype=torch.float32)
             base = 1.0 / (theta ** (steps / dim))
-            inv_freqs.append(base)
+            self.register_buffer(f"inv_freq_{i}", base, persistent=False)
 
-            positions = torch.arange(axis_len, dtype=torch.float32)
-            angles = positions[:, None] * base[None, :]
-            cos_tables.append(angles.cos())
-            sin_tables.append(angles.sin())
-
-        self.cos_tables = nn.ParameterList(
-            [nn.Parameter(t, requires_grad=False) for t in cos_tables]
-        )
-        self.sin_tables = nn.ParameterList(
-            [nn.Parameter(t, requires_grad=False) for t in sin_tables]
-        )
-        self.inv_freqs = nn.ParameterList(
-            [nn.Parameter(f, requires_grad=False) for f in inv_freqs]
-        )
+        self.num_axes = len(axes_dims)
 
     def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculates rotary embeddings for integer or floating coordinates."""
         cos = []
         sin = []
         pos_float = position_ids.float()
-        for axis_idx, inv_freq in enumerate(self.inv_freqs):
+        for axis_idx in range(self.num_axes):
+            inv_freq = getattr(self, f"inv_freq_{axis_idx}")
             pos = pos_float[:, :, axis_idx]
             # Outer product: [B, SeqLen, 1] * [1, 1, Dim // 2]
             angles = pos.unsqueeze(-1) * inv_freq.to(pos.device).view(1, 1, -1)

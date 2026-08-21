@@ -259,8 +259,6 @@ class SprintDualStreamDiT(DualStreamDiT):
         # torch compile squeezes during bw so remove dims
         self.mask_token_image = nn.Parameter(torch.zeros(self.hidden_size))
         self.mask_token_text = nn.Parameter(torch.zeros(self.hidden_size))
-        torch.nn.init.normal_(self.mask_token_image, std=0.02)
-        torch.nn.init.normal_(self.mask_token_text, std=0.02)
 
         if self.residual_type == "concat_linear":
             self.renoise_linear_image = nn.Linear(
@@ -271,6 +269,30 @@ class SprintDualStreamDiT(DualStreamDiT):
             torch.nn.init.xavier_uniform_(self.renoise_linear_text.weight)
             nn.init.zeros_(self.renoise_linear_image.bias)
             nn.init.zeros_(self.renoise_linear_text.bias)
+
+        # Freeze dead text path in the final decoder block (output is discarded)
+        if len(self.out_blocks) > 0:
+            last_block = self.out_blocks[-1]
+            for p in last_block.attn.proj_text.parameters():
+                p.requires_grad = False
+            for p in last_block.mlp_text.parameters():
+                p.requires_grad = False
+
+        # Freeze unused drop parameters based on drop_target
+        if self.drop_target not in ["text", "both"]:
+            self.mask_token_text.requires_grad = False
+            if hasattr(self, "renoise_linear_text"):
+                for p in self.renoise_linear_text.parameters():
+                    p.requires_grad = False
+
+        if self.drop_target not in ["image", "both"]:
+            self.mask_token_image.requires_grad = False
+            if hasattr(self, "renoise_linear_image"):
+                for p in self.renoise_linear_image.parameters():
+                    p.requires_grad = False
+
+        torch.nn.init.normal_(self.mask_token_image, std=0.02)
+        torch.nn.init.normal_(self.mask_token_text, std=0.02)
 
         self._zero_initialize_output()
 
@@ -482,6 +504,9 @@ class SprintDualStreamDiT(DualStreamDiT):
                 skip=skip_tensors,
             )
 
+        # last text tokens dualdit is useless, only K and V are used,
+        # proj_text, and mlp_text are not used
+        # so last layers could use single stream like flux
         tokens = self.proj_out(self.norm_final(image_tokens))
 
         tokens = tokens.reshape(bsz, h_patches, w_patches, p, p, self.out_channels)

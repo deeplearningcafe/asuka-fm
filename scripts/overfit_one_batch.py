@@ -179,6 +179,7 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
 
     num_steps = args.steps
     sample_interval = args.sample_interval
+    debug_params = args.debug_params
 
     logging.info(f"Beginning overfit loop for {num_steps} iterations...")
     unet.train()
@@ -202,6 +203,10 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
             )
 
         loss.backward()
+        if debug_params:
+            for name, param in unet.named_parameters():
+                if param.requires_grad and param.grad is None:
+                    print(f"[UNUSED PARAMETER] {name} | shape: {param.shape}")
         torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
         optimizer.step()
         if lr_scheduler is not None:
@@ -258,6 +263,7 @@ def main():
     parser.add_argument(
         "--sample_interval", type=int, default=250, help="Sampling interval"
     )
+    parser.add_argument("--debug_params", action="store_true")
     parser.add_argument("opts", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 

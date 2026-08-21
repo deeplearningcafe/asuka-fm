@@ -185,6 +185,13 @@ class StreamingTokenTierBatchSampler(IterableDataset):
         return images, tokens, mask, pos_map, tag_weights, aes_tier
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, ...]]:
+        try:
+            import pyarrow as pa
+
+            pa_pool = pa.default_memory_pool()
+        except ImportError:
+            pa_pool = None
+
         stream_iter = (
             self.dataset.iter_raw()
             if hasattr(self.dataset, "iter_raw")
@@ -193,6 +200,10 @@ class StreamingTokenTierBatchSampler(IterableDataset):
         exhausted = False
 
         while not exhausted:
+            # Reclaim unused Arrow pool memory between buffer batches
+            if pa_pool is not None:
+                pa_pool.release_unused()
+
             # Fast fill buffer with raw sample
             buffer_samples = []
             for _ in range(self.buffer_size):

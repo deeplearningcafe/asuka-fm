@@ -81,11 +81,12 @@ class StreamingImageDataset(IterableDataset):
         else:
             self.num_samples = self.total_samples
 
-        fsspec.spec.AbstractBufferedFile.DEFAULT_BLOCK_SIZE = 128 * 1024 * 1024
-        fsspec.utils.DEFAULT_BLOCK_SIZE = 128 * 1024 * 1024
+        # 128 is using > 30gb ram
+        fsspec.spec.AbstractBufferedFile.DEFAULT_BLOCK_SIZE = 32 * 1024 * 1024
+        fsspec.utils.DEFAULT_BLOCK_SIZE = 32 * 1024 * 1024
 
         storage_options = {
-            "block_size": 128 * 1024 * 1024,
+            "block_size": 32 * 1024 * 1024,
             "cache_type": "readahead",
         }
 
@@ -209,13 +210,25 @@ class StreamingImageDataset(IterableDataset):
 
         return img_tensor, tokens, mask, pos_map, tag_weight, aes_tier
 
+    def _get_worker_stream(self):
+        """Splits streaming dataset across DataLoader worker processes."""
+        worker_info = torch.utils.data.get_worker_info()
+        dataset = self.hf_dataset
+        if worker_info is not None and worker_info.num_workers > 1:
+            dataset = split_dataset_by_node(
+                dataset,
+                rank=worker_info.id,
+                world_size=worker_info.num_workers,
+            )
+        return dataset
+
     def iter_raw(self):
         """Yields raw sample dictionaries without image/text processing."""
-        for sample in self.hf_dataset:
+        for sample in self._get_worker_stream():
             yield sample
 
     def __iter__(self):
-        for sample in self.hf_dataset:
+        for sample in self._get_worker_stream():
             try:
                 yield self._process_sample(sample)
             except Exception:

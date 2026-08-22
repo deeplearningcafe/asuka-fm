@@ -5,6 +5,7 @@ from transformers import CLIPTokenizer
 import os
 import torch.nn as nn
 from functools import partial
+import gc
 from typing import Any, List, Dict
 import omegaconf
 from src.models.unet import Unet, UnetConfig
@@ -302,6 +303,10 @@ def load_trainable_model(
         if dtype != torch.float32:
             unet.to(dtype=dtype)
             text_encoder.to(dtype=dtype)
+
+        # clear ram
+        gc.collect()
+        torch.cuda.empty_cache()
 
     except Exception as e:
         logging.info(f"ERROR: Could not load model: {e}")

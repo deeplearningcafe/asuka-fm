@@ -1,5 +1,6 @@
 import io
 import math
+import logging
 import random
 import torch
 import json
@@ -54,6 +55,7 @@ class StreamingImageDataset(IterableDataset):
         shuffle_tags: bool = True,
         rank: int = 0,
         world_size: int = 1,
+        low_ram: bool = False,
     ):
         super().__init__()
         self.resolution = resolution
@@ -81,14 +83,20 @@ class StreamingImageDataset(IterableDataset):
         else:
             self.num_samples = self.total_samples
 
-        # 128 is using > 30gb ram
-        fsspec.spec.AbstractBufferedFile.DEFAULT_BLOCK_SIZE = 32 * 1024 * 1024
-        fsspec.utils.DEFAULT_BLOCK_SIZE = 32 * 1024 * 1024
-
         storage_options = {
-            "block_size": 32 * 1024 * 1024,
-            "cache_type": "readahead",
+            "block_size": 4 * 1024 * 1024,
+            "cache_type": "first",
         }
+        if not low_ram:
+            # 128 is using > 30gb ram
+            fsspec.spec.AbstractBufferedFile.DEFAULT_BLOCK_SIZE = 32 * 1024 * 1024
+            fsspec.utils.DEFAULT_BLOCK_SIZE = 32 * 1024 * 1024
+
+            storage_options = {
+                "block_size": 32 * 1024 * 1024,
+                "cache_type": "readahead",
+            }
+            logging.info("Using high ram settings!")
 
         if dataset_path is not None:
             dataset_path = Path(dataset_path)

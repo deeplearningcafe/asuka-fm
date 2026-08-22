@@ -29,6 +29,7 @@ def create_dataloader(cfg, rank, tokenizer=None) -> DataLoader:
             shuffle_tags=getattr(cfg.data, "shuffle_tags", True),
             rank=rank,
             world_size=getattr(cfg.train, "world_size", 1),
+            low_ram=getattr(cfg.data, "low_ram", False),
         )
 
         tier_lengths = cfg.data.get(

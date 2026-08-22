@@ -167,12 +167,12 @@ class Trainer:
                 logging.info("Compiling model and loss step with torch.compile...")
             # TODO: compile text_encoder and vae
             self.unet = torch.compile(self.unet)
-            # self.text_encoder = torch.compile(self.text_encoder)
-            self.vae = torch.compile(self.vae)
-            if hasattr(self.objective, "_compiled_loss_step"):
-                self.objective._compiled_loss_step = torch.compile(
-                    self.objective._compiled_loss_step
-                )
+            self.text_encoder = torch.compile(self.text_encoder)
+            # self.vae = torch.compile(self.vae)
+            # if hasattr(self.objective, "_compiled_loss_step"):
+            #     self.objective._compiled_loss_step = torch.compile(
+            #         self.objective._compiled_loss_step
+            #     )
 
         # Precision & Utils
         self.scaler = (
@@ -227,7 +227,7 @@ class Trainer:
 
         self.autocast_dtype = torch.bfloat16
         if capability[0] >= 7 and capability[0] < 8:
-            self.autocast_dtype = torch.float16
+            self.autocast_dtype = torch.float32
             torch.set_float32_matmul_precision("high")
             logging.info("Using high precision for float32 matmul (tensor cores).")
         elif capability[0] >= 8:
@@ -305,7 +305,9 @@ class Trainer:
 
         # mark as dynamic batch size, not resolution
         torch._dynamo.maybe_mark_dynamic(latents, 0)
+        torch._dynamo.maybe_mark_dynamic(cond, 0)
         torch._dynamo.maybe_mark_dynamic(cond, 1)
+        torch._dynamo.maybe_mark_dynamic(attention_mask, 0)
         torch._dynamo.maybe_mark_dynamic(attention_mask, 1)
 
         bs = latents.shape[0]

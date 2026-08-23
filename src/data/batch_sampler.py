@@ -127,6 +127,8 @@ class StreamingTokenTierBatchSampler(IterableDataset):
         self.buffer_size = buffer_size
         self.num_aesthetic_tiers = 5
         self.epoch = 0
+        self.samples_yielded = 0
+        self.total_samples = int(getattr(dataset, "total_samples", 0))
 
         self.generator = torch.Generator()
         self.generator.manual_seed(self.seed + self.rank)
@@ -134,6 +136,7 @@ class StreamingTokenTierBatchSampler(IterableDataset):
     def set_epoch(self, epoch: int):
         """Updates epoch seed and propagates to underlying dataset."""
         self.epoch = epoch
+        self.samples_yielded = 0
         self.generator.manual_seed(self.seed + self.rank + epoch)
         if hasattr(self.dataset, "set_epoch"):
             self.dataset.set_epoch(epoch)
@@ -197,136 +200,135 @@ class StreamingTokenTierBatchSampler(IterableDataset):
             if hasattr(self.dataset, "iter_raw")
             else iter(self.dataset)
         )
-        exhausted = False
 
-        while not exhausted:
-            # Reclaim unused Arrow pool memory between buffer batches
-            if pa_pool is not None:
-                pa_pool.release_unused()
+        # Persistent bins: [tier_idx][aesthetic_tier_idx]
+        bins: List[List[List[Any]]] = [
+            [[] for _ in range(self.num_aesthetic_tiers)] for _ in range(self.num_tiers)
+        ]
+        tier_counts = [0] * self.num_tiers
+        aes_counts = [[0] * self.num_aesthetic_tiers for _ in range(self.num_tiers)]
 
-            # Fast fill buffer with raw sample
-            buffer_samples = []
-            for _ in range(self.buffer_size):
-                try:
-                    sample = next(stream_iter)
-                    buffer_samples.append(sample)
-                except StopIteration:
-                    exhausted = True
-                    break
+        stream_exhausted = False
 
-            if not buffer_samples:
-                break
+        while True:
+            # Refill
+            current_buffered = sum(tier_counts)
+            if current_buffered < self.buffer_size and not stream_exhausted:
+                if pa_pool is not None:
+                    pa_pool.release_unused()
 
-            # [tier_idx][aesthetic_tier_idx]
-            bins: List[List[List[Any]]] = [
-                [[] for _ in range(self.num_aesthetic_tiers)]
-                for _ in range(self.num_tiers)
-            ]
-            tier_counts = [0] * self.num_tiers
-            aes_counts = [[0] * self.num_aesthetic_tiers for _ in range(self.num_tiers)]
-
-            for sample in buffer_samples:
-                if isinstance(sample, dict):
-                    tier_val = int(sample.get("tier", self.tier_lengths[-1]))
-                    aes_raw = int(sample.get("aesthetic_tier", -1))
-                elif isinstance(sample, (tuple, list)):
-                    tokens = sample[1]
-                    aes_val = sample[5]
-                    tier_val = (
-                        tokens.shape[-1] if hasattr(tokens, "shape") else len(tokens)
-                    )
-                    aes_raw = (
-                        int(aes_val.item())
-                        if hasattr(aes_val, "item")
-                        else int(aes_val)
-                    )
-                else:
-                    tier_val = self.tier_lengths[-1]
-                    aes_raw = -1
-
-                tier_idx = self._determine_tier_idx(tier_val)
-                aes_idx = self.AESTHETIC_TIER_MAP.get(aes_raw, 4)
-
-                bins[tier_idx][aes_idx].append(sample)
-                aes_counts[tier_idx][aes_idx] += 1
-                tier_counts[tier_idx] += 1
-
-            # Shuffle indices (tier, aesthetic)
-            for t_idx in range(self.num_tiers):
-                for a_idx in range(self.num_aesthetic_tiers):
-                    items = bins[t_idx][a_idx]
-                    if items:
-                        perm = torch.randperm(len(items), generator=self.generator)
-                        bins[t_idx][a_idx] = [items[i] for i in perm.tolist()]
-
-            total_rem = sum(tier_counts)
-            initial_total = max(1, total_rem)
-
-            while total_rem > 0:
-                active_tiers = [i for i, c in enumerate(tier_counts) if c > 0]
-                if not active_tiers:
-                    break
-
-                tier_weights = torch.tensor(
-                    [tier_counts[i] for i in active_tiers],
-                    dtype=torch.float32,
-                )
-                tier_probs = tier_weights / tier_weights.sum()
-                chosen_slot = torch.multinomial(
-                    tier_probs, 1, generator=self.generator
-                ).item()
-                chosen_tier = active_tiers[chosen_slot]
-
-                target_bs = self._calculate_batch_size(chosen_tier)
-                actual_bs = min(target_bs, tier_counts[chosen_tier])
-
-                if self.drop_last and actual_bs < target_bs:
-                    tier_counts[chosen_tier] = 0
-                    total_rem = sum(tier_counts)
-                    continue
-
-                batch_samples = []
-                while len(batch_samples) < actual_bs:
-                    avail_aes = [
-                        a
-                        for a in range(self.num_aesthetic_tiers)
-                        if aes_counts[chosen_tier][a] > 0
-                    ]
-                    if not avail_aes:
+                num_to_fetch = self.buffer_size - current_buffered
+                for _ in range(num_to_fetch):
+                    try:
+                        sample = next(stream_iter)
+                    except StopIteration:
+                        stream_exhausted = True
                         break
 
-                    if self.aesthetic_curriculum:
-                        prog = 1.0 - (total_rem / initial_total)
-                        p_simple = (1.0 - prog) * 0.4 + prog * 0.25
-                        p_complex = (1.0 - prog) * 0.1 + prog * 0.25
-                        weights = [
-                            p_simple if a in (1, 2) else p_complex for a in avail_aes
-                        ]
+                    # TODO: clean this
+                    if isinstance(sample, dict):
+                        tier_val = int(sample.get("tier", self.tier_lengths[-1]))
+                        aes_raw = int(sample.get("aesthetic_tier", -1))
+                    elif isinstance(sample, (tuple, list)):
+                        tokens = sample[1]
+                        aes_val = sample[5]
+                        tier_val = (
+                            tokens.shape[-1]
+                            if hasattr(tokens, "shape")
+                            else len(tokens)
+                        )
+                        aes_raw = (
+                            int(aes_val.item())
+                            if hasattr(aes_val, "item")
+                            else int(aes_val)
+                        )
                     else:
-                        weights = [float(aes_counts[chosen_tier][a]) for a in avail_aes]
+                        tier_val = self.tier_lengths[-1]
+                        aes_raw = -1
 
-                    aes_tensor = torch.tensor(weights, dtype=torch.float32)
-                    aes_probs = aes_tensor / aes_tensor.sum()
-                    aes_slot = torch.multinomial(
-                        aes_probs, 1, generator=self.generator
-                    ).item()
-                    chosen_aes = avail_aes[aes_slot]
+                    tier_idx = self._determine_tier_idx(tier_val)
+                    aes_idx = self.AESTHETIC_TIER_MAP.get(aes_raw, 4)
 
-                    num_needed = actual_bs - len(batch_samples)
-                    num_avail = aes_counts[chosen_tier][chosen_aes]
-                    take = min(num_needed, num_avail)
+                    bins[tier_idx][aes_idx].append(sample)
+                    aes_counts[tier_idx][aes_idx] += 1
+                    tier_counts[tier_idx] += 1
 
-                    src = bins[chosen_tier][chosen_aes]
-                    for _ in range(take):
+            ready_tiers = [
+                i
+                for i, count in enumerate(tier_counts)
+                if count >= self._calculate_batch_size(i)
+            ]
+
+            # DROP LAST
+            if not ready_tiers:
+                if stream_exhausted:
+                    break
+                continue
+
+            # tier proportionally to count
+            ready_weights = torch.tensor(
+                [tier_counts[i] for i in ready_tiers],
+                dtype=torch.float32,
+            )
+            slot = torch.multinomial(ready_weights, 1, generator=self.generator).item()
+            chosen_tier = ready_tiers[slot]
+            target_bs = self._calculate_batch_size(chosen_tier)
+
+            # batch with exact target_bs using aesthetic curriculum
+            batch_samples = []
+            while len(batch_samples) < target_bs:
+                avail_aes = [
+                    a
+                    for a in range(self.num_aesthetic_tiers)
+                    if aes_counts[chosen_tier][a] > 0
+                ]
+                if not avail_aes:
+                    break
+
+                if self.aesthetic_curriculum:
+                    prog = min(
+                        1.0,
+                        self.samples_yielded / max(1, self.total_samples),
+                    )
+                    p_simple = (1.0 - prog) * 0.4 + prog * 0.25
+                    p_complex = (1.0 - prog) * 0.1 + prog * 0.25
+                    weights = [
+                        p_simple if a in (1, 2) else p_complex for a in avail_aes
+                    ]
+                else:
+                    weights = [float(aes_counts[chosen_tier][a]) for a in avail_aes]
+
+                aes_tensor = torch.tensor(weights, dtype=torch.float32)
+                if aes_tensor.sum() <= 0 or not torch.all(torch.isfinite(aes_tensor)):
+                    aes_tensor = torch.ones(len(avail_aes), dtype=torch.float32)
+
+                aes_slot = torch.multinomial(
+                    aes_tensor, 1, generator=self.generator
+                ).item()
+                chosen_aes = avail_aes[aes_slot]
+
+                num_needed = target_bs - len(batch_samples)
+                num_avail = aes_counts[chosen_tier][chosen_aes]
+                take = min(num_needed, num_avail)
+
+                src = bins[chosen_tier][chosen_aes]
+                for _ in range(take):
+                    batch_samples.append(src.pop())
+
+                aes_counts[chosen_tier][chosen_aes] -= take
+
+            # ensure full target_bs
+            if len(batch_samples) < target_bs:
+                for a in range(self.num_aesthetic_tiers):
+                    src = bins[chosen_tier][a]
+                    while src and len(batch_samples) < target_bs:
                         batch_samples.append(src.pop())
+                        aes_counts[chosen_tier][a] -= 1
 
-                    aes_counts[chosen_tier][chosen_aes] -= take
+            tier_counts[chosen_tier] -= len(batch_samples)
+            self.samples_yielded += len(batch_samples)
 
-                tier_counts[chosen_tier] -= len(batch_samples)
-                total_rem -= len(batch_samples)
-
-                if len(batch_samples) >= self.min_batch_size or not self.drop_last:
-                    yield self._collate_batch(batch_samples)
+            yield self._collate_batch(batch_samples)
 
     def __len__(self) -> int:
         num_samples = getattr(

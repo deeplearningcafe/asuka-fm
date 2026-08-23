@@ -199,7 +199,6 @@ class StreamingImageDataset(IterableDataset):
         )
         tier_len = int(sample.get("tier", 227))
         prompt = sample.get("prompt") or sample.get("text", "")
-        # TODO: SHUFFLE TAGS
         # sample until tier len
         tokens, mask = self.tokenizer.encode(
             prompt,
@@ -208,8 +207,10 @@ class StreamingImageDataset(IterableDataset):
             tag_dropout_prob=self.tag_dropout_prob,
             shuffle_tags=self.shuffle_tags,
         )
+        is_uncond = mask.sum().item() <= 1
+        raw_tag_weight = float(sample.get("tag_weight", 1.0))
         tag_weight = torch.tensor(
-            float(sample.get("tag_weight", 1.0)), dtype=torch.float32
+            1.0 if is_uncond else raw_tag_weight, dtype=torch.float32
         )
         # TODO: use int?
         aes_tier = torch.tensor(

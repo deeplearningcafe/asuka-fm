@@ -141,6 +141,10 @@ class HFTextEncoder(BaseTextEncoder):
         self.model.eval()
         self.model.requires_grad_(False)
         self._embed_dim = self.model.config.hidden_size
+        self.bos_id = getattr(self.model.config, "bos_token_id", None)
+        if self.bos_id is None:
+            self.bos_id = 1
+        self.pad_id = getattr(self.model.config, "pad_token_id", 0) or 0
 
     @property
     def embed_dim(self) -> int:
@@ -158,12 +162,12 @@ class HFTextEncoder(BaseTextEncoder):
             mask = mask.to(device)
 
         if drop_mask is not None and drop_mask.any():
-            # WARNING: cfg must be empty prompt with its bos, pad only attention mask
-            pad_id = getattr(self.model.config, "pad_token_id", 0) or 0
             tokens = tokens.clone()
-            tokens[drop_mask] = pad_id
+            tokens[drop_mask] = self.pad_id
+            tokens[drop_mask, 0] = self.bos_id
             if mask is not None:
                 mask = mask.clone()
+                # attend only bos token
                 mask[drop_mask] = False
                 mask[drop_mask, 0] = True
 
@@ -188,6 +192,8 @@ class CLIPTextEncoderWrapper(BaseTextEncoder):
         self.clip_model = clip_model
         self.tokenizer = tokenizer
         self._embed_dim = getattr(getattr(clip_model, "config", None), "n_embd", 768)
+        self.bos_id = getattr(self.tokenizer, "bos_token_id", 49406) or 49406
+        self.eos_id = getattr(self.tokenizer, "eos_token_id", 49407) or 49407
 
     @property
     def embed_dim(self) -> int:
@@ -204,9 +210,9 @@ class CLIPTextEncoderWrapper(BaseTextEncoder):
         max_len = tokens.shape[-1]
 
         if drop_mask is not None and drop_mask.any():
-            eos_id = getattr(self.tokenizer, "eos_token_id", 49407)
             tokens = tokens.clone()
-            tokens[drop_mask] = eos_id
+            tokens[drop_mask] = self.eos_id
+            tokens[drop_mask, 0] = self.bos_id
             if mask is not None:
                 mask = mask.clone()
                 mask[drop_mask] = False

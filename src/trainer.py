@@ -227,7 +227,7 @@ class Trainer:
 
         self.autocast_dtype = torch.bfloat16
         if capability[0] >= 7 and capability[0] < 8:
-            self.autocast_dtype = torch.float32
+            self.autocast_dtype = torch.float16
             torch.set_float32_matmul_precision("high")
             logging.info("Using high precision for float32 matmul (tensor cores).")
         elif capability[0] >= 8:
@@ -295,6 +295,10 @@ class Trainer:
             tag_weights = tag_weights.to(
                 self.device, dtype=self.dtype, non_blocking=True
             )
+            torch._dynamo.maybe_mark_dynamic(pos_map, 0)
+            torch._dynamo.maybe_mark_dynamic(tag_weights, 0)
+            # tokenizer pipeline applies CFG
+            drop_mask = None
         else:
             latents = (
                 batch[0].to(self.device, dtype=self.dtype, non_blocking=True) * 0.18215
@@ -302,6 +306,11 @@ class Trainer:
             cond = batch[1]
             tag_weights = batch[2].to(self.device, dtype=self.dtype, non_blocking=True)
             attention_mask = batch[3].to(self.device, non_blocking=True)
+            bs = latents.shape[0]
+            # TODO: cache embeds of cfg
+            drop_mask = None
+            if self.cfg_dropout_prob > 0:
+                drop_mask = torch.rand(bs, device=self.device) < self.cfg_dropout_prob
 
         # mark as dynamic batch size, not resolution
         torch._dynamo.maybe_mark_dynamic(latents, 0)
@@ -309,12 +318,6 @@ class Trainer:
         torch._dynamo.maybe_mark_dynamic(cond, 1)
         torch._dynamo.maybe_mark_dynamic(attention_mask, 0)
         torch._dynamo.maybe_mark_dynamic(attention_mask, 1)
-
-        bs = latents.shape[0]
-        # TODO: cache embeds of cfg
-        drop_mask = None
-        if self.cfg_dropout_prob > 0:
-            drop_mask = torch.rand(bs, device=self.device) < self.cfg_dropout_prob
 
         with torch.autocast(
             device_type="cuda", dtype=self.autocast_dtype, enabled=True

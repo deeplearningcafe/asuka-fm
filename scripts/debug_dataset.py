@@ -19,11 +19,14 @@ import numpy as np
 from omegaconf import OmegaConf
 import torch
 import torchvision.utils as vutils
+from tqdm import tqdm
+import logging
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.loader import create_dataloader
 from src.models.text_encoders.tokenizer import HFLLMTokenizer
+from src.utils.logging_utils import Logger
 
 
 def parse_args():
@@ -48,7 +51,147 @@ def parse_args():
         default="debug_output",
         help="Directory to save inspection plots",
     )
+    parser.add_argument(
+        "--compute_vae_stats",
+        action="store_true",
+        help="Compute empirical mean (shift) and std (scale) for VAE",
+    )
+    parser.add_argument(
+        "--num_stat_samples",
+        type=int,
+        default=80000,
+        help="Max samples to scan for empirical VAE stats (default: 80k)",
+    )
+    parser.add_argument(
+        "--stat_chunk_size",
+        type=int,
+        default=64,
+        help="Chunk size for batching VAE encode during stat calculation",
+    )
     return parser.parse_args()
+
+
+def compute_empirical_vae_stats(
+    cfg,
+    dataloader,
+    num_samples: int = 80000,
+    chunk_size: int = 64,
+):
+    """
+    Computes online empirical mean and std of VAE latents using
+    Chan's parallel algorithm, matching toy-diffusion.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if cfg.train.dtype == "bf16" else torch.float32
+
+    hf_vae_id = getattr(cfg.models, "hf_vae", None) or getattr(
+        cfg.models, "vae_pretrained", None
+    )
+    models_path = cfg.paths.models
+
+    if hf_vae_id:
+        logging.info(f"Loading HuggingFace VAE for stats: {hf_vae_id}")
+        from diffusers import AutoencoderKL
+
+        vae = AutoencoderKL.from_pretrained(
+            hf_vae_id,
+            torch_dtype=dtype,
+            cache_dir=f"{models_path}/vae",
+        ).eval()
+    else:
+        from src.models.vae import Vae, VaeConfig
+
+        vae_path = f"{models_path}/vae/diffusion_pytorch_model.safetensors"
+        vae = Vae.from_pretrained(VaeConfig(), vae_path).eval()
+
+    vae.requires_grad_(False)
+    vae.to(device)
+
+    logging.info(
+        f"Computing empirical stats over max {num_samples} samples "
+        f"on {device} ({dtype})..."
+    )
+
+    count = 0
+    mean = 0.0
+    m2 = 0.0
+    total_processed = 0
+
+    pbar = tqdm(
+        total=num_samples,
+        desc="Computing VAE Stats",
+        dynamic_ncols=True,
+    )
+
+    with torch.no_grad():
+        for batch in dataloader:
+            if total_processed >= num_samples:
+                break
+
+            if len(batch) >= 5:
+                images = batch[0]
+                batch_latents = []
+                for i in range(0, images.shape[0], chunk_size):
+                    chunk = images[i : i + chunk_size].to(device, dtype=dtype)
+                    enc = vae.encode(chunk)
+                    dist = getattr(enc, "latent_dist", enc)
+                    lat = dist.sample() if hasattr(dist, "sample") else dist
+                    batch_latents.append(lat.cpu())
+                latents_tensor = torch.cat(batch_latents, dim=0)
+                n_imgs = images.shape[0]
+            else:
+                latents_tensor = batch[0].cpu()
+                n_imgs = latents_tensor.shape[0]
+
+            # Online Chan update in float64 for precision
+            chunk_f64 = latents_tensor.to(torch.float64)
+            n_b = chunk_f64.numel()
+            mean_b = chunk_f64.mean().item()
+            m2_b = ((chunk_f64 - mean_b) ** 2).sum().item()
+
+            if count == 0:
+                count = n_b
+                mean = mean_b
+                m2 = m2_b
+            else:
+                delta = mean_b - mean
+                count_next = count + n_b
+                mean = mean + delta * (n_b / count_next)
+                m2 = m2 + m2_b + (delta**2) * (count * n_b / count_next)
+                count = count_next
+
+            total_processed += n_imgs
+            pbar.update(n_imgs)
+
+    pbar.close()
+
+    if count > 1:
+        empirical_mean = mean
+        empirical_std = (m2 / (count - 1)) ** 0.5
+    else:
+        empirical_mean = 0.0
+        empirical_std = 1.0
+
+    vae_shift = empirical_mean
+    vae_std = empirical_std
+    vae_scale = 1.0 / empirical_std if empirical_std > 0 else 1.0
+
+    logging.info("\n" + "=" * 60)
+    logging.info("EMPIRICAL VAE NORMALIZATION STATISTICS")
+    logging.info("=" * 60)
+    logging.info(f"Total samples processed : {total_processed}")
+    logging.info(f"Total latent elements   : {count}")
+    logging.info(f"Empirical Mean (Shift)  : {vae_shift:.6f}")
+    logging.info(f"Empirical Std           : {vae_std:.6f}")
+    logging.info(f"Empirical Scale (1/Std) : {vae_scale:.6f}")
+    logging.info("=" * 60)
+    logging.info("Suggested config.yaml settings:")
+    logging.info("models:")
+    logging.info(f"  vae_mean: {vae_shift:.6f}")
+    logging.info(f"  vae_std: {vae_std:.6f}")
+    logging.info("=" * 60 + "\n")
+
+    return vae_shift, vae_std, vae_scale
 
 
 def plot_image_grid(images: torch.Tensor, save_path: Path):
@@ -74,7 +217,7 @@ def plot_image_grid(images: torch.Tensor, save_path: Path):
     plt.tight_layout()
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close()
-    print(f"Saved crop grid to: {save_path}")
+    logging.info(f"Saved crop grid to: {save_path}")
 
 
 def plot_position_maps(pos_maps: torch.Tensor, save_path: Path):
@@ -112,7 +255,7 @@ def plot_position_maps(pos_maps: torch.Tensor, save_path: Path):
     plt.tight_layout()
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close()
-    print(f"Saved position maps to: {save_path}")
+    logging.info(f"Saved position maps to: {save_path}")
 
 
 def plot_token_padding(masks: torch.Tensor, tokens: torch.Tensor, save_path: Path):
@@ -158,7 +301,7 @@ def plot_token_padding(masks: torch.Tensor, tokens: torch.Tensor, save_path: Pat
     plt.tight_layout(rect=[0, 0.05, 1, 0.95])
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close()
-    print(f"Saved padding visualization to: {save_path}")
+    logging.info(f"Saved padding visualization to: {save_path}")
 
 
 def main():
@@ -170,23 +313,37 @@ def main():
     cfg = OmegaConf.load(args.config)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    Logger.setup_logging(
+        save_dir=output_dir,
+        logging_name="debug_latents",
+    )
+    logging.info(cfg)
 
     current_seed = cfg.train.seed
     torch.manual_seed(current_seed)
     random.seed(current_seed)
     np.random.seed(current_seed)
 
-    print("=" * 78)
-    print("ASUKA-FM: Dataset & DataLoader Debug Inspection")
-    print("=" * 78)
-    print(f"Dataset Type:   {getattr(cfg.data, 'dataset_type', 'h5')}")
-    print(f"Base Batch Size:{cfg.train.batch_size}")
-    print(f"Use Shift Crop: {cfg.data.get('use_shift_crop', False)}")
+    logging.info("=" * 78)
+    logging.info("ASUKA-FM: Dataset & DataLoader Debug Inspection")
+    logging.info("=" * 78)
+    logging.info(f"Dataset Type:   {getattr(cfg.data, 'dataset_type', 'h5')}")
+    logging.info(f"Base Batch Size:{cfg.train.batch_size}")
+    logging.info(f"Use Shift Crop: {cfg.data.get('use_shift_crop', False)}")
     tokenizer = HFLLMTokenizer(cfg.models.hf_text_encoder)
 
     dataloader = create_dataloader(cfg, rank=0, tokenizer=tokenizer)
-    print(f"Total Batches:  {len(dataloader)}")
-    print("-" * 78)
+    logging.info(f"Total Batches:  {len(dataloader)}")
+    logging.info("-" * 78)
+
+    if args.compute_vae_stats:
+        compute_empirical_vae_stats(
+            cfg=cfg,
+            dataloader=dataloader,
+            num_samples=args.num_stat_samples,
+            chunk_size=args.stat_chunk_size,
+        )
+        return
 
     sample_batch = None
 
@@ -194,32 +351,32 @@ def main():
         if step >= args.num_batches:
             break
 
-        print(f"[Batch {step + 1:02d}/{args.num_batches}]")
+        logging.info(f"[Batch {step + 1:02d}/{args.num_batches}]")
 
         if len(batch) >= 5:
             images, tokens, mask, pos_map, tag_weights, *rest = batch
             aes_tier = rest[0] if rest else None
 
-            print(
+            logging.info(
                 f"  Images:      {tuple(images.shape)} | "
                 f"dtype={images.dtype} | "
                 f"range=[{images.min():.2f}, {images.max():.2f}]"
             )
-            print(f"  Tokens:      {tuple(tokens.shape)} | dtype={tokens.dtype}")
-            print(
+            logging.info(f"  Tokens:      {tuple(tokens.shape)} | dtype={tokens.dtype}")
+            logging.info(
                 f"  Mask:        {tuple(mask.shape)} | "
                 f"Active={mask.sum().item()}/{mask.numel()}"
             )
-            print(
+            logging.info(
                 f"  Pos Map:     {tuple(pos_map.shape)} | "
                 f"range=[{pos_map.min():.2f}, {pos_map.max():.2f}]"
             )
-            print(
+            logging.info(
                 f"  Tag Weights: {tuple(tag_weights.shape)} | "
                 f"mean={tag_weights.mean():.3f}"
             )
             if aes_tier is not None:
-                print(f"  Aes Tiers:   {tuple(aes_tier.shape)}")
+                logging.info(f"  Aes Tiers:   {tuple(aes_tier.shape)}")
 
             # Validate sequence length alignment within the batch
             if tokens.shape[1] != mask.shape[1]:
@@ -232,27 +389,29 @@ def main():
                 sample_batch = batch
         else:
             latents, cond, tag_weights, mask = batch[:4]
-            print(f"  Latents:     {tuple(latents.shape)} | dtype={latents.dtype}")
-            print(f"  Cond:        {tuple(cond.shape)} | dtype={cond.dtype}")
-            print(f"  Tag Weights: {tuple(tag_weights.shape)}")
+            logging.info(
+                f"  Latents:     {tuple(latents.shape)} | dtype={latents.dtype}"
+            )
+            logging.info(f"  Cond:        {tuple(cond.shape)} | dtype={cond.dtype}")
+            logging.info(f"  Tag Weights: {tuple(tag_weights.shape)}")
             if mask is not None:
-                print(f"  Mask:        {tuple(mask.shape)}")
+                logging.info(f"  Mask:        {tuple(mask.shape)}")
 
             if sample_batch is None:
                 sample_batch = batch
 
-    print("-" * 78)
+    logging.info("-" * 78)
 
     if sample_batch is not None and len(sample_batch) >= 5:
         images, tokens, mask, pos_map, *_ = sample_batch
         plot_image_grid(images, output_dir / "grid_crops.png")
         plot_position_maps(pos_map, output_dir / "position_maps.png")
         plot_token_padding(mask, tokens, output_dir / "token_padding.png")
-        print("All visual inspections completed successfully.")
+        logging.info("All visual inspections completed successfully.")
     else:
-        print("Raw image batch not found; visual inspection skipped.")
+        logging.info("Raw image batch not found; visual inspection skipped.")
 
-    print("=" * 78)
+    logging.info("=" * 78)
 
 
 if __name__ == "__main__":

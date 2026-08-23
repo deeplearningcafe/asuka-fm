@@ -460,7 +460,7 @@ def generate_samples(
                 latent = latent.unsqueeze(0).to(torch.float32) / 0.18215
                 torch._dynamo.maybe_mark_dynamic(latent, 1)
                 torch._dynamo.maybe_mark_dynamic(latent, 2)
-                image = vae.decode(latent)
+                image = vae.decode(latent).sample
                 image = (image / 2 + 0.5).clamp(0, 1)
                 image = image.cpu().permute(0, 2, 3, 1).numpy()[0]
                 image = (image * 255).round().astype("uint8")

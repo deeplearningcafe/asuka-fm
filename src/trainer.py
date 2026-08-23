@@ -272,10 +272,10 @@ class Trainer:
         chunk_size = 64
         for i in range(0, images.shape[0], chunk_size):
             chunk = images[i : i + chunk_size].to(self.device, non_blocking=True)
-            # dist = self.vae.encode(chunk).latent_dist
-            # latents.append(dist.sample())
-            dist = self.vae.encode(chunk)
-            latents.append(dist)
+            enc = self.vae.encode(chunk)
+            dist = getattr(enc, "latent_dist", enc)
+            lat = dist.sample() if hasattr(dist, "sample") else dist
+            latents.append(lat)
         lat = torch.cat(latents, dim=0)
         return (lat - self.vae_mean) / self.vae_std
 

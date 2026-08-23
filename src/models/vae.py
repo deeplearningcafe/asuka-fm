@@ -7,7 +7,56 @@ import torch.nn as nn
 from torch.nn import functional as F
 import re
 from dataclasses import dataclass, field
-from typing import ClassVar
+from typing import ClassVar, Optional, Union, Tuple
+
+
+@dataclass
+class DecoderOutput:
+    """Output container for VAE decode method matching Diffusers."""
+
+    sample: torch.Tensor
+
+
+@dataclass
+class AutoencoderKLOutput:
+    """Output container for VAE encode method matching Diffusers."""
+
+    latent_dist: "DiagonalGaussianDistribution"
+
+
+class DiagonalGaussianDistribution:
+    """
+    Diagonal Gaussian distribution wrapper matching Diffusers AutoencoderKL.
+    """
+
+    def __init__(
+        self,
+        parameters: torch.Tensor,
+        deterministic: bool = False,
+    ):
+        self.parameters = parameters
+        self.mean, self.logvar = torch.chunk(parameters, 2, dim=1)
+        self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
+        self.deterministic = deterministic
+        self.std = torch.exp(0.5 * self.logvar)
+        self.var = torch.exp(self.logvar)
+
+    def sample(self, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        if self.deterministic:
+            return self.mean
+        if generator is not None:
+            eps = torch.randn(
+                self.mean.size(),
+                generator=generator,
+                device=self.mean.device,
+                dtype=self.mean.dtype,
+            )
+        else:
+            eps = torch.randn_like(self.mean)
+        return self.mean + eps * self.std
+
+    def mode(self) -> torch.Tensor:
+        return self.mean
 
 
 # https://www.researchgate.net/figure/ResNet-block-submodule-from-the-time-conditional-UNet-architecture_fig7_371684920
@@ -445,18 +494,24 @@ class Vae(nn.Module):
             eps = torch.rand_like(std)
         return mu + eps * std
 
-    def decode(self, z):
+    def decode(
+        self, z: torch.Tensor, return_dict: bool = True
+    ) -> Union[DecoderOutput, Tuple[torch.Tensor]]:
         z = self.post_quant_conv(z)
-        x_hat, output_states_dec, output_mid_dec = self.decoder(z)
-        return x_hat
+        x_hat, _, _ = self.decoder(z)
+        if not return_dict:
+            return (x_hat,)
+        return DecoderOutput(sample=x_hat)
 
-    def encode(self, x, generator=None):
-        x, output_states, output_mid = self.encoder(x)
-        x = self.quant_conv(x)
-        mean, log_var = torch.split(x, self.config.latent_channels, dim=1)
-
-        z_pre = self.reparameterize(mean, log_var, generator)
-        return z_pre
+    def encode(
+        self, x: torch.Tensor, return_dict: bool = True
+    ) -> Union[AutoencoderKLOutput, Tuple[DiagonalGaussianDistribution]]:
+        h, _, _ = self.encoder(x)
+        moments = self.quant_conv(h)
+        posterior = DiagonalGaussianDistribution(moments)
+        if not return_dict:
+            return (posterior,)
+        return AutoencoderKLOutput(latent_dist=posterior)
 
     @classmethod
     def from_pretrained(cls, config, model_path):

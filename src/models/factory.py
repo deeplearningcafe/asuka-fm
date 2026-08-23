@@ -8,6 +8,7 @@ from functools import partial
 import gc
 from typing import Any, List, Dict
 import omegaconf
+from diffusers import AutoencoderKL
 from src.models.unet import Unet, UnetConfig
 from src.models.dual_stream import DualStreamDiT
 from src.models.sprint import SprintDualStreamDiT
@@ -288,10 +289,20 @@ def load_trainable_model(
 
         # text_encoder = Clip.from_pretrained(ClipConfig(), te_path).eval()
 
-        # TODO: add hf vae support
-        vae = Vae.from_pretrained(
-            VaeConfig(), f"{models_path}/vae/diffusion_pytorch_model.safetensors"
-        ).eval()
+        hf_vae_id = getattr(model_cfg, "hf_vae", None) or getattr(
+            model_cfg, "vae_pretrained", None
+        )
+        if hf_vae_id:
+            if global_rank == 0:
+                logging.info(f"Loading HuggingFace VAE: {hf_vae_id}")
+            vae = AutoencoderKL.from_pretrained(
+                hf_vae_id,
+                torch_dtype=autocast_dtype,
+                cache_dir=f"{models_path}/vae",
+            ).eval()
+        else:
+            vae_path = f"{models_path}/vae/diffusion_pytorch_model.safetensors"
+            vae = Vae.from_pretrained(VaeConfig(), vae_path).eval()
         # TODO: dynamically move to cpu
         vae.to(device)
 

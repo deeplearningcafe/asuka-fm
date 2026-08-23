@@ -1,19 +1,71 @@
 import io
 import math
+import struct
 import logging
 import random
+import argparse
+from pathlib import Path
+from collections import Counter
+
 import torch
 import json
-from pathlib import Path
 from torch.utils.data import IterableDataset
 from huggingface_hub import hf_hub_download
 from torchvision.transforms import v2
-from PIL import Image
+from PIL import Image, ImageFile, PngImagePlugin
 from datasets import load_dataset
 import fsspec.spec
 import fsspec.utils
 from datasets.distributed import split_dataset_by_node
+from tqdm import tqdm
+
 from src.models.text_encoders.tokenizer import BaseTokenizer
+
+
+PngImagePlugin.MAX_TEXT_CHUNK = 64 * 1024 * 1024
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS = None
+
+
+def sniff_image_header(
+    data: bytes,
+) -> tuple[str, tuple[int, int] | None]:
+    """
+    Fast magic-byte format and dimension parser without raster decompression.
+    """
+    if len(data) < 16:
+        return "CORRUPT", None
+
+    # PNG Header: IHDR chunk width/height located at offsets 16:24
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        if len(data) >= 24:
+            w, h = struct.unpack(">II", data[16:24])
+            return "PNG", (w, h)
+        return "PNG", None
+
+    # GIF Header: Logical Screen Descriptor dimensions at offsets 6:10
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        if len(data) >= 10:
+            w, h = struct.unpack("<HH", data[6:10])
+            return "GIF", (w, h)
+        return "GIF", None
+
+    # JPEG Header
+    if data.startswith(b"\xff\xd8\xff"):
+        return "JPEG", None
+
+    # WebP Header
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "WEBP", None
+
+    # AVIF / HEIF Header: ISO Base Media File Format (ftyp box)
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"avif", b"avis", b"mif1"):
+            return "AVIF", None
+        return "HEIF", None
+
+    return "UNKNOWN", None
 
 
 def compute_aspect_coordinates(
@@ -242,3 +294,153 @@ class StreamingImageDataset(IterableDataset):
                 yield self._process_sample(sample)
             except Exception:
                 continue
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Inspect streaming dataset for corrupt or invalid images."
+    )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default="aipracticecafe/curated-danbooru-2026",
+        help="HuggingFace dataset repository or local metadata directory.",
+    )
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default=None,
+        help="Optional local path containing raw parquet shards.",
+    )
+    parser.add_argument(
+        "--inspect_indices",
+        type=str,
+        default=None,
+        help="Comma-separated sample indices to inspect (e.g. '92743,429,855').",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=50000,
+        help="Maximum samples to scan (set -1 for complete dataset).",
+    )
+    parser.add_argument(
+        "--test_full_decode",
+        action="store_true",
+        default=True,
+        help="Perform complete RGB raster decoding to check corruption.",
+    )
+    args = parser.parse_args()
+
+    print(f"Initializing stream inspection for: {args.dataset_name}")
+    dataset = StreamingImageDataset(
+        dataset_name=args.dataset_name,
+        dataset_path=args.dataset_path,
+        resolution=256,
+        low_ram=True,
+    )
+
+    if args.inspect_indices:
+        target_indices = set(int(i.strip()) for i in args.inspect_indices.split(","))
+        max_target = max(target_indices)
+        print(f"Directly inspecting {len(target_indices)} target indices...")
+
+        for idx, sample in enumerate(dataset.iter_raw(), start=1):
+            if idx in target_indices:
+                sample_id = sample.get("booru_id")
+                img_data = sample.get("image") or sample.get("bytes")
+                data_len = len(img_data) if isinstance(img_data, bytes) else 0
+
+                fmt, dims = "UNKNOWN", None
+                if isinstance(img_data, bytes):
+                    fmt, dims = sniff_image_header(img_data)
+
+                print("\n" + "=" * 50)
+                print(f"INDEX: {idx} | SAMPLE ID: {sample_id}")
+                print(f"Format: {fmt} | Byte Size: {data_len / 1024:.1f} KB")
+                if dims:
+                    print(
+                        f"Dimensions: {dims} | Aspect Ratio: {dims[0] / dims[1]:.2f}:1"
+                    )
+                for k, v in sample.items():
+                    if k not in ("image", "bytes"):
+                        val_str = str(v)
+                        if len(val_str) > 100:
+                            val_str = val_str[:97] + "..."
+                        print(f"  {k}: {val_str}")
+
+            if idx >= max_target:
+                break
+        exit(0)
+
+    format_counts: Counter = Counter()
+    error_counts: Counter = Counter()
+    corrupt_samples = []
+    aspect_outliers = []
+    total_scanned = 0
+
+    pbar = tqdm(
+        total=args.max_samples if args.max_samples > 0 else None,
+        desc="Scanning Shards",
+        dynamic_ncols=True,
+    )
+
+    for sample in dataset.iter_raw():
+        total_scanned += 1
+        img_data = sample.get("image") or sample.get("bytes")
+        sample_id = sample.get("id") or sample.get("booru_id") or f"idx_{total_scanned}"
+
+        if not isinstance(img_data, bytes):
+            if isinstance(img_data, Image.Image):
+                format_counts[img_data.format or "PIL_IMAGE"] += 1
+                pbar.update(1)
+                continue
+            error_counts["INVALID_TYPE"] += 1
+            corrupt_samples.append((sample_id, f"Type: {type(img_data)}"))
+            pbar.update(1)
+            continue
+
+        # 1. Fast byte-level format and dimension sniffing (< 5 microseconds)
+        fmt, fast_dims = sniff_image_header(img_data)
+        format_counts[fmt] += 1
+
+        # 2. Complete raster decode verification
+        if args.test_full_decode:
+            try:
+                with Image.open(io.BytesIO(img_data)) as im:
+                    w, h = im.size
+                    ar = max(w, h) / max(1, min(w, h))
+                    if ar > 3.5:
+                        aspect_outliers.append((sample_id, fmt, (w, h), ar))
+                    # Trigger full raster decompression
+                    im.convert("RGB")
+            except Exception as e:
+                err_type = type(e).__name__
+                error_counts[err_type] += 1
+                corrupt_samples.append((sample_id, f"{err_type}: {str(e)}"))
+
+        pbar.update(1)
+        if 0 < args.max_samples <= total_scanned:
+            break
+
+    pbar.close()
+
+    print("\n" + "=" * 60)
+    print("DATASET DIAGNOSTIC SUMMARY")
+    print("=" * 60)
+    print(f"Total Samples Scanned : {total_scanned}")
+    print(f"Format Distribution   : {dict(format_counts)}")
+    print(f"Total Errors Detected : {sum(error_counts.values())}")
+    if error_counts:
+        print(f"Error Breakdown       : {dict(error_counts)}")
+    if corrupt_samples:
+        print("\nFirst 10 Corrupted Samples:")
+        for s_id, err in corrupt_samples[:10]:
+            print(f"  [ID: {s_id}] -> {err}")
+    if aspect_outliers:
+        print(f"\nAspect Ratio Outliers (>3.5:1) Count: {len(aspect_outliers)}")
+        for s_id, s_fmt, s_dims, s_ar in aspect_outliers[:5]:
+            print(
+                f"  [ID: {s_id}] Format: {s_fmt}, Dims: {s_dims}, Ratio: {s_ar:.2f}:1"
+            )
+    print("=" * 60)

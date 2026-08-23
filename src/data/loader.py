@@ -2,6 +2,7 @@ import torch
 import warnings
 import logging
 from torch.utils.data import DataLoader
+import torch.distributed as dist
 from src.data.dataset import (
     H5LatentDataset,
     _close_h5_handles_worker,
@@ -14,6 +15,11 @@ from src.data.streaming_dataset import StreamingImageDataset
 def create_dataloader(cfg, rank, tokenizer=None) -> DataLoader:
     """Instantiates DataLoader based on dataset_type (h5 vs streaming)."""
     dataset_type = getattr(cfg.data, "dataset_type", "h5")
+
+    if dist.is_available() and dist.is_initialized():
+        runtime_world_size = dist.get_world_size()
+    else:
+        runtime_world_size = 1
 
     if dataset_type == "streaming":
         dataset = StreamingImageDataset(
@@ -28,7 +34,7 @@ def create_dataloader(cfg, rank, tokenizer=None) -> DataLoader:
             tag_dropout_prob=getattr(cfg.data, "tag_dropout", 0.0),
             shuffle_tags=getattr(cfg.data, "shuffle_tags", True),
             rank=rank,
-            world_size=getattr(cfg.train, "world_size", 1),
+            world_size=runtime_world_size,
             low_ram=getattr(cfg.data, "low_ram", False),
         )
 
@@ -47,7 +53,7 @@ def create_dataloader(cfg, rank, tokenizer=None) -> DataLoader:
             length_penalty_power=cfg.data.get("length_penalty_power", 0.0),
             drop_last=cfg.data.get("drop_last", False),
             seed=cfg.train.seed,
-            world_size=getattr(cfg.train, "world_size", 1),
+            world_size=runtime_world_size,
             rank=rank,
             aesthetic_curriculum=cfg.data.get("aesthetic_curriculum", True),
             buffer_size=buffer_size,
@@ -93,7 +99,7 @@ def create_dataloader(cfg, rank, tokenizer=None) -> DataLoader:
         base_resolution_area=base_area,
         drop_last=drop_last,
         seed=cfg.train.seed,
-        world_size=cfg.train.world_size,
+        world_size=runtime_world_size,
         rank=rank,
         initial_epoch_focus_low_res=initial_epoch_focus_low_res,
         low_res_focus_factor=low_res_focus_factor,

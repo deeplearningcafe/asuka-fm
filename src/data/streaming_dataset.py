@@ -173,11 +173,6 @@ class StreamingImageDataset(IterableDataset):
                 storage_options=storage_options,
             )
 
-        if self.world_size > 1:
-            self.hf_dataset = split_dataset_by_node(
-                self.hf_dataset, rank=rank, world_size=world_size
-            )
-
         self.normalize = v2.Compose(
             [
                 v2.ToImage(),
@@ -272,16 +267,35 @@ class StreamingImageDataset(IterableDataset):
         return img_tensor, tokens, mask, pos_map, tag_weight, aes_tier
 
     def _get_worker_stream(self):
-        """Splits streaming dataset across DataLoader worker processes."""
+        """
+        Partitions the dataset stream exactly once across all global workers
+        (DDP ranks * DataLoader num_workers).
+        """
         worker_info = torch.utils.data.get_worker_info()
-        dataset = self.hf_dataset
-        if worker_info is not None and worker_info.num_workers > 1:
-            dataset = split_dataset_by_node(
-                dataset,
-                rank=worker_info.id,
-                world_size=worker_info.num_workers,
+
+        if worker_info is None:
+            # Single-process
+            if self.world_size > 1:
+                return split_dataset_by_node(
+                    self.hf_dataset,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                )
+            return self.hf_dataset
+
+        # Multi-worker
+        num_workers = worker_info.num_workers
+        worker_id = worker_info.id
+        global_worker_id = (self.rank * num_workers) + worker_id
+        total_workers = self.world_size * num_workers
+
+        if total_workers > 1:
+            return split_dataset_by_node(
+                self.hf_dataset,
+                rank=global_worker_id,
+                world_size=total_workers,
             )
-        return dataset
+        return self.hf_dataset
 
     def iter_raw(self):
         """Yields raw sample dictionaries without image/text processing."""

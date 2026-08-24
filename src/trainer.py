@@ -178,6 +178,7 @@ class Trainer:
         self.scaler = (
             torch.cuda.amp.GradScaler() if self.dtype == torch.float16 else None
         )
+        self.clip_norm = cfg.train.get("clip_norm", 1.0)
 
         self.sample_configs = self._load_sample_configs()
 
@@ -486,27 +487,30 @@ class Trainer:
                         if self.grad_offloader is None:
                             if self.scaler is None:
                                 norm_unet = torch.nn.utils.clip_grad_norm_(
-                                    self.unet.parameters(), 2.0
+                                    self.unet.parameters(), self.clip_norm
                                 )
                                 if self.train_te:
                                     norm_text_encoder = torch.nn.utils.clip_grad_norm_(
-                                        self.text_encoder.parameters(), max_norm=1.0
+                                        self.text_encoder.parameters(),
+                                        max_norm=self.clip_norm / 2.0,
                                     )
                                 self.optimizer.step()
                             else:
                                 self.scaler.unscale_(self.optimizer)
                                 norm_unet = torch.nn.utils.clip_grad_norm_(
-                                    self.unet.parameters(), 2.0
+                                    self.unet.parameters(), self.clip_norm
                                 )
                                 if self.train_te:
                                     norm_text_encoder = torch.nn.utils.clip_grad_norm_(
                                         self.text_encoder.parameters(),
-                                        max_norm=1.0,
+                                        max_norm=self.clip_norm / 2.0,
                                     )
                                 self.scaler.step(self.optimizer)
                         else:
                             norm_unet = self.grad_offloader.finalize_and_step(
-                                self.optimizer, scaler=self.scaler, max_norm=2.0
+                                self.optimizer,
+                                scaler=self.scaler,
+                                max_norm=self.clip_norm,
                             )
 
                         self.lr_scheduler.step()
@@ -701,6 +705,8 @@ class Trainer:
                                         device=self.device,
                                         dtype=self.dtype,
                                         use_unet_mult=False if self.is_dit else True,
+                                        vae_mean=self.vae_mean,
+                                        vae_std=self.vae_std,
                                     )
                                     prompts = [
                                         c.get("prompt") for c in self.sample_configs
@@ -782,6 +788,8 @@ class Trainer:
                         device=self.device,
                         dtype=self.dtype,
                         use_unet_mult=False if self.is_dit else True,
+                        vae_mean=self.vae_mean,
+                        vae_std=self.vae_std,
                     )
                 prompts = [c.get("prompt") for c in self.sample_configs]
                 io_executor.submit(log_image, images, prompts, epoch, self.global_step)

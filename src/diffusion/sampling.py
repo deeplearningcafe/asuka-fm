@@ -333,6 +333,8 @@ def generate_samples(
     dtype: torch.dtype = torch.float32,
     autocast_dtype: torch.dtype = torch.bfloat16,
     use_unet_mult: bool = True,
+    vae_mean: float = 0.0,
+    vae_std: float = 0.18215,
 ) -> List[Image.Image]:
     """
     Main entry point for generating samples during training.
@@ -457,7 +459,7 @@ def generate_samples(
 
             # Decode one by one to save VRAM
             for j, latent in enumerate(latents):
-                latent = latent.unsqueeze(0).to(torch.float32) / 0.18215
+                latent = (latent.unsqueeze(0).to(torch.float32) - vae_mean) / vae_std
                 torch._dynamo.maybe_mark_dynamic(latent, 1)
                 torch._dynamo.maybe_mark_dynamic(latent, 2)
                 image = vae.decode(latent).sample

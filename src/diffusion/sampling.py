@@ -335,6 +335,7 @@ def generate_samples(
     use_unet_mult: bool = True,
     vae_mean: float = 0.0,
     vae_std: float = 0.18215,
+    in_channels: int = 4,
 ) -> List[Image.Image]:
     """
     Main entry point for generating samples during training.
@@ -375,7 +376,7 @@ def generate_samples(
             # 1. Prepare Latents (Noise)
             gen = torch.Generator(device=device).manual_seed(seed)
             latents = torch.randn(
-                (curr_bs, 4, H // 8, W // 8), device=device, generator=gen, dtype=dtype
+                (curr_bs, in_channels, H // 8, W // 8), device=device, generator=gen, dtype=dtype
             )
 
             # 2. Polymorphic Text Tokenization & Encoding
@@ -458,12 +459,16 @@ def generate_samples(
                 )
 
             # Decode one by one to save VRAM
+            vae_dtype = next(vae.parameters()).dtype
             for j, latent in enumerate(latents):
-                latent = (latent.unsqueeze(0).to(torch.float32) - vae_mean) / vae_std
+                # Inverse transform: z_raw = (z_norm * std) + mean
+                raw_lat = (
+                    latent.unsqueeze(0).to(torch.float32) * vae_std
+                ) + vae_mean
                 torch._dynamo.maybe_mark_dynamic(latent, 1)
                 torch._dynamo.maybe_mark_dynamic(latent, 2)
-                image = vae.decode(latent).sample
-                image = (image / 2 + 0.5).clamp(0, 1)
+                image = vae.decode(raw_lat.to(vae_dtype)).sample
+                image = (image.to(torch.float32) / 2 + 0.5).clamp(0, 1)
                 image = image.cpu().permute(0, 2, 3, 1).numpy()[0]
                 image = (image * 255).round().astype("uint8")
 

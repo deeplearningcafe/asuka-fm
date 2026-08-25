@@ -51,29 +51,63 @@ def decode_latents_to_pil(
     latents: torch.Tensor,
     vae: torch.nn.Module,
     device: torch.device,
-    vae_mean: float = 0.0,
-    vae_std: float = 1.0 / 0.18215,
+    vae_mean: Any = 0.0,
+    vae_std: Any = 1.0 / 0.18215,
+    vae_batch_size: int = 4,
 ) -> List[Image.Image]:
-    """Decodes latent representations to PIL images for ground truth."""
+    """Decodes latent representations to PIL images with batch chunking."""
     images = []
     vae.eval()
+    vae_dtype = next(vae.parameters()).dtype
     with torch.no_grad():
+        # Inverse transform: z_raw = (z_norm * std) + mean
         scaled = (latents.to(device) * vae_std) + vae_mean
-        for i in range(scaled.shape[0]):
-            lat = scaled[i : i + 1].to(torch.float32)
-            out = vae.decode(lat)
+        for i in range(0, scaled.shape[0], vae_batch_size):
+            chunk = scaled[i : i + vae_batch_size].to(
+                device=device, dtype=vae_dtype
+            )
+            out = vae.decode(chunk)
             sample = out.sample if hasattr(out, "sample") else out
-            sample = (sample / 2.0 + 0.5).clamp(0, 1)
-            img_np = sample.cpu().permute(0, 2, 3, 1).numpy()[0]
-            img_uint8 = (img_np * 255.0).round().astype(np.uint8)
-            images.append(Image.fromarray(img_uint8))
+            sample = (sample.to(torch.float32) / 2.0 + 0.5).clamp(0, 1)
+            img_np = sample.cpu().permute(0, 2, 3, 1).numpy()
+            for j in range(img_np.shape[0]):
+                img_uint8 = (img_np[j] * 255.0).round().astype(np.uint8)
+                images.append(Image.fromarray(img_uint8))
     return images
+
+
+def encode_vae_latents(
+    images: torch.Tensor,
+    vae: torch.nn.Module,
+    device: torch.device,
+    autocast_dtype: torch.dtype,
+    vae_mean: torch.Tensor,
+    vae_std: torch.Tensor,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """Encodes raw image batch to latents using dynamic chunking."""
+    latents = []
+    vae_dtype = next(vae.parameters()).dtype
+    for i in range(0, images.shape[0], chunk_size):
+        chunk = images[i : i + chunk_size].to(
+            device=device, dtype=vae_dtype, non_blocking=True
+        )
+        with torch.autocast(
+            device_type="cuda", dtype=autocast_dtype, enabled=True
+        ):
+            enc = vae.encode(chunk)
+            dist = getattr(enc, "latent_dist", enc)
+            lat = dist.sample() if hasattr(dist, "sample") else dist
+            latents.append(lat)
+    lat = torch.cat(latents, dim=0)
+    # Forward transform: z_norm = (z_raw - mean) / std
+    return (lat - vae_mean) / vae_std
 
 
 def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
     """Executes single-batch overfitting optimization and sampling."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if cfg.train.dtype == "bf16" else torch.float32
+    dtype = torch.float32  # Keep master weights in FP32
 
     model_type = getattr(cfg.models, "model_type", "unet")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -89,6 +123,33 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
     logging.info(f"Initializing model architecture: {model_type}")
     logging.info(cfg)
 
+    # Hardware detection and TF32/autocast configuration
+    autocast_dtype = torch.bfloat16
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability()
+        if capability[0] >= 7 and capability[0] < 8:
+            autocast_dtype = torch.float16
+            torch.set_float32_matmul_precision("high")
+            logging.info(
+                "Using high precision for float32 matmul (Volta/Turing)."
+            )
+        elif capability[0] >= 8:
+            torch.set_float32_matmul_precision("medium")
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
+                True
+            )
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
+                True
+            )
+            logging.info("Using TF32 and tensor cores (Ampere+).")
+        else:
+            logging.info("Legacy GPU detected; standard precision used.")
+
+    logging.info(f"Using {autocast_dtype} for autocast mixed precision")
+
+
     unet, text_encoder, vae, tokenizer, ema = load_trainable_model(
         models_path=cfg.paths.models,
         device=device,
@@ -102,6 +163,7 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
         global_rank=0,
         model_type=model_type,
         model_cfg=cfg.models,
+        autocast_dtype=autocast_dtype,
     )
 
     # Configure schedule and loss objective
@@ -117,7 +179,9 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
         )
     else:
         schedule = DDPMSchedule(device=device)
-        objective = DDPMObjective(schedule=schedule, min_snr_gamma=cfg.train.snr_gamma)
+        objective = DDPMObjective(
+            schedule=schedule, min_snr_gamma=cfg.train.snr_gamma
+        )
 
     cfg.train.cfg_dropout_prob = 0.0
     cfg.train.tag_dropout = 0.0
@@ -127,16 +191,33 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
     # Parse and cache single batch on GPU
     vae_mean = getattr(cfg.models, "vae_mean", 0.0)
     vae_std = getattr(cfg.models, "vae_std", 1.0 / 0.18215)
+    vae_mean_t = torch.tensor(
+        vae_mean, device=device, dtype=dtype
+    ).view(1, -1, 1, 1)
+    vae_std_t = torch.tensor(
+        vae_std, device=device, dtype=dtype
+    ).view(1, -1, 1, 1)
+    vae_batch_size = cfg.train.get(
+        "vae_batch_size", cfg.models.get("vae_batch_size", 64)
+    )
 
     pos_map = None
     if len(raw_batch) >= 5:
         images, cond, mask, pos_map, tag_weights, *rest = raw_batch
-        images = images.to(device, dtype=dtype)
         with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=dtype, enabled=True):
-                dist = vae.encode(images)
-                latents = dist.sample() if hasattr(dist, "sample") else dist
-                latents = (latents - vae_mean) / vae_std
+            with torch.autocast(
+                device_type="cuda", dtype=autocast_dtype, enabled=True
+            ):
+                latents = encode_vae_latents(
+                    images=images,
+                    vae=vae,
+                    device=device,
+                    autocast_dtype=autocast_dtype,
+                    vae_mean=vae_mean_t,
+                    vae_std=vae_std_t,
+                    chunk_size=vae_batch_size,
+                )
+        torch.cuda.empty_cache()
         attention_mask = mask.to(device)
         pos_map = pos_map.to(device, dtype=dtype)
         tag_weights = tag_weights.to(device, dtype=dtype)
@@ -147,10 +228,17 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
         attention_mask = raw_batch[3].to(device)
 
     bsz = latents.shape[0]
-    logging.info(f"Overfitting batch size: {bsz}, Latents shape: {latents.shape}")
+    logging.info(
+        f"Overfitting batch size: {bsz}, Latents shape: {latents.shape}"
+    )
 
     gt_images = decode_latents_to_pil(
-        latents[:16], vae, device, vae_mean=vae_mean, vae_std=vae_std
+        latents[:16],
+        vae,
+        device,
+        vae_mean=vae_mean,
+        vae_std=vae_std,
+        vae_batch_size=min(4, vae_batch_size),
     )
     save_pil_grid(gt_images, os.path.join(save_dir, "ground_truth.png"))
 
@@ -158,6 +246,11 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
     cfg.train.warmup = 0.005
     optimizer = create_optim(unet, text_encoder, cfg)
     lr_scheduler = create_scheduler(optimizer, dataloader, cfg)
+    scaler = (
+        torch.cuda.amp.GradScaler()
+        if autocast_dtype == torch.float16
+        else None
+    )
 
     # Setup sampling prompts from the batch
     sample_configs = []
@@ -183,7 +276,9 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
 
     logging.info(f"Beginning overfit loop for {num_steps} iterations...")
     unet.train()
-    with torch.autocast(device_type="cuda", dtype=dtype, enabled=True):
+    with torch.autocast(
+        device_type="cuda", dtype=autocast_dtype, enabled=True
+    ):
         with torch.set_grad_enabled(cfg.train.train_te):
             encoder_hidden_states, attention_mask = text_encoder(
                 cond, mask=attention_mask, drop_mask=None
@@ -192,7 +287,9 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
     for step in range(num_steps):
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.autocast(device_type="cuda", dtype=dtype, enabled=True):
+        with torch.autocast(
+            device_type="cuda", dtype=autocast_dtype, enabled=True
+        ):
             loss, metrics = objective.forward(
                 unet,
                 latents,
@@ -202,13 +299,25 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
                 pos_map=pos_map,
             )
 
-        loss.backward()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
         if debug_params:
             for name, param in unet.named_parameters():
                 if param.requires_grad and param.grad is None:
                     print(f"[UNUSED PARAMETER] {name} | shape: {param.shape}")
-        torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
-        optimizer.step()
+
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
+            optimizer.step()
+
         if lr_scheduler is not None:
             lr_scheduler.step()
 
@@ -239,8 +348,10 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
                     diffusion_type=cfg.train.objective,
                     device=str(device),
                     dtype=dtype,
-                    autocast_dtype=dtype,
+                    autocast_dtype=autocast_dtype,
                     use_unet_mult=False if is_dit else True,
+                    vae_mean=vae_mean_t,
+                    vae_std=vae_std_t,
                 )
 
             step_path = os.path.join(save_dir, f"sample_step_{step + 1:05d}.png")

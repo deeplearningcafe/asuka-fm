@@ -81,6 +81,8 @@ class Trainer:
         self.vae_std = torch.tensor(vae_std, device=self.device, dtype=self.dtype).view(
             1, -1, 1, 1
         )
+        self.vae_batch_size = cfg.train.get("vae_batch_size", 64)
+        self.in_channels = cfg.models.get("in_channels", 4)
 
         self.optimizer = create_optim(self.unet, self.text_encoder, cfg)
         self.grad_offloader = None
@@ -270,7 +272,7 @@ class Trainer:
     def _encode_vae_latents(self, images: torch.Tensor) -> torch.Tensor:
         """In-place VAE encoding with dynamic batch slicing."""
         latents = []
-        chunk_size = 64
+        chunk_size = self.vae_batch_size
         for i in range(0, images.shape[0], chunk_size):
             chunk = images[i : i + chunk_size].to(self.device, non_blocking=True)
             enc = self.vae.encode(chunk)
@@ -707,6 +709,7 @@ class Trainer:
                                         use_unet_mult=False if self.is_dit else True,
                                         vae_mean=self.vae_mean,
                                         vae_std=self.vae_std,
+                                        in_channels=self.in_channels
                                     )
                                     prompts = [
                                         c.get("prompt") for c in self.sample_configs
@@ -790,6 +793,7 @@ class Trainer:
                         use_unet_mult=False if self.is_dit else True,
                         vae_mean=self.vae_mean,
                         vae_std=self.vae_std,
+                        in_channels=self.in_channels
                     )
                 prompts = [c.get("prompt") for c in self.sample_configs]
                 io_executor.submit(log_image, images, prompts, epoch, self.global_step)

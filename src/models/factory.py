@@ -198,6 +198,7 @@ def load_trainable_model(
         text_encoder = CLIPTextEncoderWrapper(raw_clip, tokenizer)
         text_embed_dim = 768
 
+    in_channels = getattr(model_cfg, "in_channels", 32) if model_cfg else 4
     if global_rank == 0:
         logging.info(f"Loading {model_type} model from {models_path}...")
     try:
@@ -214,8 +215,8 @@ def load_trainable_model(
         if model_type == "dual_stream":
             # TODO: channels dynamically from vae meta
             unet = DualStreamDiT(
-                in_channels=4,
-                out_channels=4,
+                in_channels=in_channels,
+                out_channels=in_channels,
                 patch_size=patch_size,
                 hidden_size=hidden_size,
                 depth=depth,
@@ -249,8 +250,8 @@ def load_trainable_model(
             )
 
             unet = SprintDualStreamDiT(
-                in_channels=4,
-                out_channels=4,
+                in_channels=in_channels,
+                out_channels=in_channels,
                 patch_size=patch_size,
                 hidden_size=hidden_size,
                 depth=depth,
@@ -298,7 +299,7 @@ def load_trainable_model(
             vae = AutoencoderKL.from_pretrained(
                 hf_vae_id,
                 torch_dtype=autocast_dtype,
-                cache_dir=f"{models_path}/vae",
+                cache_dir=None #f"{models_path}/vae",
             ).eval()
         else:
             vae_path = f"{models_path}/vae/diffusion_pytorch_model.safetensors"

@@ -14,6 +14,8 @@ from huggingface_hub import hf_hub_download
 from torchvision.transforms import v2
 from PIL import Image, ImageFile, PngImagePlugin
 from datasets import load_dataset
+import pyarrow
+import pyarrow.dataset
 import fsspec.spec
 import fsspec.utils
 from datasets.distributed import split_dataset_by_node
@@ -139,13 +141,20 @@ class StreamingImageDataset(IterableDataset):
             "block_size": 4 * 1024 * 1024,
             "cache_type": "first",
         }
+        cache_opts = pyarrow.CacheOptions(
+            prefetch_limit=1 if low_ram else 2,
+            range_size_limit=(32 << 20) if low_ram else (128 << 20),
+        )
+        scan_options = pyarrow.dataset.ParquetFragmentScanOptions(
+            cache_options=cache_opts
+        )
         if not low_ram:
             # 128 is using > 30gb ram
-            fsspec.spec.AbstractBufferedFile.DEFAULT_BLOCK_SIZE = 32 * 1024 * 1024
-            fsspec.utils.DEFAULT_BLOCK_SIZE = 32 * 1024 * 1024
+            fsspec.spec.AbstractBufferedFile.DEFAULT_BLOCK_SIZE = 128 * 1024 * 1024
+            fsspec.utils.DEFAULT_BLOCK_SIZE = 128 * 1024 * 1024
 
             storage_options = {
-                "block_size": 32 * 1024 * 1024,
+                "block_size": 128 * 1024 * 1024,
                 "cache_type": "readahead",
             }
             logging.info("Using high ram settings!")
@@ -153,12 +162,23 @@ class StreamingImageDataset(IterableDataset):
         if dataset_path is not None:
             dataset_path = Path(dataset_path)
             if dataset_path.is_dir():
-                print(f"Reading data from {dataset_path}")
-                parquet_files = sorted([str(p) for p in dataset_path.glob("*.parquet")])
+                parquet_files = sorted(
+                    [
+                        str(p)
+                        for p in dataset_path.glob("data_shard_*.parquet")
+                    ]
+                )
+                if not parquet_files:
+                    parquet_files = sorted(
+                        [str(p) for p in dataset_path.rglob("*.parquet")]
+                    )
                 if not parquet_files:
                     raise FileNotFoundError(
-                        f"No parquet files found in directory: {dataset_name}"
+                        f"No parquet shards found in: {dataset_path}"
                     )
+                logging.info(
+                    f"Found {len(parquet_files)} local parquet shards."
+                )
                 self.hf_dataset = load_dataset(
                     "parquet",
                     data_files={"train": parquet_files},
@@ -166,11 +186,31 @@ class StreamingImageDataset(IterableDataset):
                     streaming=True,
                 )
         else:
+            # Explicitly match all 34 root data_shard_*.parquet files on Hub
             self.hf_dataset = load_dataset(
                 dataset_name,
+                data_files={"train": "data_shard_*.parquet"},
                 split="train",
                 streaming=True,
                 storage_options=storage_options,
+                    fragment_scan_options=scan_options,
+            )
+
+        detected_shards = getattr(
+            self.hf_dataset,
+            "num_shards",
+            getattr(self.hf_dataset, "n_shards", "unknown"),
+        )
+        logging.info(
+            f"Initialized HF Streaming Dataset with {detected_shards} shards."
+        )
+
+        # Split across DDP nodes/ranks ONCE at initialization
+        if self.world_size > 1:
+            self.hf_dataset = split_dataset_by_node(
+                self.hf_dataset,
+                rank=self.rank,
+                world_size=self.world_size,
             )
 
         self.normalize = v2.Compose(
@@ -266,35 +306,18 @@ class StreamingImageDataset(IterableDataset):
 
         return img_tensor, tokens, mask, pos_map, tag_weight, aes_tier
 
+    def set_epoch(self, epoch: int) -> None:
+        """Updates epoch state for shard shuffling on streaming dataset."""
+        self.epoch = epoch
+        if hasattr(self.hf_dataset, "set_epoch"):
+            self.hf_dataset.set_epoch(epoch)
+
     def _get_worker_stream(self):
         """
-        Partitions the dataset stream exactly once across all global workers
-        (DDP ranks * DataLoader num_workers).
+        Returns the HuggingFace streaming dataset. HF IterableDataset
+        automatically detects PyTorch worker_info and splits its assigned
+        shards across DataLoader workers.
         """
-        worker_info = torch.utils.data.get_worker_info()
-
-        if worker_info is None:
-            # Single-process
-            if self.world_size > 1:
-                return split_dataset_by_node(
-                    self.hf_dataset,
-                    rank=self.rank,
-                    world_size=self.world_size,
-                )
-            return self.hf_dataset
-
-        # Multi-worker
-        num_workers = worker_info.num_workers
-        worker_id = worker_info.id
-        global_worker_id = (self.rank * num_workers) + worker_id
-        total_workers = self.world_size * num_workers
-
-        if total_workers > 1:
-            return split_dataset_by_node(
-                self.hf_dataset,
-                rank=global_worker_id,
-                world_size=total_workers,
-            )
         return self.hf_dataset
 
     def iter_raw(self):

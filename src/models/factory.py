@@ -152,6 +152,7 @@ def load_trainable_model(
     Loads models (UNet, TE, VAE) and configures them for training (gradients, dtype).
     Handles fallback logic: Checkpoint -> Base Model.
     """
+    is_dit = model_type in ["dual_stream", "sprint_dual"]
     unet_path = f"{models_path}/unet/diffusion_pytorch_model.safetensors"
     te_path = f"{models_path}/clip/model.safetensors"
 
@@ -168,7 +169,7 @@ def load_trainable_model(
             if global_rank == 0:
                 logging.info(f"  -> Found UNet weights: {unet_path}")
 
-        if train_te and os.path.exists(ckpt_te_path):
+        if train_te and not hf_te_id and os.path.exists(ckpt_te_path):
             te_path = ckpt_te_path
             if global_rank == 0:
                 logging.info(f"  -> Found Text Encoder weights: {te_path}")
@@ -275,15 +276,49 @@ def load_trainable_model(
                 output_head_path=output_head_path,
             ).eval()
 
-        # Offload to CPU
+        # Load weights for DiT architectures from checkpoint or base path
+        if is_dit:
+            ckpt_dit_path = None
+            if resume_from_checkpoint and os.path.isdir(resume_from_checkpoint):
+                for fname in ["unet.safetensors", "model.safetensors"]:
+                    candidate = os.path.join(resume_from_checkpoint, fname)
+                    if os.path.exists(candidate):
+                        ckpt_dit_path = candidate
+                        break
+            elif os.path.exists(unet_path):
+                ckpt_dit_path = unet_path
+
+            if ckpt_dit_path and os.path.exists(ckpt_dit_path):
+                if global_rank == 0:
+                    logging.info(
+                        f"  -> Loading DiT weights from: {ckpt_dit_path}"
+                    )
+                sd = load_file(ckpt_dit_path, device="cpu")
+                sd = {
+                    k.replace("_orig_mod.", "").replace("unet.", ""): v
+                    for k, v in sd.items()
+                    if not k.startswith("text_enc.")
+                }
+                unet.load_state_dict(sd, strict=False)
+
+        # Offload EMA to CPU
         actual_use_ema = use_ema and (global_rank == 0)
         ema = EMAModel(
-            unet, decay=ema_decay, use_ema=actual_use_ema, device=torch.device("cpu")
+            unet,
+            decay=ema_decay,
+            use_ema=actual_use_ema,
+            device=torch.device("cpu"),
         )
 
-        if resume_from_checkpoint and os.path.isdir(resume_from_checkpoint):
-            ema_path = os.path.join(resume_from_checkpoint, "unet_ema.safetensors")
-            # Only rank 0 has ema.use_ema = True
+        if (
+            not is_dit
+            and not hf_te_id
+            and resume_from_checkpoint
+            and os.path.isdir(resume_from_checkpoint)
+        ):
+            ema_path = os.path.join(
+                resume_from_checkpoint, "unet_ema.safetensors"
+            )
             if os.path.exists(ema_path) and ema.use_ema:
                 logging.info(f"  -> Found EMA weights: {ema_path}")
                 ema.ema_model.load_state_dict(load_file(ema_path, device="cpu"))
@@ -368,7 +403,7 @@ def load_training_state(
     device,
     global_rank,
 ):
-    """Loads optimizer, scheduler, and training state (epoch/step) from checkpoint."""
+    """Loads optimizer, scheduler, and training state (epoch/step)."""
     start_epoch = 0
     global_step = 0
 
@@ -378,7 +413,7 @@ def load_training_state(
     if global_rank == 0:
         logging.info(f"Resuming training state from: {checkpoint_path}")
 
-    # Load Epoch/Step
+    # Load Epoch/Step with fallback to directory name parsing
     state_path = os.path.join(checkpoint_path, "training_state.pt")
     if os.path.exists(state_path):
         state = torch.load(state_path, map_location=device)
@@ -386,20 +421,47 @@ def load_training_state(
         global_step = state.get("global_step", 0)
         if global_rank == 0:
             logging.info(
-                f"  -> Resuming from epoch {start_epoch}, global step {global_step}"
+                f"  -> Resuming from epoch {start_epoch}, "
+                f"global step {global_step}"
             )
+    else:
+        base_name = os.path.basename(os.path.normpath(checkpoint_path))
+        if base_name.startswith("epoch_"):
+            parts = base_name.split("_")
+            try:
+                start_epoch = int(parts[1])
+                if len(parts) >= 4 and parts[2] == "step":
+                    global_step = int(parts[3])
+            except (ValueError, IndexError):
+                pass
+            if global_rank == 0:
+                logging.info(
+                    f"  -> Resumed from directory name: "
+                    f"epoch {start_epoch}, step {global_step}"
+                )
 
     optimizer_path = os.path.join(checkpoint_path, "optimizer.pt")
     if os.path.exists(optimizer_path):
-        optimizer.load_state_dict(torch.load(optimizer_path, map_location=device))
+        optimizer.load_state_dict(
+            torch.load(optimizer_path, map_location=device)
+        )
         if global_rank == 0:
             logging.info("  -> Optimizer state loaded.")
 
     scheduler_path = os.path.join(checkpoint_path, "scheduler.pt")
     if scheduler and os.path.exists(scheduler_path):
-        scheduler.load_state_dict(torch.load(scheduler_path, map_location=device))
-        if global_rank == 0:
-            logging.info("  -> Scheduler state loaded.")
+        try:
+            scheduler.load_state_dict(
+                torch.load(scheduler_path, map_location=device)
+            )
+            if global_rank == 0:
+                logging.info("  -> Scheduler state loaded.")
+        except Exception as e:
+            if global_rank == 0:
+                logging.warning(
+                    f"Could not load scheduler state: {e}. "
+                    f"Proceeding with initialized scheduler."
+                )
 
     torch.cuda.empty_cache()
     return optimizer, scheduler, start_epoch, global_step
@@ -604,6 +666,7 @@ def create_optimizer_param_groups(
 
 
 def create_optim(unet, text_encoder, conf: omegaconf.DictConfig):
+    model_type = getattr(conf.models, "model_type", "unet")
     param_groups = create_optimizer_param_groups(
         unet_model=unet,
         text_encoder_model=text_encoder,
@@ -614,6 +677,7 @@ def create_optim(unet, text_encoder, conf: omegaconf.DictConfig):
         unet_high_lr_multiplier=1.05,
         unet_backbone_lr_multiplier=1.0,
         unet_low_lr_multiplier=1.0,
+        model_type=model_type,
     )
 
     if conf.train.use_bitsandbytes:

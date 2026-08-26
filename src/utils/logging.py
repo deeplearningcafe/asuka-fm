@@ -5,6 +5,7 @@ from PIL import Image
 
 _wandb_run = None
 _hf_api = None
+_created_repos = set()
 
 
 def init_wandb(
@@ -158,22 +159,43 @@ def log_folder(
     repo_id: str = "",
 ):
     """
-    Logs an image to W&B with explicit step and commit control.
+    Uploads a checkpoint folder to Hugging Face Hub.
+
+    If the upload fails (e.g. due to rate limits or network issues),
+    the error is caught, logged as a warning, and suppressed so that
+    model training continues uninterrupted.
 
     Args:
-        folder_path (str): Key for the image in W&B dashboard.
-        repo_id (str, optional): Caption for the image.
+        folder_path (str): Local directory path containing checkpoint files.
+        repo_id (str, optional): Target repository ID on Hugging Face.
     """
-    if _hf_api:
-        try:
-            if len(repo_id) < 1:
-                repo_id = "edm-flow-matching"
-            _hf_api.create_repo(repo_id, private=True, repo_type="model", exist_ok=True)
-            _hf_api.upload_large_folder(
-                repo_id=repo_id, repo_type="model", folder_path=folder_path
+    if not _hf_api:
+        return
+
+    if not repo_id:
+        repo_id = "edm-flow-matching"
+
+    try:
+        if repo_id not in _created_repos:
+            _hf_api.create_repo(
+                repo_id=repo_id,
+                private=True,
+                repo_type="model",
+                exist_ok=True,
             )
-        except Exception as e:
-            print(f"Error logging folder to HfApi: {e}")
+            _created_repos.add(repo_id)
+
+        _hf_api.upload_folder(
+            repo_id=repo_id,
+            repo_type="model",
+            folder_path=folder_path,
+        )
+        print(f"Successfully uploaded {folder_path} to {repo_id}")
+    except Exception as e:
+        print(
+            f"Warning: Failed to upload checkpoint to Hugging Face "
+            f"({repo_id}): {e}. Skipping upload and continuing training."
+        )
 
 
 def is_hfapi_initialized():

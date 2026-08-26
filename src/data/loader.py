@@ -3,6 +3,7 @@ import warnings
 import logging
 from torch.utils.data import DataLoader
 import torch.distributed as dist
+from huggingface_hub.utils import _http
 from src.data.dataset import (
     H5LatentDataset,
     _close_h5_handles_worker,
@@ -11,6 +12,12 @@ from src.data.dataset import (
 from src.data.batch_sampler import StreamingTokenTierBatchSampler, BucketBatchSampler
 from src.data.streaming_dataset import StreamingImageDataset
 
+def worker_init_fn(worker_id: int) -> None:
+    """Isolates HTTP clients and resets connection pools per worker."""
+    try:
+        _http.reset_sessions()
+    except (ImportError, AttributeError):
+        pass
 
 def create_dataloader(cfg, rank, tokenizer=None) -> DataLoader:
     """Instantiates DataLoader based on dataset_type (h5 vs streaming)."""
@@ -59,21 +66,19 @@ def create_dataloader(cfg, rank, tokenizer=None) -> DataLoader:
             buffer_size=buffer_size,
         )
 
-        dataloader = DataLoader(
+        return DataLoader(
             batched_stream,
             batch_size=None,
-            num_workers=cfg.data.num_workers,
-            pin_memory=cfg.data.get("pin_memory", True),
+            num_workers=cfg.train.get("num_workers", 4),
+            pin_memory=True,
+            persistent_workers=True if cfg.train.get("num_workers", 4) > 0 else False,
             prefetch_factor=(
-                cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None
+                cfg.train.get("prefetch_factor", 2)
+                if cfg.train.get("num_workers", 4) > 0
+                else None
             ),
-            persistent_workers=(
-                cfg.data.get("persistent_workers", True)
-                if cfg.data.num_workers > 0
-                else False
-            ),
+            worker_init_fn=worker_init_fn,
         )
-        return dataloader
 
     metadata_path = f"{cfg.data.h5_path}/metadata.json"
     base_area = cfg.data.get("base_resolution_area", 64 * 64)

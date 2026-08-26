@@ -307,8 +307,15 @@ class StreamingImageDataset(IterableDataset):
         return img_tensor, tokens, mask, pos_map, tag_weight, aes_tier
 
     def set_epoch(self, epoch: int) -> None:
-        """Updates epoch state for shard shuffling on streaming dataset."""
+        """Updates epoch state and refreshes HTTP sessions between epochs."""
         self.epoch = epoch
+        try:
+            from huggingface_hub.utils import _http
+
+            _http.reset_sessions()
+        except Exception:
+            pass
+
         if hasattr(self.hf_dataset, "set_epoch"):
             self.hf_dataset.set_epoch(epoch)
 
@@ -321,9 +328,29 @@ class StreamingImageDataset(IterableDataset):
         return self.hf_dataset
 
     def iter_raw(self):
-        """Yields raw sample dictionaries without image/text processing."""
-        for sample in self._get_worker_stream():
-            yield sample
+        """Yields raw samples with automatic recovery from closed sessions."""
+        max_retries = 3
+        retries = 0
+        while retries < max_retries:
+            try:
+                for sample in self._get_worker_stream():
+                    yield sample
+                break
+            except RuntimeError as e:
+                if "client has been closed" in str(e) or "closed" in str(e):
+                    retries += 1
+                    logging.warning(
+                        f"HTTP client closed in worker stream. "
+                        f"Resetting session (attempt {retries}/{max_retries})."
+                    )
+                    try:
+                        from huggingface_hub.utils import _http
+
+                        _http.reset_sessions()
+                    except Exception:
+                        pass
+                else:
+                    raise e
 
     def __iter__(self):
         for sample in self._get_worker_stream():

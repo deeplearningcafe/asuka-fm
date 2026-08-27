@@ -9,8 +9,15 @@ from src.data.dataset import (
     _close_h5_handles_worker,
     WORKER_H5_HANDLES,
 )
-from src.data.batch_sampler import StreamingTokenTierBatchSampler, BucketBatchSampler
-from src.data.streaming_dataset import StreamingImageDataset
+from src.data.batch_sampler import (
+    StreamingTokenTierBatchSampler,
+    BucketBatchSampler,
+    RAMTokenTierBatchSampler,
+)
+from src.data.streaming_dataset import (
+    StreamingImageDataset,
+    precompute_latents_to_ram,
+)
 
 def worker_init_fn(worker_id: int) -> None:
     """Isolates HTTP clients and resets connection pools per worker."""
@@ -19,7 +26,7 @@ def worker_init_fn(worker_id: int) -> None:
     except (ImportError, AttributeError):
         pass
 
-def create_dataloader(cfg, rank, tokenizer=None) -> DataLoader:
+def create_dataloader(cfg, rank, tokenizer=None, vae=None, autocast_dtype=torch.float32) -> DataLoader:
     """Instantiates DataLoader based on dataset_type (h5 vs streaming)."""
     dataset_type = getattr(cfg.data, "dataset_type", "h5")
 
@@ -48,6 +55,61 @@ def create_dataloader(cfg, rank, tokenizer=None) -> DataLoader:
         tier_lengths = cfg.data.get(
             "tier_lengths", getattr(dataset, "length_tiers", [77, 152, 227])
         )
+
+        # In-RAM caching branch
+        if cfg.data.get("cache_latents_to_ram", False) and vae is not None:
+            vae_bs = cfg.models.get("vae_batch_size", 32)
+            precompute_workers = cfg.data.get(
+                "precompute_num_workers",
+                cfg.train.get("num_workers", 8),
+            )
+            precompute_prefetch = cfg.data.get(
+                "precompute_prefetch_factor",
+                cfg.train.get("prefetch_factor", 4),
+            )
+            ram_dataset = precompute_latents_to_ram(
+                dataset=dataset,
+                vae=vae,
+                batch_size=vae_bs,
+                num_workers=precompute_workers,
+                prefetch_factor=precompute_prefetch,
+                device=torch.device(f"cuda:{rank}"),
+                autocast_dtype=autocast_dtype,
+                vae_mean=getattr(cfg.models, "vae_mean", 0.0),
+                vae_std=getattr(cfg.models, "vae_std", 1.0),
+                in_channels=cfg.models.get("in_channels", 32),
+                rank=rank,
+                world_size=runtime_world_size,
+            )
+
+
+            # Avoid double-sharding: stream was already node-sharded per rank
+            batch_sampler = RAMTokenTierBatchSampler(
+                dataset=ram_dataset,
+                base_batch_size=cfg.train.batch_size,
+                tier_lengths=tier_lengths,
+                base_sequence_length=cfg.data.get("base_sequence_length", 77),
+                length_penalty_power=cfg.data.get("length_penalty_power", 0.0),
+                drop_last=cfg.data.get("drop_last", False),
+                seed=cfg.train.seed,
+                world_size=1,
+                rank=0,
+                aesthetic_curriculum=cfg.data.get("aesthetic_curriculum", True),
+            )
+
+            num_workers = cfg.train.get(
+                "num_workers", cfg.data.get("num_workers", 4)
+            )
+            return DataLoader(
+                ram_dataset,
+                batch_sampler=batch_sampler,
+                num_workers=num_workers,
+                pin_memory=True,
+                persistent_workers=(num_workers > 0),
+                prefetch_factor=cfg.train.get("prefetch_factor", 4),
+                )
+
+
         # 10K uses a lot of ram
         default_buf = min(1024, dataset.samples_per_shard)
         buffer_size = cfg.data.get("buffer_size", default_buf)

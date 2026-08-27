@@ -13,6 +13,7 @@ import wandb
 from omegaconf import DictConfig, OmegaConf
 from datetime import datetime
 import logging
+from typing import List, Dict, Any, Optional, Tuple
 
 from src.diffusion.schedules import LinearSchedule, DDPMSchedule
 from src.diffusion.objectives import FlowMatchingObjective, DDPMObjective
@@ -68,9 +69,13 @@ class Trainer:
                 autocast_dtype=self.autocast_dtype,
             )
         )
+        # TODO: could compile vae?
         self.dataloader = create_dataloader(
-            cfg, self.global_rank, tokenizer=self.tokenizer
+            cfg, self.global_rank, tokenizer=self.tokenizer, vae=self.vae, autocast_dtype=self.autocast_dtype,
         )
+
+        # leave vae in gpu to sample
+        self.is_cache_latents = cfg.data.get("cache_latents_to_ram", False)
 
         # VAE empirical scaling buffers
         vae_mean = getattr(cfg.models, "vae_mean", 0.0)
@@ -170,7 +175,7 @@ class Trainer:
             # TODO: compile text_encoder and vae
             self.unet = torch.compile(self.unet)
             self.text_encoder = torch.compile(self.text_encoder)
-            # self.vae = torch.compile(self.vae)
+            #self.vae = torch.compile(self.vae)
             # if hasattr(self.objective, "_compiled_loss_step"):
             #     self.objective._compiled_loss_step = torch.compile(
             #         self.objective._compiled_loss_step
@@ -284,15 +289,25 @@ class Trainer:
 
     def train_step(self, batch):
         pos_map = None
-        # Check if raw image streaming batch (len >= 5) or precomputed latents
+        # Check if raw streaming batch or precomputed RAM batch (len >= 5)
         if len(batch) >= 5:
-            images, cond, mask, pos_map, tag_weights, *rest = batch
-            torch._dynamo.maybe_mark_dynamic(images, 0)
-            with torch.no_grad():
-                with torch.autocast(
-                    device_type="cuda", dtype=self.autocast_dtype, enabled=True
-                ):
-                    latents = self._encode_vae_latents(images)
+            images_or_lats, cond, mask, pos_map, tag_weights, *rest = batch
+            if not self.is_cache_latents:
+                # Raw RGB images -> Encode via VAE in-place
+                torch._dynamo.maybe_mark_dynamic(images_or_lats, 0)
+                with torch.no_grad():
+                    with torch.autocast(
+                        device_type="cuda",
+                        dtype=self.autocast_dtype,
+                        enabled=True,
+                    ):
+                        latents = self._encode_vae_latents(images_or_lats)
+            else:
+                # Precomputed latents in RAM (e.g. 32 channels)
+                latents = images_or_lats.to(
+                    self.device, dtype=self.dtype, non_blocking=True
+                )
+
             attention_mask = mask.to(self.device, non_blocking=True)
             pos_map = pos_map.to(self.device, non_blocking=True)
             tag_weights = tag_weights.to(
@@ -300,7 +315,6 @@ class Trainer:
             )
             torch._dynamo.maybe_mark_dynamic(pos_map, 0)
             torch._dynamo.maybe_mark_dynamic(tag_weights, 0)
-            # tokenizer pipeline applies CFG
             drop_mask = None
         else:
             latents = (
@@ -310,7 +324,6 @@ class Trainer:
             tag_weights = batch[2].to(self.device, dtype=self.dtype, non_blocking=True)
             attention_mask = batch[3].to(self.device, non_blocking=True)
             bs = latents.shape[0]
-            # TODO: cache embeds of cfg
             drop_mask = None
             if self.cfg_dropout_prob > 0:
                 drop_mask = torch.rand(bs, device=self.device) < self.cfg_dropout_prob

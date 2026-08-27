@@ -465,8 +465,8 @@ def generate_samples(
                 raw_lat = (
                     latent.unsqueeze(0).to(torch.float32) * vae_std
                 ) + vae_mean
-                torch._dynamo.maybe_mark_dynamic(latent, 1)
                 torch._dynamo.maybe_mark_dynamic(latent, 2)
+                torch._dynamo.maybe_mark_dynamic(latent, 3)
                 image = vae.decode(raw_lat.to(vae_dtype)).sample
                 image = (image.to(torch.float32) / 2 + 0.5).clamp(0, 1)
                 image = image.cpu().permute(0, 2, 3, 1).numpy()[0]

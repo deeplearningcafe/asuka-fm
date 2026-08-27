@@ -159,20 +159,28 @@ def load_trainable_model(
     if resume_from_checkpoint and os.path.isdir(resume_from_checkpoint):
         if global_rank == 0:
             logging.info(
-                f"Attempting to load weights from checkpoint: {resume_from_checkpoint}"
+                f"Resolved checkpoint directory: {resume_from_checkpoint}"
             )
-        ckpt_unet_path = os.path.join(resume_from_checkpoint, "unet.safetensors")
-        ckpt_te_path = os.path.join(resume_from_checkpoint, "text_encoder.safetensors")
+        for fname in ["unet.safetensors", "model.safetensors"]:
+            candidate = os.path.join(resume_from_checkpoint, fname)
+            if os.path.exists(candidate):
+                unet_path = candidate
+                if global_rank == 0:
+                    logging.info(f"  -> Found model weights: {unet_path}")
+                break
 
-        if os.path.exists(ckpt_unet_path):
-            unet_path = ckpt_unet_path
-            if global_rank == 0:
-                logging.info(f"  -> Found UNet weights: {unet_path}")
-
-        if train_te and not hf_te_id and os.path.exists(ckpt_te_path):
+        ckpt_te_path = os.path.join(
+            resume_from_checkpoint, "text_encoder.safetensors"
+        )
+        hf_te_id = getattr(model_cfg, "hf_text_encoder", None)
+        if not hf_te_id and train_te and os.path.exists(ckpt_te_path):
             te_path = ckpt_te_path
             if global_rank == 0:
                 logging.info(f"  -> Found Text Encoder weights: {te_path}")
+    elif resume_from_checkpoint:
+        raise FileNotFoundError(
+            f"Checkpoint path '{resume_from_checkpoint}' could not be resolved."
+        )
 
     hf_te_id = getattr(model_cfg, "hf_text_encoder", None)
     if hf_te_id:
@@ -300,6 +308,10 @@ def load_trainable_model(
                     if not k.startswith("text_enc.")
                 }
                 unet.load_state_dict(sd, strict=False)
+            elif resume_from_checkpoint:
+                raise FileNotFoundError(
+                    f"Could not find DiT weights in {resolved_ckpt_dir}"
+                )
 
         # Offload EMA to CPU
         actual_use_ema = use_ema and (global_rank == 0)
@@ -336,6 +348,7 @@ def load_trainable_model(
                 torch_dtype=autocast_dtype,
                 cache_dir=None #f"{models_path}/vae",
             ).eval()
+            vae.to(dtype=autocast_dtype)
         else:
             vae_path = f"{models_path}/vae/diffusion_pytorch_model.safetensors"
             vae = Vae.from_pretrained(VaeConfig(), vae_path).eval()
@@ -677,7 +690,7 @@ def create_optim(unet, text_encoder, conf: omegaconf.DictConfig):
         unet_high_lr_multiplier=1.05,
         unet_backbone_lr_multiplier=1.0,
         unet_low_lr_multiplier=1.0,
-        model_type=model_type,
+        #model_type=model_type,
     )
 
     if conf.train.use_bitsandbytes:

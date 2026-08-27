@@ -6,6 +6,7 @@ import random
 import argparse
 from pathlib import Path
 from collections import Counter, defaultdict
+import warnings
 
 import torch
 import json
@@ -76,6 +77,32 @@ def sniff_image_header(
 
     return "UNKNOWN", None
 
+def bytes_to_tensor(
+    raw_bytes: bytes,
+    shape: list[int] | tuple[int, ...],
+    dtype_str: str = "bf16",
+) -> torch.Tensor:
+    """Zero-copy bitcast deserialization of raw latent bytes."""
+    dt = dtype_str.lower()
+    
+    # latent is read only but pytorch modifies it only strides and offsets so no problem
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="The given buffer is not writable.*",
+            category=UserWarning,
+        )
+        if dt in ("bf16", "bfloat16"):
+            tensor = torch.frombuffer(raw_bytes, dtype=torch.int16).view(
+                torch.bfloat16
+            )
+        elif dt in ("fp16", "float16"):
+            tensor = torch.frombuffer(raw_bytes, dtype=torch.float16)
+        else:
+            tensor = torch.frombuffer(raw_bytes, dtype=torch.float32)
+
+    return tensor.view(*shape)
+
 
 def compute_aspect_coordinates(
     target_h: int,
@@ -117,6 +144,7 @@ class StreamingImageDataset(IterableDataset):
         rank: int = 0,
         world_size: int = 1,
         low_ram: bool = False,
+        is_latent: bool = False,
     ):
         super().__init__()
         self.resolution = resolution
@@ -129,6 +157,7 @@ class StreamingImageDataset(IterableDataset):
         self.shuffle_tags = shuffle_tags
         self.rank = rank
         self.world_size = world_size
+        self.is_latent = is_latent
 
         self.metadata = self._load_metadata(dataset_name)
         self.total_samples = int(self.metadata.get("total_samples", 0))
@@ -138,6 +167,8 @@ class StreamingImageDataset(IterableDataset):
         self.samples_per_shard = int(self.metadata.get("samples_per_shard", 10000))
         self.length_tiers = self.metadata.get("length_tiers", [77, 152, 227])
         self.bucket_info = self.metadata.get("bucket_info", [])
+        self.crop_latent_size = resolution // vae_downsample_factor
+        self.vae_downsample_factor = vae_downsample_factor
 
         if self.world_size > 1:
             self.num_samples = self.total_samples // self.world_size
@@ -252,9 +283,62 @@ class StreamingImageDataset(IterableDataset):
             print(f"[Warning] {warnings_msg}")
             return {}
 
+    def _process_latent_sample(
+        self, sample: dict
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, ...]:
+        """Processes precomputed latent sample with dynamic shift cropping."""
+        raw_bytes = sample.get("latent")
+        shape = sample.get("latent_shape", [32, 64, 64])
+        dtype_str = sample.get("latent_dtype", "bf16")
+        latent = bytes_to_tensor(raw_bytes, shape, dtype_str)
+
+        _, h_lat, w_lat = latent.shape
+        max_y = max(0, h_lat - self.crop_latent_size)
+        max_x = max(0, w_lat - self.crop_latent_size)
+        crop_y_lat = random.randint(0, max_y) if max_y > 0 else 0
+        crop_x_lat = random.randint(0, max_x) if max_x > 0 else 0
+
+        cropped_latent = latent[
+            :,
+            crop_y_lat : crop_y_lat + self.crop_latent_size,
+            crop_x_lat : crop_x_lat + self.crop_latent_size,
+        ].clone()
+
+        pos_map = compute_aspect_coordinates(
+            target_h=h_lat * self.vae_downsample_factor,
+            target_w=w_lat * self.vae_downsample_factor,
+            crop_y=crop_y_lat * self.vae_downsample_factor,
+            crop_x=crop_x_lat * self.vae_downsample_factor,
+            crop_size=self.resolution,
+            patch_size=self.latent_patch,
+        )
+
+        tier_len = int(sample.get("tier", 227))
+        prompt = sample.get("prompt") or sample.get("text", "")
+        tokens, mask = self.tokenizer.encode(
+            prompt,
+            max_len=tier_len,
+            cfg_dropout_prob=self.cfg_dropout_prob,
+            tag_dropout_prob=self.tag_dropout_prob,
+            shuffle_tags=self.shuffle_tags,
+        )
+        is_uncond = mask.sum().item() <= 1
+        raw_tag_weight = float(sample.get("tag_weight", 1.0))
+        tag_weight = torch.tensor(
+            1.0 if is_uncond else raw_tag_weight, dtype=torch.float32
+        )
+        aes_tier = torch.tensor(
+            float(sample.get("aesthetic_tier", -1.0)), dtype=torch.float32
+        )
+
+        return cropped_latent, tokens, mask, pos_map, tag_weight, aes_tier
+
     def _process_sample(
         self, sample: dict
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.is_latent or "latent" in sample:
+            return self._process_latent_sample(sample)
+
         img_data = sample.get("image") or sample.get("bytes")
         if isinstance(img_data, bytes):
             image = Image.open(io.BytesIO(img_data)).convert("RGB")

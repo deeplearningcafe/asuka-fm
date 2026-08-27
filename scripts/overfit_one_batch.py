@@ -183,9 +183,15 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
             schedule=schedule, min_snr_gamma=cfg.train.snr_gamma
         )
 
+    is_latent = (
+            cfg.data.get("is_latent", False)
+            or getattr(cfg.data, "dataset_type", "") == "streaming_latents"
+            or cfg.data.get("cache_latents_to_ram", False)
+        )
+
     cfg.train.cfg_dropout_prob = 0.0
     cfg.train.tag_dropout = 0.0
-    dataloader = create_dataloader(cfg, rank=0, tokenizer=tokenizer)
+    dataloader = create_dataloader(cfg, rank=0, tokenizer=tokenizer, vae=vae, autocast_dtype=autocast_dtype,)
     raw_batch = next(iter(dataloader))
 
     # Parse and cache single batch on GPU
@@ -203,20 +209,26 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
 
     pos_map = None
     if len(raw_batch) >= 5:
-        images, cond, mask, pos_map, tag_weights, *rest = raw_batch
-        with torch.no_grad():
-            with torch.autocast(
-                device_type="cuda", dtype=autocast_dtype, enabled=True
-            ):
-                latents = encode_vae_latents(
-                    images=images,
-                    vae=vae,
-                    device=device,
-                    autocast_dtype=autocast_dtype,
-                    vae_mean=vae_mean_t,
-                    vae_std=vae_std_t,
-                    chunk_size=vae_batch_size,
-                )
+        images_or_lats, cond, mask, pos_map, tag_weights, *rest = raw_batch
+        if not is_latent:
+            with torch.no_grad():
+                with torch.autocast(
+                    device_type="cuda", dtype=autocast_dtype, enabled=True
+                ):
+                    latents = encode_vae_latents(
+                        images=images,
+                        vae=vae,
+                        device=device,
+                        autocast_dtype=autocast_dtype,
+                        vae_mean=vae_mean_t,
+                        vae_std=vae_std_t,
+                        chunk_size=vae_batch_size,
+                    )
+        else:
+            # Precomputed latents (streaming shards or RAM buffer)
+            latents = images_or_lats.to(
+                device, dtype=dtype, non_blocking=True
+            )
         torch.cuda.empty_cache()
         attention_mask = mask.to(device)
         pos_map = pos_map.to(device, dtype=dtype)
@@ -241,6 +253,7 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
         vae_batch_size=min(4, vae_batch_size),
     )
     save_pil_grid(gt_images, os.path.join(save_dir, "ground_truth.png"))
+    in_channels = cfg.models.get("in_channels", 4)
 
     cfg.train.epochs = 1
     cfg.train.warmup = 0.005
@@ -352,6 +365,7 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
                     use_unet_mult=False if is_dit else True,
                     vae_mean=vae_mean_t,
                     vae_std=vae_std_t,
+                    in_channels=in_channels
                 )
 
             step_path = os.path.join(save_dir, f"sample_step_{step + 1:05d}.png")

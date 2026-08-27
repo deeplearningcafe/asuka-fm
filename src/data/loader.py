@@ -26,7 +26,9 @@ def worker_init_fn(worker_id: int) -> None:
     except (ImportError, AttributeError):
         pass
 
-def create_dataloader(cfg, rank, tokenizer=None, vae=None, autocast_dtype=torch.float32) -> DataLoader:
+def create_dataloader(
+    cfg, rank, tokenizer=None, vae=None, autocast_dtype=torch.float32
+) -> DataLoader:
     """Instantiates DataLoader based on dataset_type (h5 vs streaming)."""
     dataset_type = getattr(cfg.data, "dataset_type", "h5")
 
@@ -34,8 +36,17 @@ def create_dataloader(cfg, rank, tokenizer=None, vae=None, autocast_dtype=torch.
         runtime_world_size = dist.get_world_size()
     else:
         runtime_world_size = 1
+    if rank == 0:
+        logging.info(f"Loading {dataset_type} dataset")
 
-    if dataset_type == "streaming":
+    if dataset_type in ("streaming", "streaming_latents"):
+        is_latent = (
+            cfg.data.get("is_latent", False)
+            or (dataset_type == "streaming_latents")
+        )
+        if rank == 0:
+            logging.info(f"Using latents {is_latent}")
+
         dataset = StreamingImageDataset(
             dataset_name=cfg.data.streaming_dataset_name,
             dataset_path=cfg.data.get("dataset_path", None),
@@ -50,6 +61,7 @@ def create_dataloader(cfg, rank, tokenizer=None, vae=None, autocast_dtype=torch.
             rank=rank,
             world_size=runtime_world_size,
             low_ram=getattr(cfg.data, "low_ram", False),
+            is_latent=is_latent,
         )
 
         tier_lengths = cfg.data.get(
@@ -82,8 +94,6 @@ def create_dataloader(cfg, rank, tokenizer=None, vae=None, autocast_dtype=torch.
                 world_size=runtime_world_size,
             )
 
-
-            # Avoid double-sharding: stream was already node-sharded per rank
             batch_sampler = RAMTokenTierBatchSampler(
                 dataset=ram_dataset,
                 base_batch_size=cfg.train.batch_size,
@@ -107,10 +117,8 @@ def create_dataloader(cfg, rank, tokenizer=None, vae=None, autocast_dtype=torch.
                 pin_memory=True,
                 persistent_workers=(num_workers > 0),
                 prefetch_factor=cfg.train.get("prefetch_factor", 4),
-                )
+            )
 
-
-        # 10K uses a lot of ram
         default_buf = min(1024, dataset.samples_per_shard)
         buffer_size = cfg.data.get("buffer_size", default_buf)
 
@@ -133,7 +141,7 @@ def create_dataloader(cfg, rank, tokenizer=None, vae=None, autocast_dtype=torch.
             batch_size=None,
             num_workers=cfg.train.get("num_workers", 4),
             pin_memory=True,
-            persistent_workers=True if cfg.train.get("num_workers", 4) > 0 else False,
+            persistent_workers=cfg.train.get("num_workers", 4) > 0,
             prefetch_factor=(
                 cfg.train.get("prefetch_factor", 2)
                 if cfg.train.get("num_workers", 4) > 0

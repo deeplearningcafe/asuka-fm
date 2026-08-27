@@ -348,7 +348,6 @@ def load_trainable_model(
                 torch_dtype=autocast_dtype,
                 cache_dir=None #f"{models_path}/vae",
             ).eval()
-            vae.to(dtype=autocast_dtype)
         else:
             vae_path = f"{models_path}/vae/diffusion_pytorch_model.safetensors"
             vae = Vae.from_pretrained(VaeConfig(), vae_path).eval()

@@ -74,6 +74,12 @@ class Trainer:
             cfg, self.global_rank, tokenizer=self.tokenizer, vae=self.vae, autocast_dtype=self.autocast_dtype,
         )
 
+        self.is_latent = (
+            cfg.data.get("is_latent", False)
+            or getattr(cfg.data, "dataset_type", "") == "streaming_latents"
+            or cfg.data.get("cache_latents_to_ram", False)
+        )
+
         # leave vae in gpu to sample
         self.is_cache_latents = cfg.data.get("cache_latents_to_ram", False)
 
@@ -292,7 +298,7 @@ class Trainer:
         # Check if raw streaming batch or precomputed RAM batch (len >= 5)
         if len(batch) >= 5:
             images_or_lats, cond, mask, pos_map, tag_weights, *rest = batch
-            if not self.is_cache_latents:
+            if not self.is_latent:
                 # Raw RGB images -> Encode via VAE in-place
                 torch._dynamo.maybe_mark_dynamic(images_or_lats, 0)
                 with torch.no_grad():
@@ -303,7 +309,7 @@ class Trainer:
                     ):
                         latents = self._encode_vae_latents(images_or_lats)
             else:
-                # Precomputed latents in RAM (e.g. 32 channels)
+                # Precomputed latents (streaming shards or RAM buffer)
                 latents = images_or_lats.to(
                     self.device, dtype=self.dtype, non_blocking=True
                 )
@@ -470,15 +476,16 @@ class Trainer:
                     bsz = raw_bsz * self.world_size
                     batch_size_accum += bsz
 
-                    h_dim, w_dim = batch[0].shape[2], batch[0].shape[3]
-                    if is_raw_image:
-                        h_lat, w_lat = h_dim // 8, w_dim // 8
+                    if len(batch) >= 5:
+                        if not self.is_latent:
+                            h_lat, w_lat = h_dim // 8, w_dim // 8
+                        else:
+                            h_lat, w_lat = h_dim, w_dim
                         img_tokens = (h_lat // self.patch_size) * (
                             w_lat // self.patch_size
                         )
                         text_tokens = batch[2].bool().sum().item()
                     else:
-                        # Precomputed latents
                         img_tokens = (h_dim // self.patch_size) * (
                             w_dim // self.patch_size
                         )

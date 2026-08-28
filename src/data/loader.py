@@ -139,11 +139,11 @@ def create_dataloader(
         return DataLoader(
             batched_stream,
             batch_size=None,
-            num_workers=cfg.train.get("num_workers", 4),
+            num_workers=cfg.data.get("num_workers", 4),
             pin_memory=True,
-            persistent_workers=cfg.train.get("num_workers", 4) > 0,
+            persistent_workers=cfg.data.get("num_workers", 4) > 0,
             prefetch_factor=(
-                cfg.train.get("prefetch_factor", 2)
+                cfg.data.get("prefetch_factor", 2)
                 if cfg.train.get("num_workers", 4) > 0
                 else None
             ),

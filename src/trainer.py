@@ -476,6 +476,7 @@ class Trainer:
                     bsz = raw_bsz * self.world_size
                     batch_size_accum += bsz
 
+                    h_dim, w_dim = batch[0].shape[2], batch[0].shape[3]
                     if len(batch) >= 5:
                         if not self.is_latent:
                             h_lat, w_lat = h_dim // 8, w_dim // 8

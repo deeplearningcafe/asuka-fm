@@ -216,7 +216,7 @@ def run_overfit_experiment(cfg: DictConfig, args: argparse.Namespace) -> None:
                     device_type="cuda", dtype=autocast_dtype, enabled=True
                 ):
                     latents = encode_vae_latents(
-                        images=images,
+                        images=images_or_lats,
                         vae=vae,
                         device=device,
                         autocast_dtype=autocast_dtype,

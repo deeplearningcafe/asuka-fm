@@ -1,5 +1,6 @@
 import math
 import torch
+from collections import defaultdict
 from typing import List, Dict, Any, Optional
 from PIL import Image
 from src.diffusion.schedules import BaseSchedule
@@ -82,6 +83,7 @@ def compute_inference_pos_map(
     zoom: float = 1.0,
     x_shift: float = 0.0,
     y_shift: float = 0.0,
+    coord_system: str = "aspect_norm",
     device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
@@ -92,17 +94,37 @@ def compute_inference_pos_map(
     num_h = (height // vae_scale) // patch_size
     num_w = (width // vae_scale) // patch_size
 
-    y_pos = torch.arange(num_h, dtype=torch.float32, device=device)
-    x_pos = torch.arange(num_w, dtype=torch.float32, device=device)
-    grid_y, grid_x = torch.meshgrid(y_pos, x_pos, indexing="ij")
+    if coord_system == "aspect_norm":
+        r_h = math.sqrt(height / width)
+        r_w = math.sqrt(width / height)
 
-    # Center-anchored zoom and normalized shift scaled to patch count
-    center_y = (num_h - 1.0) / 2.0
-    center_x = (num_w - 1.0) / 2.0
-    grid_y = (grid_y - center_y) / zoom + center_y + y_shift * num_h
-    grid_x = (grid_x - center_x) / zoom + center_x + x_shift * num_w
+        y_centers = (
+            torch.arange(num_h, dtype=torch.float32, device=device) + 0.5
+        ) / float(num_h)
+        x_centers = (
+            torch.arange(num_w, dtype=torch.float32, device=device) + 0.5
+        ) / float(num_w)
 
-    pos_map = torch.stack((grid_y, grid_x), dim=-1).flatten(0, 1)
+        grid_y = y_centers * (2.0 * r_h) - r_h
+        grid_x = x_centers * (2.0 * r_w) - r_w
+        mesh_y, mesh_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
+
+        # Camera viewport manipulations in aspect-normalized space
+        mesh_y = (mesh_y / zoom) + (y_shift * 2.0 * r_h)
+        mesh_x = (mesh_x / zoom) + (x_shift * 2.0 * r_w)
+    else:
+        y_pos = torch.arange(num_h, dtype=torch.float32, device=device)
+        x_pos = torch.arange(num_w, dtype=torch.float32, device=device)
+        mesh_y, mesh_x = torch.meshgrid(y_pos, x_pos, indexing="ij")
+
+        # Center-anchored zoom and normalized shift scaled to patch count
+        center_y = (num_h - 1.0) / 2.0
+        center_x = (num_w - 1.0) / 2.0
+        # this produces pos ids at distance diff from 1 patch
+        mesh_y = (mesh_y - center_y) / zoom + center_y + y_shift * num_h
+        mesh_x = (mesh_x - center_x) / zoom + center_x + x_shift * num_w
+
+    pos_map = torch.stack((mesh_y, mesh_x), dim=-1).flatten(0, 1)
     return pos_map.to(dtype=dtype)
 
 
@@ -336,6 +358,7 @@ def generate_samples(
     vae_mean: float = 0.0,
     vae_std: float = 0.18215,
     in_channels: int = 4,
+    coord_system: str = "aspect_norm",
 ) -> List[Image.Image]:
     """
     Main entry point for generating samples during training.
@@ -353,127 +376,155 @@ def generate_samples(
 
     total_samples = len(sample_configs)
 
-    for i in range(0, total_samples, global_batch_size):
-        batch_configs = sample_configs[i : i + global_batch_size]
-        batch_prompts = [cfg.get("prompt", "") for cfg in batch_configs]
-        batch_neg = [cfg.get("negative_prompt", "") for cfg in batch_configs]
+    # 1. Group prompts by structural parameters that govern batch tensor shape
+    # and synchronous ODE trajectory steps
+    buckets = defaultdict(list)
+    for idx, cfg in enumerate(sample_configs):
+        bucket_key = (
+            cfg.get("height", 512),
+            cfg.get("width", 512),
+            cfg.get("sample_steps", 25),
+            cfg.get("cfg_scale", 7.0),
+            cfg.get("shift", 1.0),
+        )
+        buckets[bucket_key].append((idx, cfg))
 
-        H = batch_configs[0].get("height", 512)
-        W = batch_configs[0].get("width", 512)
-        steps = batch_configs[0].get("sample_steps", 25)
-        cfg_scale = batch_configs[0].get("cfg_scale", 7.0)
-        seed = batch_configs[0].get("seed", 42)
-        shift = batch_configs[0].get("shift", 1.0)
+    # 2. Process each bucket in batches up to global_batch_size
+    for (H, W, steps, cfg_scale, shift), bucket_items in buckets.items():
+        num_items = len(bucket_items)
+        for b_start in range(0, num_items, global_batch_size):
+            batch_chunk = bucket_items[b_start : b_start + global_batch_size]
+            batch_indices = [item[0] for item in batch_chunk]
+            batch_configs = [item[1] for item in batch_chunk]
+            curr_bs = len(batch_configs)
 
-        # Viewport camera manipulation parameters
-        zoom = batch_configs[0].get("zoom", 1.0)
-        x_shift = batch_configs[0].get("x_shift", 0.0)
-        y_shift = batch_configs[0].get("y_shift", 0.0)
+            batch_prompts = [c.get("prompt", "") for c in batch_configs]
+            batch_neg = [c.get("negative_prompt", "") for c in batch_configs]
 
-        curr_bs = len(batch_configs)
+            with torch.no_grad():
+                # 3. Independent per-sample noise generation based on seeds
+                latents_list = []
+                for c in batch_configs:
+                    seed = c.get("seed", 42)
+                    gen = torch.Generator(device=device).manual_seed(seed)
+                    lat = torch.randn(
+                        (1, in_channels, H // 8, W // 8),
+                        device=device,
+                        generator=gen,
+                        dtype=dtype,
+                    )
+                    latents_list.append(lat)
+                latents = torch.cat(latents_list, dim=0)
 
-        with torch.no_grad():
-            # 1. Prepare Latents (Noise)
-            gen = torch.Generator(device=device).manual_seed(seed)
-            latents = torch.randn(
-                (curr_bs, in_channels, H // 8, W // 8), device=device, generator=gen, dtype=dtype
-            )
+                # 4. Text tokenization and multi-tier length bucketing
+                full_prompts = batch_neg + batch_prompts
+                lengths = [tokenizer.get_length(p) for p in full_prompts]
+                max_p_len = max(lengths) if lengths else 77
+                target_len = 77
+                for tier_len in [77, 152, 227, 256]:
+                    if max_p_len <= tier_len:
+                        target_len = tier_len
+                        break
+                else:
+                    target_len = max(256, max_p_len)
 
-            # 2. Polymorphic Text Tokenization & Encoding
-            full_prompts = batch_neg + batch_prompts
+                tokens_list, mask_list = [], []
+                for p in full_prompts:
+                    tok, m = tokenizer.encode(
+                        p,
+                        max_len=target_len,
+                        cfg_dropout_prob=0.0,
+                        tag_dropout_prob=0.0,
+                        shuffle_tags=False,
+                    )
+                    tokens_list.append(tok)
+                    mask_list.append(m)
 
-            lengths = [tokenizer.get_length(p) for p in full_prompts]
-            max_p_len = max(lengths) if lengths else 77
-            target_len = 77
-            for tier_len in [77, 152, 227, 256]:
-                if max_p_len <= tier_len:
-                    target_len = tier_len
-                    break
-            else:
-                target_len = max(256, max_p_len)
-
-            tokens_list, mask_list = [], []
-            for p in full_prompts:
-                tok, m = tokenizer.encode(
-                    p,
-                    max_len=target_len,
-                    cfg_dropout_prob=0.0,
-                    tag_dropout_prob=0.0,
-                    shuffle_tags=False,
+                tokens = torch.stack(tokens_list).to(device)
+                attention_mask = torch.stack(mask_list).to(device)
+                embeddings, attention_mask = text_encoder(
+                    tokens, mask=attention_mask
                 )
-                tokens_list.append(tok)
-                mask_list.append(m)
-            tokens = torch.stack(tokens_list).to(device)
-            attention_mask = torch.stack(mask_list).to(device)
-            embeddings, attention_mask = text_encoder(tokens, mask=attention_mask)
 
-            # 3. Build Continuous 2D RoPE Position Map for DiT
-            pos_map = None
-            if "pos_map" in batch_configs[0] and (
-                batch_configs[0]["pos_map"] is not None
-            ):
-                pos_maps = [c["pos_map"] for c in batch_configs]
-                pos_map = torch.cat(pos_maps, dim=0).to(device=device)
-                print("Using Pos map with camera control")
-            else:
+                # 5. Build per-sample RoPE Continuous 2D Position Map
                 patch_size = getattr(unet, "patch_size", None)
                 if patch_size is None and hasattr(unet, "module"):
                     patch_size = getattr(unet.module, "patch_size", None)
+                p_size = patch_size if patch_size is not None else 2
 
-                has_camera = zoom != 1.0 or x_shift != 0.0 or y_shift != 0.0
-                if patch_size is not None or has_camera:
-                    print("Using Pos map with camera control")
-                    p_size = patch_size if patch_size is not None else 2
-                    single_pos = compute_inference_pos_map(
-                        height=H,
-                        width=W,
-                        patch_size=p_size,
-                        vae_scale=8,
-                        zoom=zoom,
-                        x_shift=x_shift,
-                        y_shift=y_shift,
-                        device=device,
-                        dtype=dtype,
-                    )
-                    pos_map = single_pos.unsqueeze(0).expand(curr_bs, -1, -1)
+                pos_maps = []
+                for c in batch_configs:
+                    if "pos_map" in c and c["pos_map"] is not None:
+                        pm = c["pos_map"].to(device=device, dtype=dtype)
+                        if pm.dim() == 2:
+                            pm = pm.unsqueeze(0)
+                        pos_maps.append(pm)
+                    else:
+                        zoom = c.get("zoom", 1.0)
+                        x_shift = c.get("x_shift", 0.0)
+                        y_shift = c.get("y_shift", 0.0)
+                        has_camera = (
+                            zoom != 1.0 or x_shift != 0.0 or y_shift != 0.0
+                        )
+                        if patch_size is not None or has_camera:
+                            single_pos = compute_inference_pos_map(
+                                height=H,
+                                width=W,
+                                patch_size=p_size,
+                                vae_scale=8,
+                                zoom=zoom,
+                                x_shift=x_shift,
+                                y_shift=y_shift,
+                                coord_system=coord_system,
+                                device=device,
+                                dtype=dtype,
+                            )
+                            pos_maps.append(single_pos.unsqueeze(0))
 
-            model_wrapper = CFGModelWrapper(
-                unet=unet,
-                combined_embeddings=embeddings,
-                cfg_scale=cfg_scale,
-                device=device,
-                autocast_dtype=autocast_dtype,
-                is_ddpm=(diffusion_type == "ddpm"),
-                attention_mask=attention_mask,
-                use_unet_mult=use_unet_mult,
-                pos_map=pos_map,
-            )
-
-            if diffusion_type == "ddpm":
-                latents = sample_ddpm(model_wrapper, schedule, latents, steps)
-            else:
-                sigmas = linear_shift_schedule(steps, shift=shift).to(device)
-                # latents = sample_res_multistep(model_wrapper, latents, sigmas)
-                latents = sample_euler(
-                    model_wrapper, latents, num_steps=steps, shift=shift
+                pos_map = (
+                    torch.cat(pos_maps, dim=0) if len(pos_maps) > 0 else None
                 )
 
-            # Decode one by one to save VRAM
-            vae_dtype = next(vae.parameters()).dtype
-            for j, latent in enumerate(latents):
-                # Inverse transform: z_raw = (z_norm * std) + mean
-                raw_lat = (
-                    latent.unsqueeze(0).to(torch.float32) * vae_std
-                ) + vae_mean
-                torch._dynamo.maybe_mark_dynamic(latent, 2)
-                torch._dynamo.maybe_mark_dynamic(latent, 3)
-                image = vae.decode(raw_lat.to(vae_dtype)).sample
-                image = (image.to(torch.float32) / 2 + 0.5).clamp(0, 1)
-                image = image.cpu().permute(0, 2, 3, 1).numpy()[0]
-                image = (image * 255).round().astype("uint8")
+                model_wrapper = CFGModelWrapper(
+                    unet=unet,
+                    combined_embeddings=embeddings,
+                    cfg_scale=cfg_scale,
+                    device=device,
+                    autocast_dtype=autocast_dtype,
+                    is_ddpm=(diffusion_type == "ddpm"),
+                    attention_mask=attention_mask,
+                    use_unet_mult=use_unet_mult,
+                    pos_map=pos_map,
+                )
 
-                all_images[i + j] = Image.fromarray(image)
+                # 6. Trajectory integration (DDPM or Flow Matching Euler ODE)
+                if diffusion_type == "ddpm":
+                    if schedule is None:
+                        raise ValueError(
+                            "Schedule must be provided for DDPM sampling"
+                        )
+                    latents = sample_ddpm(
+                        model_wrapper, schedule, latents, steps
+                    )
+                else:
+                    latents = sample_euler(
+                        model_wrapper, latents, num_steps=steps, shift=shift
+                    )
 
+                # 7. VAE Decode into original index locations
+                vae_dtype = next(vae.parameters()).dtype
+                for j, latent in enumerate(latents):
+                    orig_idx = batch_indices[j]
+                    raw_lat = (
+                        latent.unsqueeze(0).to(torch.float32) * vae_std
+                    ) + vae_mean
+                    torch._dynamo.maybe_mark_dynamic(raw_lat, 2)
+                    torch._dynamo.maybe_mark_dynamic(raw_lat, 3)
+                    image = vae.decode(raw_lat.to(vae_dtype)).sample
+                    image = (image.to(torch.float32) / 2.0 + 0.5).clamp(0, 1)
+                    image = image.cpu().permute(0, 2, 3, 1).numpy()[0]
+                    image = (image * 255).round().astype("uint8")
+                    all_images[orig_idx] = Image.fromarray(image)
     # vae.to("cpu")
 
     return [all_images[k] for k in range(total_samples)]

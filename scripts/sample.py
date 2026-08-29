@@ -5,12 +5,14 @@ import torch
 import toml
 from datetime import datetime
 from omegaconf import OmegaConf
+import logging
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.models.factory import load_trainable_model
 from src.diffusion.schedules import LinearSchedule, DDPMSchedule
 from src.diffusion.sampling import generate_samples
+from src.utils.logging_utils import Logger
 
 
 def load_toml_configs(toml_path):
@@ -52,7 +54,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="sampling",
+        default="results/sampling",
         help="Root directory for saving samples",
     )
     args = parser.parse_args()
@@ -65,6 +67,33 @@ def main():
     dtype = torch.bfloat16 if cfg.train.dtype == "bf16" else torch.float32
     print(f"Using device: {device}, Precision: {dtype}")
 
+    # Hardware detection and TF32/autocast configuration
+    autocast_dtype = torch.bfloat16
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability()
+        if capability[0] >= 7 and capability[0] < 8:
+            autocast_dtype = torch.float16
+            torch.set_float32_matmul_precision("high")
+            logging.info(
+                "Using high precision for float32 matmul (Volta/Turing)."
+            )
+        elif capability[0] >= 8:
+            torch.set_float32_matmul_precision("medium")
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
+                True
+            )
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
+                True
+            )
+            logging.info("Using TF32 and tensor cores (Ampere+).")
+        else:
+            logging.info("Legacy GPU detected; standard precision used.")
+
+    logging.info(f"Using {autocast_dtype} for autocast mixed precision")
+
+
     checkpoint_path = (
         args.checkpoint if args.checkpoint else cfg.models.resume_from_checkpoint
     )
@@ -73,6 +102,7 @@ def main():
     if checkpoint_path:
         print(f"Resuming weights from: {checkpoint_path}")
 
+    model_type = getattr(cfg.models, "model_type", "unet")
     unet, text_encoder, vae, tokenizer, _ = load_trainable_model(
         models_path=cfg.paths.models,
         device=device,
@@ -81,7 +111,21 @@ def main():
         use_checkpointing=False,
         resume_from_checkpoint=checkpoint_path,
         train_only_output=False,
+        global_rank=0,
+        model_type=model_type,
+        model_cfg=cfg.models,
+        autocast_dtype=autocast_dtype,
     )
+    in_channels = cfg.models.get("in_channels", 4)
+    vae_mean = getattr(cfg.models, "vae_mean", 0.0)
+    vae_std = getattr(cfg.models, "vae_std", 1.0 / 0.18215)
+    vae_mean = torch.tensor(
+        vae_mean, device=device, dtype=dtype
+    ).view(1, -1, 1, 1)
+    vae_std = torch.tensor(vae_std, device=device, dtype=dtype).view(
+        1, -1, 1, 1
+    )
+    is_dit = model_type in ["dual_stream", "sprint_dual"]
 
     # Ensure everything is in Eval mode and gradients are disabled
     unet.eval()
@@ -115,6 +159,10 @@ def main():
         diffusion_type=cfg.train.objective,
         device=device,
         dtype=dtype,
+        use_unet_mult=False if is_dit else True,
+        vae_mean=vae_mean,
+        vae_std=vae_std,
+        in_channels=in_channels
     )
 
     # Create datetime folder: sampling/YYYY-MM-DD-HH-MM

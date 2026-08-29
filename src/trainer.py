@@ -94,6 +94,7 @@ class Trainer:
         )
         self.vae_batch_size = cfg.train.get("vae_batch_size", 64)
         self.in_channels = cfg.models.get("in_channels", 4)
+        self.coord_system = "aspect_norm" if getattr(cfg.models, "use_calibrated_spatial", False) else "discrete"
 
         self.optimizer = create_optim(self.unet, self.text_encoder, cfg)
         self.grad_offloader = None
@@ -633,6 +634,7 @@ class Trainer:
                                             self.cfg.train.train_only_output
                                         ),
                                         ema=self.ema,
+                                        config=self.cfg,
                                     )
 
                         # Sampling
@@ -648,7 +650,7 @@ class Trainer:
                             # if sprint multi images tokens by drop_ratio
                             # TODO: take into account enc and dec layers and drop target
                             images_interval = (
-                                images_interval * self.cfg.models.drop_ratio
+                                images_interval * (1-self.cfg.models.drop_ratio)
                                 if self.model_type == "sprint_dual"
                                 else images_interval
                             )
@@ -807,6 +809,7 @@ class Trainer:
                         text_encoder=self.text_encoder,
                         tokenizer=self.tokenizer,
                         vae=self.vae,
+                        schedule=self.schedule,
                         sample_configs=self.sample_configs,
                         diffusion_type=self.cfg.train.objective,
                         device=self.device,
@@ -820,17 +823,23 @@ class Trainer:
                 io_executor.submit(log_image, images, prompts, epoch, self.global_step)
 
                 unet_save = self.unet.module if self.is_ddp else self.unet
+                te_save = (
+                    self.text_encoder.module
+                    if self.is_ddp and self.train_te
+                    else self.text_encoder
+                    )
                 save_checkpoint(
                     epoch,
                     self.global_step,
                     unet_save,
-                    self.text_encoder,
+                    te_save,
                     self.optimizer,
                     self.lr_scheduler,
                     self.train_te,
                     self.cfg.logging.hf_repo,
                     train_only_output=self.cfg.train.train_only_output,
                     ema=self.ema,
+                    config=self.cfg,
                 )
 
                 self.unet.train()

@@ -146,6 +146,7 @@ class SprintDualStreamDiT(DualStreamDiT):
         activation_func: str = "geglu",
         skip_checkpointing_layers: int = 0,
         use_random_drop: bool = False,
+        use_calibrated_spatial: bool = True,
     ):
         # Prevent base constructor block initialization
         nn.Module.__init__(self)
@@ -165,6 +166,7 @@ class SprintDualStreamDiT(DualStreamDiT):
         self.use_rope_text_adapter = use_rope_text_adapter
         self.skip_checkpointing_layers = skip_checkpointing_layers
         self.use_random_drop = use_random_drop
+        self.use_calibrated_spatial = use_calibrated_spatial
 
         def should_checkpoint(layer_idx: int) -> bool:
             return self.use_checkpointing and (
@@ -201,7 +203,9 @@ class SprintDualStreamDiT(DualStreamDiT):
         # 4. 3D RoPE
         head_dim = hidden_size // num_heads
         axes_dims = _default_rope_axes_dims(head_dim)
-        self.rope_embedder = MultimodalRopeEmbedder(axes_dims)
+        self.rope_embedder = MultimodalRopeEmbedder(
+            axes_dims, use_calibrated_spatial=self.use_calibrated_spatial
+        )
 
         # Encoder blocks
         in_start_idx = current_layer_idx

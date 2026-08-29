@@ -30,12 +30,26 @@ PngImagePlugin.MAX_TEXT_CHUNK = 64 * 1024 * 1024
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
 
-def _worker_init_fn(worker_id: int) -> None:
-    """Resets HTTP session pools per worker to prevent socket collisions."""
+
+def _reset_http_sessions() -> None:
+    """
+    Safely closes global HTTPX and Requests connection pools across
+    multiprocessing worker forks to prevent stale/closed socket errors.
+    """
     try:
-        _http.reset_sessions()
+        from huggingface_hub.utils import _http
+
+        if hasattr(_http, "close_session"):
+            _http.close_session()
+        elif hasattr(_http, "reset_sessions"):
+            _http.reset_sessions()
     except Exception:
         pass
+
+
+def _worker_init_fn(worker_id: int) -> None:
+    """Resets HTTP session pools per worker to prevent socket collisions."""
+    _reset_http_sessions()
 
 def sniff_image_header(
     data: bytes,
@@ -111,16 +125,30 @@ def compute_aspect_coordinates(
     crop_x: int,
     crop_size: int,
     patch_size: int,
+    coord_system: str = "aspect_norm",
 ) -> torch.Tensor:
     """Computes continuous patch-unit 2D RoPE position map for cropped patch."""
     num_patches_h = crop_size // patch_size
     num_patches_w = crop_size // patch_size
 
-    crop_y_patch = crop_y / float(patch_size)
-    crop_x_patch = crop_x / float(patch_size)
+    if coord_system == "aspect_norm":
+        r_h = math.sqrt(target_h / target_w)
+        r_w = math.sqrt(target_w / target_h)
 
-    y_pos = torch.arange(num_patches_h, dtype=torch.float32) + crop_y_patch
-    x_pos = torch.arange(num_patches_w, dtype=torch.float32) + crop_x_patch
+        y_centers = (
+            torch.arange(num_patches_h, dtype=torch.float32) + 0.5
+        ) * patch_size + crop_y
+        x_centers = (
+            torch.arange(num_patches_w, dtype=torch.float32) + 0.5
+        ) * patch_size + crop_x
+
+        y_pos = (y_centers / float(target_h)) * (2.0 * r_h) - r_h
+        x_pos = (x_centers / float(target_w)) * (2.0 * r_w) - r_w
+    else:
+        crop_y_patch = crop_y / float(patch_size)
+        crop_x_patch = crop_x / float(patch_size)
+        y_pos = torch.arange(num_patches_h, dtype=torch.float32) + crop_y_patch
+        x_pos = torch.arange(num_patches_w, dtype=torch.float32) + crop_x_patch
 
     grid_y, grid_x = torch.meshgrid(y_pos, x_pos, indexing="ij")
     return torch.stack((grid_y, grid_x), dim=-1).flatten(0, 1)
@@ -145,8 +173,11 @@ class StreamingImageDataset(IterableDataset):
         world_size: int = 1,
         low_ram: bool = False,
         is_latent: bool = False,
+        coord_system:str="aspect_norm",
     ):
         super().__init__()
+        self.dataset_name = dataset_name
+        self.dataset_path = dataset_path
         self.resolution = resolution
         self.patch_size = patch_size
         self.latent_patch = patch_size * vae_downsample_factor
@@ -158,6 +189,7 @@ class StreamingImageDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.is_latent = is_latent
+        self.coord_system = coord_system
 
         self.metadata = self._load_metadata(dataset_name)
         self.total_samples = int(self.metadata.get("total_samples", 0))
@@ -311,6 +343,7 @@ class StreamingImageDataset(IterableDataset):
             crop_x=crop_x_lat * self.vae_downsample_factor,
             crop_size=self.resolution,
             patch_size=self.latent_patch,
+            coord_system=self.coord_system,
         )
 
         tier_len = int(sample.get("tier", 227))
@@ -374,6 +407,7 @@ class StreamingImageDataset(IterableDataset):
             crop_x=crop_x,
             crop_size=self.resolution,
             patch_size=self.latent_patch,
+            coord_system=self.coord_system,
         )
         tier_len = int(sample.get("tier", 227))
         prompt = sample.get("prompt") or sample.get("text", "")
@@ -602,9 +636,25 @@ class PrecomputeExtractDataset(IterableDataset):
         # slices the assigned shard subset via get_worker_info().
         for raw_sample in self.streaming_dataset.hf_dataset:
             try:
-                img_tensor, res_h, res_w = (
-                    self.streaming_dataset._extract_resized_image(raw_sample)
-                )
+                if (
+                    self.streaming_dataset.is_latent
+                    or "latent" in raw_sample
+                ):
+                    raw_bytes = raw_sample.get("latent")
+                    shape = raw_sample.get(
+                        "latent_shape", [32, 64, 64]
+                    )
+                    dtype_str = raw_sample.get(
+                        "latent_dtype", "bf16"
+                    )
+                    item_tensor = bytes_to_tensor(
+                        raw_bytes, shape, dtype_str
+                    )
+                    res_h, res_w = int(shape[1]), int(shape[2])
+                else:
+                    item_tensor, res_h, res_w = (
+                        self.streaming_dataset._extract_resized_image(raw_sample)
+                    )
             except Exception as e:
                 logging.warning(
                     f"Worker failed to decode image: {e}. Skipping."
@@ -616,7 +666,7 @@ class PrecomputeExtractDataset(IterableDataset):
             tag_weight = float(raw_sample.get("tag_weight", 1.0))
             aes_tier = int(raw_sample.get("aesthetic_tier", -1))
 
-            yield img_tensor, res_h, res_w, prompt, tier, tag_weight, aes_tier
+            yield item_tensor, res_h, res_w, prompt, tier, tag_weight, aes_tier
 
 
 @torch.no_grad()
@@ -690,32 +740,10 @@ def precompute_latents_to_ram(
     sample_idx = 0
     current_flat_offset = 0
 
-    def _flush_bucket(items: list) -> None:
-        nonlocal current_flat_offset, sample_idx, latents_flat_buf
-        nonlocal offsets_buf, shapes_buf
-        if not items:
-            return
-
-        b_size = len(items)
-        imgs = torch.stack([it[0] for it in items], dim=0)
-        imgs_gpu = imgs.to(device, non_blocking=True)
-
-        with torch.autocast(
-            device_type="cuda", dtype=autocast_dtype, enabled=True
-        ):
-            enc = vae.encode(imgs_gpu)
-            dist = getattr(enc, "latent_dist", enc)
-            lats = dist.sample() if hasattr(dist, "sample") else dist
-            lats = (lats - vae_mean_t) / vae_std_t
-
-        lats_cpu = lats.to(dtype=autocast_dtype, device="cpu")
-        _, _, h_lat, w_lat = lats_cpu.shape
-        sample_numel = in_channels * h_lat * w_lat
-        total_elements = b_size * sample_numel
-
-        # Dynamic buffer expansion
-        if current_flat_offset + total_elements > latents_flat_buf.numel():
-            new_size = int((current_flat_offset + total_elements) * 1.3)
+    def _ensure_buffer_capacity(needed_elements: int, needed_samples: int):
+        nonlocal latents_flat_buf, offsets_buf, shapes_buf
+        if current_flat_offset + needed_elements > latents_flat_buf.numel():
+            new_size = int((current_flat_offset + needed_elements) * 1.3)
             new_buf = torch.empty(
                 (new_size,), dtype=autocast_dtype, device="cpu"
             ).share_memory_()
@@ -724,8 +752,8 @@ def precompute_latents_to_ram(
             ]
             latents_flat_buf = new_buf
 
-        if sample_idx + b_size > offsets_buf.shape[0]:
-            new_cap = int((sample_idx + b_size) * 1.3)
+        if sample_idx + needed_samples > offsets_buf.shape[0]:
+            new_cap = int((sample_idx + needed_samples) * 1.3)
             new_offsets = torch.empty(
                 (new_cap,), dtype=torch.long, device="cpu"
             ).share_memory_()
@@ -738,8 +766,27 @@ def precompute_latents_to_ram(
             new_shapes[:sample_idx] = shapes_buf[:sample_idx]
             shapes_buf = new_shapes
 
-        for i in range(b_size):
-            flat_lat = lats_cpu[i].flatten()
+    if dataset.is_latent:
+        # Direct zero-copy population from precomputed latents
+        for item in prefetch_loader:
+            if sample_idx >= max_samples:
+                break
+            (
+                latent,
+                h_lat,
+                w_lat,
+                prompt,
+                tier,
+                tag_weight,
+                aes_tier,
+            ) = item
+            flat_lat = latent.to(
+                dtype=autocast_dtype, device="cpu"
+            ).flatten()
+            sample_numel = flat_lat.numel()
+
+            _ensure_buffer_capacity(sample_numel, 1)
+
             latents_flat_buf[
                 current_flat_offset : current_flat_offset + sample_numel
             ] = flat_lat
@@ -747,7 +794,6 @@ def precompute_latents_to_ram(
             shapes_buf[sample_idx, 0] = h_lat
             shapes_buf[sample_idx, 1] = w_lat
 
-            _, prompt, tier, tag_weight, aes_tier = items[i]
             prompts_list.append(prompt)
             tiers_list.append(tier)
             tag_weights_list.append(tag_weight)
@@ -755,29 +801,81 @@ def precompute_latents_to_ram(
 
             current_flat_offset += sample_numel
             sample_idx += 1
+            if pbar:
+                pbar.update(1)
+    else:
+        # In-place VAE encoding branch for raw RGB images
+        bucket_buffers: dict[tuple[int, int], list] = defaultdict(list)
 
-        if pbar:
-            pbar.update(b_size)
-        items.clear()
+        def _flush_bucket(items: list) -> None:
+            nonlocal current_flat_offset, sample_idx
+            if not items:
+                return
 
-    for item in prefetch_loader:
-        if sample_idx >= max_samples:
-            break
+            b_size = len(items)
+            imgs = torch.stack([it[0] for it in items], dim=0)
+            imgs_gpu = imgs.to(device, non_blocking=True)
 
-        img_tensor, res_h, res_w, prompt, tier, tag_weight, aes_tier = item
-        res_key = (int(res_h), int(res_w))
-        bucket_buffers[res_key].append(
-            (img_tensor, prompt, tier, tag_weight, aes_tier)
-        )
+            with torch.autocast(
+                device_type="cuda", dtype=autocast_dtype, enabled=True
+            ):
+                enc = vae.encode(imgs_gpu)
+                dist = getattr(enc, "latent_dist", enc)
+                lats = dist.sample() if hasattr(dist, "sample") else dist
+                lats = (lats - vae_mean_t) / vae_std_t
 
-        if len(bucket_buffers[res_key]) >= batch_size:
-            _flush_bucket(bucket_buffers[res_key])
+            lats_cpu = lats.to(dtype=autocast_dtype, device="cpu")
+            _, _, h_lat, w_lat = lats_cpu.shape
+            sample_numel = in_channels * h_lat * w_lat
+            total_elements = b_size * sample_numel
 
-    # Flush all remaining partial buckets
-    for res_key, items in list(bucket_buffers.items()):
-        if items:
-            _flush_bucket(items)
+            _ensure_buffer_capacity(total_elements, b_size)
 
+            for i in range(b_size):
+                flat_lat = lats_cpu[i].flatten()
+                latents_flat_buf[
+                    current_flat_offset : current_flat_offset + sample_numel
+                ] = flat_lat
+                offsets_buf[sample_idx] = current_flat_offset
+                shapes_buf[sample_idx, 0] = h_lat
+                shapes_buf[sample_idx, 1] = w_lat
+
+                _, prompt, tier, tag_weight, aes_tier = items[i]
+                prompts_list.append(prompt)
+                tiers_list.append(tier)
+                tag_weights_list.append(tag_weight)
+                aes_tiers_list.append(aes_tier)
+
+                current_flat_offset += sample_numel
+                sample_idx += 1
+
+            if pbar:
+                pbar.update(b_size)
+            items.clear()
+
+        for item in prefetch_loader:
+            if sample_idx >= max_samples:
+                break
+            (
+                img_tensor,
+                res_h,
+                res_w,
+                prompt,
+                tier,
+                tag_weight,
+                aes_tier,
+            ) = item
+            res_key = (int(res_h), int(res_w))
+            bucket_buffers[res_key].append(
+                (img_tensor, prompt, tier, tag_weight, aes_tier)
+            )
+
+            if len(bucket_buffers[res_key]) >= batch_size:
+                _flush_bucket(bucket_buffers[res_key])
+
+        for res_key, items in list(bucket_buffers.items()):
+            if items:
+                _flush_bucket(items)
     if pbar:
         pbar.close()
 

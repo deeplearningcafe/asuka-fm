@@ -47,6 +47,11 @@ def create_dataloader(
         if rank == 0:
             logging.info(f"Using latents {is_latent}")
 
+        coord_system = "aspect_norm" if getattr(cfg.models, "use_calibrated_spatial", False) else "discrete"
+        if rank == 0:
+            logging.info(
+                f"Creating with {is_latent} latents and rope {coord_system}"
+            )
         dataset = StreamingImageDataset(
             dataset_name=cfg.data.streaming_dataset_name,
             dataset_path=cfg.data.get("dataset_path", None),
@@ -62,6 +67,7 @@ def create_dataloader(
             world_size=runtime_world_size,
             low_ram=getattr(cfg.data, "low_ram", False),
             is_latent=is_latent,
+            coord_system=coord_system,
         )
 
         tier_lengths = cfg.data.get(
@@ -69,15 +75,15 @@ def create_dataloader(
         )
 
         # In-RAM caching branch
-        if cfg.data.get("cache_latents_to_ram", False) and vae is not None:
+        if cfg.data.get("cache_latents_to_ram", False):
             vae_bs = cfg.models.get("vae_batch_size", 32)
             precompute_workers = cfg.data.get(
                 "precompute_num_workers",
-                cfg.train.get("num_workers", 8),
+                cfg.data.get("num_workers", 4),
             )
             precompute_prefetch = cfg.data.get(
                 "precompute_prefetch_factor",
-                cfg.train.get("prefetch_factor", 4),
+                cfg.data.get("prefetch_factor", 4),
             )
             ram_dataset = precompute_latents_to_ram(
                 dataset=dataset,

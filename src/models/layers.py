@@ -498,6 +498,21 @@ class TransformerTextAdapter(nn.Module):
         return x
 
 
+def compute_calibrated_spatial_freqs(
+    dim: int = 16,
+    min_freq: float = math.pi / 4.0,
+    max_freq: float = 2.0 * math.pi,
+) -> torch.Tensor:
+    """Computes full-spectrum continuous 2D RoPE spatial frequencies.
+
+    Ordered from highest frequency (k=0) to lowest frequency (k=D/2-1)
+    to eliminate axial phase collapse and prevent harmonic aliasing.
+    """
+    log_max = math.log(max_freq)
+    log_min = math.log(min_freq)
+    log_freqs = torch.linspace(log_max, log_min, dim // 2)
+    return log_freqs.exp()
+
 # based on https://github.com/zlab-princeton/i1/blob/main/torch_inference/generate.py
 def _default_rope_axes_dims(head_dim: int) -> tuple[int, int, int]:
     """Splits the head dimension into 3 chunks for Text, Y, and X coordinates."""
@@ -532,16 +547,26 @@ class MultimodalRopeEmbedder(nn.Module):
         max_text_len: int = 512,
         max_spatial_dim: int = 128,
         theta: float = 10000.0,
+        use_calibrated_spatial: bool = True,
     ) -> None:
         super().__init__()
-        axes_lens = (max_text_len, max_spatial_dim, max_spatial_dim)
-
-        for i, (dim, axis_len) in enumerate(zip(axes_dims, axes_lens)):
-            steps = torch.arange(0, dim, 2, dtype=torch.float32)
-            base = 1.0 / (theta ** (steps / dim))
-            self.register_buffer(f"inv_freq_{i}", base, persistent=False)
-
         self.num_axes = len(axes_dims)
+        self.use_calibrated_spatial = use_calibrated_spatial
+
+        # Axis 0: Text Sequence (Standard LLM Geometric RoPE)
+        dim_text = axes_dims[0]
+        steps_text = torch.arange(0, dim_text, 2, dtype=torch.float32)
+        base_text = 1.0 / (theta ** (steps_text / dim_text))
+        self.register_buffer("inv_freq_0", base_text, persistent=False)
+
+        # Axes 1 & 2: Y and X Spatial Axes
+        for i, dim in enumerate(axes_dims[1:], start=1):
+            if use_calibrated_spatial:
+                freqs = compute_calibrated_spatial_freqs(dim=dim)
+            else:
+                steps = torch.arange(0, dim, 2, dtype=torch.float32)
+                freqs = 1.0 / (theta ** (steps / dim))
+            self.register_buffer(f"inv_freq_{i}", freqs, persistent=False)
 
     def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculates rotary embeddings for integer or floating coordinates."""

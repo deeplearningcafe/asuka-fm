@@ -221,6 +221,13 @@ def load_trainable_model(
         use_rope = (
             getattr(model_cfg, "use_rope_text_adapter", False) if model_cfg else False
         )
+        use_calibrated_spatial = (
+            getattr(model_cfg, "use_calibrated_spatial", False) if model_cfg else False
+        )
+        if global_rank == 0:
+            logging.info(
+                f"Creating model with {hidden_size} hs, {depth} layers, and spatial rope {use_calibrated_spatial}"
+            )
         if model_type == "dual_stream":
             # TODO: channels dynamically from vae meta
             unet = DualStreamDiT(
@@ -257,7 +264,10 @@ def load_trainable_model(
             use_random_drop = (
                 getattr(model_cfg, "use_random_drop", True) if model_cfg else True
             )
-
+            if global_rank == 0:
+                logging.info(
+                    f"Sprint with {drop_ratio} drop ratio, {residual_type} residual type and {drop_target} target"
+                )
             unet = SprintDualStreamDiT(
                 in_channels=in_channels,
                 out_channels=in_channels,
@@ -276,6 +286,7 @@ def load_trainable_model(
                 use_rope_text_adapter=use_rope,
                 skip_checkpointing_layers=skip_checkpointing_layers,
                 use_random_drop=use_random_drop,
+                use_calibrated_spatial=use_calibrated_spatial,
             )
         else:
             unet = Unet.from_pretrained(

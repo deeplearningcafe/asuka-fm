@@ -6,7 +6,7 @@ import os
 import torch.nn as nn
 from functools import partial
 import gc
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Optional
 import omegaconf
 from diffusers import AutoencoderKL
 from src.models.unet import Unet, UnetConfig
@@ -425,6 +425,8 @@ def load_training_state(
     scheduler,
     device,
     global_rank,
+    reset_scheduler: bool = False,
+    reset_optimizer: bool = False,
 ):
     """Loads optimizer, scheduler, and training state (epoch/step)."""
     start_epoch = 0
@@ -463,28 +465,36 @@ def load_training_state(
                     f"epoch {start_epoch}, step {global_step}"
                 )
 
-    optimizer_path = os.path.join(checkpoint_path, "optimizer.pt")
-    if os.path.exists(optimizer_path):
-        optimizer.load_state_dict(
-            torch.load(optimizer_path, map_location=device)
-        )
-        if global_rank == 0:
-            logging.info("  -> Optimizer state loaded.")
-
-    scheduler_path = os.path.join(checkpoint_path, "scheduler.pt")
-    if scheduler and os.path.exists(scheduler_path):
-        try:
-            scheduler.load_state_dict(
-                torch.load(scheduler_path, map_location=device)
+    if not reset_optimizer:
+        optimizer_path = os.path.join(checkpoint_path, "optimizer.pt")
+        if os.path.exists(optimizer_path):
+            optimizer.load_state_dict(
+                torch.load(optimizer_path, map_location=device)
             )
             if global_rank == 0:
-                logging.info("  -> Scheduler state loaded.")
-        except Exception as e:
-            if global_rank == 0:
-                logging.warning(
-                    f"Could not load scheduler state: {e}. "
-                    f"Proceeding with initialized scheduler."
+                logging.info("  -> Optimizer state loaded.")
+    else:
+        if global_rank == 0:
+            logging.info("  -> Optimizer reset: starting fresh optimizer.")
+
+    if not reset_scheduler:
+        scheduler_path = os.path.join(checkpoint_path, "scheduler.pt")
+        if scheduler and os.path.exists(scheduler_path):
+            try:
+                scheduler.load_state_dict(
+                    torch.load(scheduler_path, map_location=device)
                 )
+                if global_rank == 0:
+                    logging.info("  -> Scheduler state loaded.")
+            except Exception as e:
+                if global_rank == 0:
+                    logging.warning(
+                        f"Could not load scheduler state: {e}. "
+                        f"Proceeding with initialized scheduler."
+                    )
+    else:
+        if global_rank == 0:
+            logging.info("  -> Scheduler reset: will build new scheduler.")
 
     torch.cuda.empty_cache()
     return optimizer, scheduler, start_epoch, global_step
@@ -718,36 +728,123 @@ def create_optim(unet, text_encoder, conf: omegaconf.DictConfig):
 
     return optim
 
-
-def create_scheduler(optim, train_loader, conf: omegaconf.DictConfig):
-    if not hasattr(train_loader, "__len__"):
+def create_scheduler(
+    optim,
+    train_loader,
+    conf: omegaconf.DictConfig,
+    total_steps_override: Optional[int] = None,
+):
+    """Creates a flexible LR scheduler supporting WSD, Cosine, and Constant."""
+    if total_steps_override is not None:
+        total_steps = max(1, total_steps_override)
+    elif not hasattr(train_loader, "__len__"):
         total_steps = conf.train.epochs * 10000
     else:
-        update_steps_epoch = len(train_loader) // conf.train.gradient_accumulation_steps
+        grad_accum = conf.train.gradient_accumulation_steps
+        update_steps_epoch = len(train_loader) // grad_accum
         total_steps = conf.train.epochs * update_steps_epoch
 
-    warmup_steps = int(conf.train.warmup * total_steps)
-    warmup_steps = min(warmup_steps, total_steps - 1) if total_steps > 0 else 0
-
-    scheduler_warmup = torch.optim.lr_scheduler.LinearLR(
-        optim, start_factor=0.001, end_factor=1.0, total_iters=max(1, warmup_steps)
+    warmup_ratio = conf.train.get("warmup", 0.04)
+    warmup_steps = int(warmup_ratio * total_steps)
+    warmup_steps = (
+        min(warmup_steps, total_steps - 1) if total_steps > 1 else 0
     )
 
-    if conf.train.get("use_cos_scheduler", False):
-        logging.info("Using cosine lr scheduler")
-        cosine_steps = max(1, total_steps - warmup_steps)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optim, T_max=cosine_steps, eta_min=conf.train.lr * 0.1
+    decay_ratio = conf.train.get("decay_ratio", 0.0)
+    decay_steps = int(decay_ratio * total_steps)
+    decay_steps = min(decay_steps, total_steps - warmup_steps)
+
+    stable_steps = max(0, total_steps - warmup_steps - decay_steps)
+
+    # Resolve schedule type with backward compatibility
+    sched_type = conf.train.get("scheduler_type", None)
+    if sched_type is None:
+        if conf.train.get("use_cos_scheduler", False):
+            sched_type = "cosine"
+        elif decay_ratio > 0.0:
+            sched_type = "wsd"
+        else:
+            sched_type = "constant"
+
+    min_lr_ratio = conf.train.get("min_lr_ratio", 0.05)
+    decay_type = conf.train.get("decay_type", "cosine")
+    base_lr = conf.train.lr
+
+    schedulers = []
+    milestones = []
+    current_step = 0
+
+    # 1. Warmup stage
+    if warmup_steps > 0:
+        s_warmup = torch.optim.lr_scheduler.LinearLR(
+            optim,
+            start_factor=0.001,
+            end_factor=1.0,
+            total_iters=warmup_steps,
         )
+        schedulers.append(s_warmup)
+        current_step += warmup_steps
+        milestones.append(current_step)
+
+    # 2. Main schedule branches
+    if sched_type == "cosine":
+        logging.info("Using Warmup-Cosine lr scheduler")
+        cosine_steps = max(1, total_steps - warmup_steps)
+        s_cos = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optim,
+            T_max=cosine_steps,
+            eta_min=base_lr * min_lr_ratio,
+        )
+        schedulers.append(s_cos)
+
+    elif sched_type == "wsd":
+        logging.info(
+            f"Using WSD scheduler (Warmup: {warmup_steps}, "
+            f"Stable: {stable_steps}, Decay: {decay_steps})"
+        )
+        if stable_steps > 0:
+            s_stable = torch.optim.lr_scheduler.ConstantLR(
+                optim,
+                factor=1.0,
+                total_iters=stable_steps,
+            )
+            schedulers.append(s_stable)
+            current_step += stable_steps
+            if decay_steps > 0:
+                milestones.append(current_step)
+
+        if decay_steps > 0:
+            if decay_type == "cosine":
+                s_decay = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optim,
+                    T_max=decay_steps,
+                    eta_min=base_lr * min_lr_ratio,
+                )
+            else:
+                s_decay = torch.optim.lr_scheduler.LinearLR(
+                    optim,
+                    start_factor=1.0,
+                    end_factor=min_lr_ratio,
+                    total_iters=decay_steps,
+                )
+            schedulers.append(s_decay)
+
     else:
         logging.info("Using constant lr scheduler")
-        constant_steps = max(1, total_steps - warmup_steps)
-        scheduler = torch.optim.lr_scheduler.ConstantLR(
-            optim, factor=1.0, total_iters=constant_steps
+        const_steps = max(1, total_steps - warmup_steps)
+        s_const = torch.optim.lr_scheduler.ConstantLR(
+            optim,
+            factor=1.0,
+            total_iters=const_steps,
         )
+        schedulers.append(s_const)
 
-    if warmup_steps > 0:
-        return torch.optim.lr_scheduler.SequentialLR(
-            optim, [scheduler_warmup, scheduler], milestones=[warmup_steps]
-        )
-    return scheduler
+    if len(schedulers) == 1:
+        return schedulers[0]
+
+    valid_milestones = milestones[: len(schedulers) - 1]
+    return torch.optim.lr_scheduler.SequentialLR(
+        optim,
+        schedulers,
+        milestones=valid_milestones,
+    )

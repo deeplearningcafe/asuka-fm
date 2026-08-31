@@ -108,19 +108,47 @@ class Trainer:
         ):
             self.grad_offloader = CPUGradientAccumulator(self.unet)
 
+        reset_scheduler = cfg.train.get("reset_scheduler", False)
+        reset_optimizer = cfg.train.get("reset_optimizer", False)
+
         # TODO: how compute total steps with streaming datasets? use compute like nanomagi
-        self.lr_scheduler = create_scheduler(self.optimizer, self.dataloader, cfg)
+        initial_scheduler = (
+            None
+            if reset_scheduler
+            else create_scheduler(self.optimizer, self.dataloader, cfg)
+        )
 
         # Resume Training State (Epoch, Step, Optim State)
         self.optimizer, self.lr_scheduler, self.start_epoch, self.global_step = (
             load_training_state(
                 cfg.models.resume_from_checkpoint,
                 self.optimizer,
-                self.lr_scheduler,
+                initial_scheduler,
                 self.device,
                 self.global_rank,
+                reset_scheduler=reset_scheduler,
+                reset_optimizer=reset_optimizer,
             )
         )
+
+        # Build fresh scheduler calibrated to remaining steps if reset
+        if reset_scheduler or self.lr_scheduler is None:
+            remaining_steps = None
+            if hasattr(self.dataloader, "__len__"):
+                grad_accum = self.cfg.train.gradient_accumulation_steps
+                steps_per_epoch = len(self.dataloader) // grad_accum
+                rem_epochs = max(
+                    1, self.cfg.train.epochs - self.start_epoch
+                )
+                remaining_steps = rem_epochs * steps_per_epoch
+
+            self.lr_scheduler = create_scheduler(
+                self.optimizer,
+                self.dataloader,
+                cfg,
+                total_steps_override=remaining_steps,
+            )
+            torch.cuda.empty_cache()
 
         if self.ema is not None and self.ema.use_ema:
             self.ema.step = self.global_step

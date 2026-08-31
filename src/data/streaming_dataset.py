@@ -537,6 +537,7 @@ class RAMCachedDataset(torch.utils.data.Dataset):
         cfg_dropout_prob: float = 0.0,
         tag_dropout_prob: float = 0.0,
         shuffle_tags: bool = True,
+        coord_system: str = "aspect_norm",
     ):
         self.latents_flat = latents_flat
         self.offsets = offsets
@@ -555,6 +556,7 @@ class RAMCachedDataset(torch.utils.data.Dataset):
         self.cfg_dropout_prob = cfg_dropout_prob
         self.tag_dropout_prob = tag_dropout_prob
         self.shuffle_tags = shuffle_tags
+        self.coord_system = coord_system
         self.num_samples = offsets.shape[0]
 
     def __len__(self) -> int:
@@ -590,6 +592,7 @@ class RAMCachedDataset(torch.utils.data.Dataset):
             crop_x=crop_x_lat * self.vae_downsample_factor,
             crop_size=self.resolution,
             patch_size=self.latent_patch,
+            coord_system=self.coord_system,
         )
 
         # Dynamic text tokenization on-the-fly

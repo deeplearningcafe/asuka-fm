@@ -468,11 +468,30 @@ def load_training_state(
     if not reset_optimizer:
         optimizer_path = os.path.join(checkpoint_path, "optimizer.pt")
         if os.path.exists(optimizer_path):
+            # Capture target LR and weight decay configured from cfg
+            target_lrs = [g["lr"] for g in optimizer.param_groups]
+            target_wds = [
+                g.get("weight_decay", 0.0)
+                for g in optimizer.param_groups
+            ]
+
             optimizer.load_state_dict(
                 torch.load(optimizer_path, map_location=device)
             )
+
+            # Override param_groups with new config values while keeping states
+            if len(optimizer.param_groups) == len(target_lrs):
+                for group, new_lr, new_wd in zip(
+                    optimizer.param_groups, target_lrs, target_wds
+                ):
+                    group["lr"] = new_lr
+                    group["initial_lr"] = new_lr
+                    group["weight_decay"] = new_wd
             if global_rank == 0:
-                logging.info("  -> Optimizer state loaded.")
+                logging.info(
+                    f"  -> Optimizer state loaded (re-applied target lr: "
+                    f"{target_lrs[0]:.2e})"
+                )
     else:
         if global_rank == 0:
             logging.info("  -> Optimizer reset: starting fresh optimizer.")
@@ -735,6 +754,10 @@ def create_scheduler(
     total_steps_override: Optional[int] = None,
 ):
     """Creates a flexible LR scheduler supporting WSD, Cosine, and Constant."""
+    # TODO: is this redundant?
+    for group in optim.param_groups:
+        group["initial_lr"] = group["lr"]
+
     if total_steps_override is not None:
         total_steps = max(1, total_steps_override)
     elif not hasattr(train_loader, "__len__"):

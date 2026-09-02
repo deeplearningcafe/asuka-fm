@@ -11,8 +11,11 @@ import argparse
 import math
 import os
 import sys
+import time
 from pathlib import Path
 import random
+import logging
+from collections import deque
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,18 +23,17 @@ from omegaconf import OmegaConf
 import torch
 import torchvision.utils as vutils
 from tqdm import tqdm
-import logging
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.loader import create_dataloader
+from src.data.streaming_dataset import StreamingImageDataset
 from src.models.text_encoders.tokenizer import HFLLMTokenizer
 from src.utils.logging_utils import Logger
 
-
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Verify and visualize dataset, cropping, and padding."
+        description="Verify, profile, and debug dataset and dataloader."
     )
     parser.add_argument(
         "--config",
@@ -43,7 +45,7 @@ def parse_args():
         "--num_batches",
         type=int,
         default=10,
-        help="Number of batches to iterate through and inspect",
+        help="Number of batches to inspect in visual mode",
     )
     parser.add_argument(
         "--output_dir",
@@ -54,13 +56,13 @@ def parse_args():
     parser.add_argument(
         "--compute_vae_stats",
         action="store_true",
-        help="Compute empirical mean (shift) and std (scale) for VAE",
+        help="Compute empirical mean and std for VAE latents",
     )
     parser.add_argument(
         "--num_stat_samples",
         type=int,
         default=80000,
-        help="Max samples to scan for empirical VAE stats (default: 80k)",
+        help="Max samples to scan for empirical VAE stats",
     )
     parser.add_argument(
         "--stat_chunk_size",
@@ -68,8 +70,29 @@ def parse_args():
         default=64,
         help="Chunk size for batching VAE encode during stat calculation",
     )
+    parser.add_argument(
+        "--profile_full_epoch",
+        action="store_true",
+        help="Profile DataLoader over an entire epoch to track stall cycles",
+    )
+    parser.add_argument(
+        "--stall_threshold",
+        type=float,
+        default=1.5,
+        help="Latency threshold in seconds to flag a batch delivery stall",
+    )
+    parser.add_argument(
+        "--benchmark_raw_stream",
+        action="store_true",
+        help="Directly benchmark raw HF stream I/O without DataLoader workers",
+    )
+    parser.add_argument(
+        "--max_stream_samples",
+        type=int,
+        default=10000,
+        help="Maximum raw stream samples to benchmark",
+    )
     return parser.parse_args()
-
 
 def compute_empirical_vae_stats(
     cfg,
@@ -304,6 +327,177 @@ def plot_token_padding(masks: torch.Tensor, tokens: torch.Tensor, save_path: Pat
     logging.info(f"Saved padding visualization to: {save_path}")
 
 
+
+def benchmark_raw_stream(cfg, max_samples: int = 10000):
+    """
+    Measures isolated raw Hugging Face streaming speed and network throughput.
+    Helps separate network bandwidth bottlenecks from DataLoader multi-worker
+    contention.
+    """
+    logging.info("=" * 78)
+    logging.info("BENCHMARKING RAW HUGGINGFACE STREAM (ISOLATED I/O)")
+    logging.info("=" * 78)
+
+    dataset = StreamingImageDataset(
+        dataset_name=cfg.data.streaming_dataset_name,
+        dataset_path=cfg.data.get("dataset_path", None),
+        resolution=cfg.data.get("resolution", 512),
+        low_ram=getattr(cfg.data, "low_ram", False),
+        is_latent=cfg.data.get("is_latent", False),
+    )
+
+    t_start = time.perf_counter()
+    sample_count = 0
+    total_bytes = 0
+    latencies = []
+    last_time = t_start
+
+    pbar = tqdm(
+        total=max_samples,
+        desc="Raw Stream Fetching",
+        dynamic_ncols=True,
+    )
+
+    for sample in dataset.iter_raw():
+        curr_time = time.perf_counter()
+        delta = curr_time - last_time
+        latencies.append(delta)
+        last_time = curr_time
+
+        sample_count += 1
+        raw_latent = sample.get("latent")
+        raw_img = sample.get("image") or sample.get("bytes")
+        if isinstance(raw_latent, bytes):
+            total_bytes += len(raw_latent)
+        elif isinstance(raw_img, bytes):
+            total_bytes += len(raw_img)
+
+        pbar.update(1)
+        if sample_count >= max_samples:
+            break
+
+    pbar.close()
+    total_elapsed = time.perf_counter() - t_start
+
+    avg_sps = sample_count / max(total_elapsed, 1e-6)
+    mb_transferred = total_bytes / (1024 * 1024)
+    mb_rate = mb_transferred / max(total_elapsed, 1e-6)
+
+    logging.info("-" * 78)
+    logging.info(f"Samples Processed   : {sample_count}")
+    logging.info(f"Total Time Elapsed  : {total_elapsed:.2f} s")
+    logging.info(f"Throughput          : {avg_sps:.2f} samples/sec")
+    logging.info(f"Payload Transferred : {mb_transferred:.2f} MB")
+    logging.info(f"Bandwidth           : {mb_rate:.2f} MB/sec")
+    if latencies:
+        p50 = np.percentile(latencies, 50) * 1000.0
+        p95 = np.percentile(latencies, 95) * 1000.0
+        p99 = np.percentile(latencies, 99) * 1000.0
+        logging.info(
+            f"Latency per sample  : P50={p50:.2f}ms | P95={p95:.2f}ms | "
+            f"P99={p99:.2f}ms"
+        )
+    logging.info("=" * 78)
+
+
+def run_dataloader_diagnostics(dataloader, stall_threshold: float = 1.5):
+    """
+    Monitors DataLoader execution across batches, detecting stalls and
+    measuring throughput stability to pinpoint buffer exhaustion.
+    """
+    logging.info("=" * 78)
+    logging.info("DATALOADER STALL & THROUGHPUT PROFILER")
+    logging.info(f"Stall Latency Threshold: {stall_threshold:.2f} seconds")
+    logging.info("=" * 78)
+
+    batch_latencies = []
+    stall_events = []
+    batches_since_stall = 0
+    total_samples = 0
+    start_time = time.perf_counter()
+    prev_time = start_time
+
+    pbar = tqdm(
+        dataloader,
+        desc="Profiling DataLoader",
+        dynamic_ncols=True,
+    )
+
+    for step, batch in enumerate(pbar):
+        curr_time = time.perf_counter()
+        delta = curr_time - prev_time
+        batch_latencies.append(delta)
+
+        bsz = batch[0].shape[0] if isinstance(batch, (list, tuple)) else 1
+        total_samples += bsz
+        batches_since_stall += 1
+
+        if delta >= stall_threshold:
+            stall_events.append(
+                {
+                    "step": step,
+                    "pause_time": delta,
+                    "batches_since_last": batches_since_stall,
+                    "samples_since_last": batches_since_stall * bsz,
+                }
+            )
+            logging.warning(
+                f"[STALL DETECTED] Step {step:05d} | "
+                f"Pause: {delta:.2f}s | "
+                f"Interval: {batches_since_stall} batches "
+                f"(~{batches_since_stall * bsz} samples)"
+            )
+            batches_since_stall = 0
+
+        prev_time = curr_time
+        inst_rate = 1.0 / max(delta, 1e-6)
+        pbar.set_postfix({"it/s": f"{inst_rate:.2f}", "last_dt": f"{delta:.2f}s"})
+
+    pbar.close()
+    total_time = time.perf_counter() - start_time
+    total_batches = len(batch_latencies)
+
+    if total_batches == 0:
+        logging.error("No batches were yielded by the DataLoader.")
+        return
+
+    latencies_np = np.array(batch_latencies)
+    avg_it_s = total_batches / max(total_time, 1e-6)
+    avg_sps = total_samples / max(total_time, 1e-6)
+
+    logging.info("\n" + "=" * 78)
+    logging.info("PROFILING SUMMARY & DIAGNOSTIC REPORT")
+    logging.info("=" * 78)
+    logging.info(f"Total Batches Yielded : {total_batches}")
+    logging.info(f"Total Samples Yielded : {total_samples}")
+    logging.info(f"Total Time Elapsed    : {total_time:.2f} s")
+    logging.info(f"Mean Throughput       : {avg_it_s:.2f} it/s ({avg_sps:.2f} samples/s)")
+    logging.info(
+        f"Batch Latencies       : Min={latencies_np.min():.4f}s | "
+        f"Mean={latencies_np.mean():.4f}s | "
+        f"P50={np.percentile(latencies_np, 50):.4f}s | "
+        f"P95={np.percentile(latencies_np, 95):.4f}s | "
+        f"Max={latencies_np.max():.4f}s"
+    )
+    logging.info(f"Total Stalls Detected : {len(stall_events)}")
+
+    if stall_events:
+        intervals = [e["batches_since_last"] for e in stall_events[1:]]
+        pauses = [e["pause_time"] for e in stall_events]
+        logging.info(
+            f"Mean Stall Duration   : {np.mean(pauses):.2f}s "
+            f"(Max: {np.max(pauses):.2f}s)"
+        )
+        if intervals:
+            logging.info(
+                f"Mean Batches/Stall    : {np.mean(intervals):.1f} batches "
+                f"(~{np.mean(intervals) * (total_samples / total_batches):.0f} samples)"
+            )
+            logging.info("Diagnosed Root Cause  : Multi-worker buffer exhaustion cycle.")
+    else:
+        logging.info("Diagnosis             : Pipeline is streaming continuously.")
+    logging.info("=" * 78 + "\n")
+
 def main():
     args = parse_args()
 
@@ -324,6 +518,13 @@ def main():
     random.seed(current_seed)
     np.random.seed(current_seed)
 
+    if args.benchmark_raw_stream:
+        benchmark_raw_stream(
+            cfg=cfg,
+            max_samples=args.max_stream_samples,
+        )
+        return
+
     logging.info("=" * 78)
     logging.info("ASUKA-FM: Dataset & DataLoader Debug Inspection")
     logging.info("=" * 78)
@@ -333,7 +534,11 @@ def main():
     tokenizer = HFLLMTokenizer(cfg.models.hf_text_encoder)
 
     dataloader = create_dataloader(cfg, rank=0, tokenizer=tokenizer)
-    logging.info(f"Total Batches:  {len(dataloader)}")
+    try:
+        total_batches = len(dataloader)
+        logging.info(f"Total Batches:  {total_batches}")
+    except TypeError:
+        logging.info("Total Batches:  Dynamic (Streaming Iterable)")
     logging.info("-" * 78)
 
     if args.compute_vae_stats:
@@ -342,6 +547,13 @@ def main():
             dataloader=dataloader,
             num_samples=args.num_stat_samples,
             chunk_size=args.stat_chunk_size,
+        )
+        return
+
+    if args.profile_full_epoch:
+        run_dataloader_diagnostics(
+            dataloader=dataloader,
+            stall_threshold=args.stall_threshold,
         )
         return
 
@@ -362,7 +574,10 @@ def main():
                 f"dtype={images.dtype} | "
                 f"range=[{images.min():.2f}, {images.max():.2f}]"
             )
-            logging.info(f"  Tokens:      {tuple(tokens.shape)} | dtype={tokens.dtype}")
+            logging.info(
+                f"  Tokens:      {tuple(tokens.shape)} | "
+                f"dtype={tokens.dtype}"
+            )
             logging.info(
                 f"  Mask:        {tuple(mask.shape)} | "
                 f"Active={mask.sum().item()}/{mask.numel()}"
@@ -378,7 +593,6 @@ def main():
             if aes_tier is not None:
                 logging.info(f"  Aes Tiers:   {tuple(aes_tier.shape)}")
 
-            # Validate sequence length alignment within the batch
             if tokens.shape[1] != mask.shape[1]:
                 raise ValueError(
                     f"Mismatch between token len ({tokens.shape[1]}) "
@@ -390,9 +604,13 @@ def main():
         else:
             latents, cond, tag_weights, mask = batch[:4]
             logging.info(
-                f"  Latents:     {tuple(latents.shape)} | dtype={latents.dtype}"
+                f"  Latents:     {tuple(latents.shape)} | "
+                f"dtype={latents.dtype}"
             )
-            logging.info(f"  Cond:        {tuple(cond.shape)} | dtype={cond.dtype}")
+            logging.info(
+                f"  Cond:        {tuple(cond.shape)} | "
+                f"dtype={cond.dtype}"
+            )
             logging.info(f"  Tag Weights: {tuple(tag_weights.shape)}")
             if mask is not None:
                 logging.info(f"  Mask:        {tuple(mask.shape)}")
@@ -412,7 +630,6 @@ def main():
         logging.info("Raw image batch not found; visual inspection skipped.")
 
     logging.info("=" * 78)
-
 
 if __name__ == "__main__":
     main()

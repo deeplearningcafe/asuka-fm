@@ -20,9 +20,20 @@ from src.data.streaming_dataset import (
 )
 
 def worker_init_fn(worker_id: int) -> None:
-    """Isolates HTTP clients and resets connection pools per worker."""
+    """
+    Limits intra-op OpenMP threads per worker to prevent CPU thrashing
+    on shared machines and resets HTTP connection pools.
+    """
+    # Prevent each worker from spawning multiple CPU threads
+    torch.set_num_threads(1)
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+
     try:
-        _http.reset_sessions()
+        if hasattr(_http, "reset_sessions"):
+            _http.reset_sessions()
+        elif hasattr(_http, "close_session"):
+            _http.close_session()
     except (ImportError, AttributeError):
         pass
 

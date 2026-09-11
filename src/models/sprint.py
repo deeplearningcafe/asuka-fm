@@ -10,6 +10,7 @@ from src.models.dual_stream import (
     DualStreamDiTBlock,
     MultimodalRopeEmbedder,
     _default_rope_axes_dims,
+    LocalDecoder,
 )
 
 
@@ -147,6 +148,7 @@ class SprintDualStreamDiT(DualStreamDiT):
         skip_checkpointing_layers: int = 0,
         use_random_drop: bool = False,
         use_calibrated_spatial: bool = True,
+        use_pixel_decoder: bool = False,
     ):
         # Prevent base constructor block initialization
         nn.Module.__init__(self)
@@ -167,6 +169,7 @@ class SprintDualStreamDiT(DualStreamDiT):
         self.skip_checkpointing_layers = skip_checkpointing_layers
         self.use_random_drop = use_random_drop
         self.use_calibrated_spatial = use_calibrated_spatial
+        self.use_pixel_decoder = use_pixel_decoder
 
         def should_checkpoint(layer_idx: int) -> bool:
             return self.use_checkpointing and (
@@ -258,7 +261,19 @@ class SprintDualStreamDiT(DualStreamDiT):
         current_layer_idx += self.decoder_depth
 
         self.norm_final = nn.RMSNorm(hidden_size, eps=eps)
-        self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
+        if self.use_pixel_decoder:
+            self.pixel_decoder = LocalDecoder(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                cond_hidden_size=hidden_size,
+            )
+            self.proj_out = None
+        else:
+            self.pixel_decoder = None
+            self.proj_out = nn.Linear(
+                hidden_size, patch_size * patch_size * out_channels
+            )
+            self._zero_initialize_output()
 
         # torch compile squeezes during bw so remove dims
         self.mask_token_image = nn.Parameter(torch.zeros(self.hidden_size))
@@ -297,8 +312,6 @@ class SprintDualStreamDiT(DualStreamDiT):
 
         torch.nn.init.normal_(self.mask_token_image, std=0.02)
         torch.nn.init.normal_(self.mask_token_text, std=0.02)
-
-        self._zero_initialize_output()
 
     def _drop_tokens(self, tokens, freqs, h_patches=None, w_patches=None):
         if not self.use_random_drop and h_patches is not None and w_patches is not None:
@@ -511,9 +524,4 @@ class SprintDualStreamDiT(DualStreamDiT):
         # last text tokens dualdit is useless, only K and V are used,
         # proj_text, and mlp_text are not used
         # so last layers could use single stream like flux
-        tokens = self.proj_out(self.norm_final(image_tokens))
-
-        tokens = tokens.reshape(bsz, h_patches, w_patches, p, p, self.out_channels)
-        tokens = tokens.permute(0, 5, 1, 3, 2, 4).reshape(bsz, self.out_channels, H, W)
-
-        return tokens
+        return self._decode_output(image_tokens, x, bsz, h_patches, w_patches, p, H, W)

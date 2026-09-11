@@ -359,6 +359,7 @@ def generate_samples(
     vae_std: float = 0.18215,
     in_channels: int = 4,
     coord_system: str = "aspect_norm",
+    pixel_sampling: bool = False,
 ) -> List[Image.Image]:
     """
     Main entry point for generating samples during training.
@@ -368,8 +369,9 @@ def generate_samples(
 
     unet.eval()
     text_encoder.eval()
-    vae.eval()
-    vae.to(device)
+    if not pixel_sampling:
+        vae.eval()
+        vae.to(device)
     torch.cuda.empty_cache()
 
     all_images = {}
@@ -407,8 +409,10 @@ def generate_samples(
                 for c in batch_configs:
                     seed = c.get("seed", 42)
                     gen = torch.Generator(device=device).manual_seed(seed)
+                    spatial_h = H if pixel_sampling else H // 8
+                    spatial_w = W if pixel_sampling else W // 8
                     lat = torch.randn(
-                        (1, in_channels, H // 8, W // 8),
+                        (1, in_channels, spatial_h, spatial_w),
                         device=device,
                         generator=gen,
                         dtype=dtype,
@@ -442,9 +446,7 @@ def generate_samples(
 
                 tokens = torch.stack(tokens_list).to(device)
                 attention_mask = torch.stack(mask_list).to(device)
-                embeddings, attention_mask = text_encoder(
-                    tokens, mask=attention_mask
-                )
+                embeddings, attention_mask = text_encoder(tokens, mask=attention_mask)
 
                 # 5. Build per-sample RoPE Continuous 2D Position Map
                 patch_size = getattr(unet, "patch_size", None)
@@ -463,15 +465,13 @@ def generate_samples(
                         zoom = c.get("zoom", 1.0)
                         x_shift = c.get("x_shift", 0.0)
                         y_shift = c.get("y_shift", 0.0)
-                        has_camera = (
-                            zoom != 1.0 or x_shift != 0.0 or y_shift != 0.0
-                        )
+                        has_camera = zoom != 1.0 or x_shift != 0.0 or y_shift != 0.0
                         if patch_size is not None or has_camera:
                             single_pos = compute_inference_pos_map(
                                 height=H,
                                 width=W,
                                 patch_size=p_size,
-                                vae_scale=8,
+                                vae_scale=1 if pixel_sampling else 8,
                                 zoom=zoom,
                                 x_shift=x_shift,
                                 y_shift=y_shift,
@@ -481,9 +481,7 @@ def generate_samples(
                             )
                             pos_maps.append(single_pos.unsqueeze(0))
 
-                pos_map = (
-                    torch.cat(pos_maps, dim=0) if len(pos_maps) > 0 else None
-                )
+                pos_map = torch.cat(pos_maps, dim=0) if len(pos_maps) > 0 else None
 
                 model_wrapper = CFGModelWrapper(
                     unet=unet,
@@ -500,31 +498,37 @@ def generate_samples(
                 # 6. Trajectory integration (DDPM or Flow Matching Euler ODE)
                 if diffusion_type == "ddpm":
                     if schedule is None:
-                        raise ValueError(
-                            "Schedule must be provided for DDPM sampling"
-                        )
-                    latents = sample_ddpm(
-                        model_wrapper, schedule, latents, steps
-                    )
+                        raise ValueError("Schedule must be provided for DDPM sampling")
+                    latents = sample_ddpm(model_wrapper, schedule, latents, steps)
                 else:
                     latents = sample_euler(
                         model_wrapper, latents, num_steps=steps, shift=shift
                     )
 
                 # 7. VAE Decode into original index locations
-                vae_dtype = next(vae.parameters()).dtype
-                for j, latent in enumerate(latents):
-                    orig_idx = batch_indices[j]
-                    raw_lat = (
-                        latent.unsqueeze(0).to(torch.float32) * vae_std
-                    ) + vae_mean
-                    torch._dynamo.maybe_mark_dynamic(raw_lat, 2)
-                    torch._dynamo.maybe_mark_dynamic(raw_lat, 3)
-                    image = vae.decode(raw_lat.to(vae_dtype)).sample
-                    image = (image.to(torch.float32) / 2.0 + 0.5).clamp(0, 1)
-                    image = image.cpu().permute(0, 2, 3, 1).numpy()[0]
-                    image = (image * 255).round().astype("uint8")
-                    all_images[orig_idx] = Image.fromarray(image)
+                # Decode into PIL images
+                if pixel_sampling:
+                    for j, img_t in enumerate(latents):
+                        orig_idx = batch_indices[j]
+                        # Map [-1, 1] normalized RGB back to uint8
+                        img = (img_t.to(torch.float32) / 2.0 + 0.5).clamp(0, 1)
+                        img = img.cpu().permute(1, 2, 0).numpy()
+                        img = (img * 255).round().astype("uint8")
+                        all_images[orig_idx] = Image.fromarray(img)
+                else:
+                    vae_dtype = next(vae.parameters()).dtype
+                    for j, latent in enumerate(latents):
+                        orig_idx = batch_indices[j]
+                        raw_lat = (
+                            latent.unsqueeze(0).to(torch.float32) * vae_std
+                        ) + vae_mean
+                        torch._dynamo.maybe_mark_dynamic(raw_lat, 2)
+                        torch._dynamo.maybe_mark_dynamic(raw_lat, 3)
+                        image = vae.decode(raw_lat.to(vae_dtype)).sample
+                        image = (image.to(torch.float32) / 2.0 + 0.5).clamp(0, 1)
+                        image = image.cpu().permute(0, 2, 3, 1).numpy()[0]
+                        image = (image * 255).round().astype("uint8")
+                        all_images[orig_idx] = Image.fromarray(image)
     # vae.to("cpu")
 
     return [all_images[k] for k in range(total_samples)]

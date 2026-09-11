@@ -227,6 +227,124 @@ class DualStreamDiTBlock(nn.Module):
         return image_tokens, text_tokens
 
 
+# from https://github.com/NJU-PCALab/DiP/blob/main/src/models/transformer/dip.py#L212
+class LocalDecoder(nn.Module):
+    """
+    Lightweight 4-stage convolutional U-Net patch detailer head (DiP).
+    Restores high-frequency textures per patch conditioned on backbone tokens.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        cond_hidden_size: int = 768,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # Encoder: 16x16 -> 8x8 -> 4x4 -> 2x2 -> 1x1
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.pool1 = nn.MaxPool2d(2, stride=2)
+
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.pool2 = nn.MaxPool2d(2, stride=2)
+
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.pool3 = nn.MaxPool2d(2, stride=2)
+
+        self.enc4 = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.pool4 = nn.MaxPool2d(2, stride=2)
+
+        # Bottleneck: Injects global token feature vector s_i
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(512 + cond_hidden_size, 512, kernel_size=1),
+            nn.SiLU(),
+        )
+
+        # Decoder: 1x1 -> 2x2 -> 4x4 -> 8x8 -> 16x16
+        self.up4 = nn.ConvTranspose2d(512, 512, kernel_size=2, stride=2)
+        self.dec4 = nn.Sequential(
+            nn.Conv2d(512 + 512, 256, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+
+        self.up3 = nn.ConvTranspose2d(256, 256, kernel_size=2, stride=2)
+        self.dec3 = nn.Sequential(
+            nn.Conv2d(256 + 256, 128, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+
+        self.up2 = nn.ConvTranspose2d(128, 128, kernel_size=2, stride=2)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(128 + 128, 64, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+
+        self.up1 = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(64 + 64, 64, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+
+        self.out_conv = nn.Conv2d(64, out_channels, kernel_size=1)
+        self._initialize_weights()
+
+    def _initialize_weights(self) -> None:
+        """Zero-initialize the final conv to start with zero velocity output."""
+        nn.init.zeros_(self.out_conv.weight)
+        if self.out_conv.bias is not None:
+            nn.init.zeros_(self.out_conv.bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Raw noisy pixel patch tensor of shape [B * N, C, 16, 16].
+            c: DiT conditioning token tensor of shape [B * N, D, 1, 1].
+        """
+        enc1_out = self.enc1(x)
+        p1 = self.pool1(enc1_out)
+
+        enc2_out = self.enc2(p1)
+        p2 = self.pool2(enc2_out)
+
+        enc3_out = self.enc3(p2)
+        p3 = self.pool3(enc3_out)
+
+        enc4_out = self.enc4(p3)
+        p4 = self.pool4(enc4_out)
+
+        bottleneck_in = torch.cat([p4, c], dim=1)
+        b_out = self.bottleneck(bottleneck_in)
+
+        d4 = self.up4(b_out)
+        d4 = self.dec4(torch.cat([d4, enc4_out], dim=1))
+
+        d3 = self.up3(d4)
+        d3 = self.dec3(torch.cat([d3, enc3_out], dim=1))
+
+        d2 = self.up2(d3)
+        d2 = self.dec2(torch.cat([d2, enc2_out], dim=1))
+
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, enc1_out], dim=1))
+
+        return self.out_conv(d1)
+
+
 class DualStreamDiT(nn.Module):
     """
     Lightweight Dual-Stream DiT based on the i1 paper.
@@ -249,6 +367,7 @@ class DualStreamDiT(nn.Module):
         norm_type: str = "layer_norm",
         activation_func: str = "geglu",
         skip_checkpointing_layers: int = 0,
+        use_pixel_decoder: bool = False,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -259,6 +378,7 @@ class DualStreamDiT(nn.Module):
         self.skip_checkpointing_layers = skip_checkpointing_layers
         # in the original i1 paper the don't use it
         self.use_rope_text_adapter = use_rope_text_adapter
+        self.use_pixel_decoder = use_pixel_decoder
 
         def should_checkpoint(layer_idx: int) -> bool:
             return self.use_checkpointing and (
@@ -342,7 +462,20 @@ class DualStreamDiT(nn.Module):
         current_layer_idx += num_in_blocks
 
         self.norm_final = nn.RMSNorm(hidden_size, eps=eps)
-        self.proj_out = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
+
+        if self.use_pixel_decoder:
+            self.pixel_decoder = LocalDecoder(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                cond_hidden_size=hidden_size,
+            )
+            self.proj_out = None
+        else:
+            self.pixel_decoder = None
+            self.proj_out = nn.Linear(
+                hidden_size, patch_size * patch_size * out_channels
+            )
+            self._zero_initialize_output()
 
         # Freeze dead text path in the final decoder block (output is discarded)
         if len(self.out_blocks) > 0:
@@ -352,12 +485,11 @@ class DualStreamDiT(nn.Module):
             for p in last_block.mlp_text.parameters():
                 p.requires_grad = False
 
-        self._zero_initialize_output()
-
     def _zero_initialize_output(self):
         """Crucial for diffusion/flow matching: start by predicting zero velocity/noise."""
-        nn.init.zeros_(self.proj_out.weight)
-        nn.init.zeros_(self.proj_out.bias)
+        if self.proj_out is not None:
+            nn.init.zeros_(self.proj_out.weight)
+            nn.init.zeros_(self.proj_out.bias)
 
     def _build_position_ids(
         self,
@@ -410,6 +542,45 @@ class DualStreamDiT(nn.Module):
         self,
     ) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def _decode_output(
+        self,
+        image_tokens: torch.Tensor,
+        x: torch.Tensor,
+        bsz: int,
+        h_patches: int,
+        w_patches: int,
+        p: int,
+        H: int,
+        W: int,
+    ) -> torch.Tensor:
+        """Synthesizes final prediction via LocalDecoder or linear projection."""
+        s = self.norm_final(image_tokens)
+
+        if self.pixel_decoder is not None:
+            num_patches = h_patches * w_patches
+            s_cond = s.reshape(bsz * num_patches, self.hidden_size, 1, 1)
+
+            # Extract patches: [B, C, H, W] -> [B * N, C, P, P]
+            x_patches = (
+                x.view(bsz, self.in_channels, h_patches, p, w_patches, p)
+                .permute(0, 2, 4, 1, 3, 5)
+                .reshape(bsz * num_patches, self.in_channels, p, p)
+            )
+            out_patches = self.pixel_decoder(x_patches, s_cond)
+
+            # Fold patches back into full image: [B * N, C, P, P] -> [B, C, H, W]
+            tokens = (
+                out_patches.view(bsz, h_patches, w_patches, self.out_channels, p, p)
+                .permute(0, 3, 1, 4, 2, 5)
+                .reshape(bsz, self.out_channels, H, W)
+            )
+            return tokens
+
+        tokens = self.proj_out(self.norm_final(image_tokens))  # [B, H*W, p*p*C_out]
+        tokens = tokens.reshape(bsz, h_patches, w_patches, p, p, self.out_channels)
+        tokens = tokens.permute(0, 5, 1, 3, 2, 4).reshape(bsz, self.out_channels, H, W)
+        return tokens
 
     def forward(
         self,
@@ -493,9 +664,4 @@ class DualStreamDiT(nn.Module):
                 skip=skip_tensors,
             )
 
-        tokens = self.proj_out(self.norm_final(image_tokens))  # [B, H*W, p*p*C_out]
-
-        tokens = tokens.reshape(bsz, h_patches, w_patches, p, p, self.out_channels)
-        tokens = tokens.permute(0, 5, 1, 3, 2, 4).reshape(bsz, self.out_channels, H, W)
-
-        return tokens
+        return self._decode_output(image_tokens, x, bsz, h_patches, w_patches, p, H, W)

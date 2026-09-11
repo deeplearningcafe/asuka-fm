@@ -158,9 +158,7 @@ def load_trainable_model(
 
     if resume_from_checkpoint and os.path.isdir(resume_from_checkpoint):
         if global_rank == 0:
-            logging.info(
-                f"Resolved checkpoint directory: {resume_from_checkpoint}"
-            )
+            logging.info(f"Resolved checkpoint directory: {resume_from_checkpoint}")
         for fname in ["unet.safetensors", "model.safetensors"]:
             candidate = os.path.join(resume_from_checkpoint, fname)
             if os.path.exists(candidate):
@@ -169,9 +167,7 @@ def load_trainable_model(
                     logging.info(f"  -> Found model weights: {unet_path}")
                 break
 
-        ckpt_te_path = os.path.join(
-            resume_from_checkpoint, "text_encoder.safetensors"
-        )
+        ckpt_te_path = os.path.join(resume_from_checkpoint, "text_encoder.safetensors")
         hf_te_id = getattr(model_cfg, "hf_text_encoder", None)
         if not hf_te_id and train_te and os.path.exists(ckpt_te_path):
             te_path = ckpt_te_path
@@ -224,6 +220,10 @@ def load_trainable_model(
         use_calibrated_spatial = (
             getattr(model_cfg, "use_calibrated_spatial", False) if model_cfg else False
         )
+
+        use_pixel_decoder = (
+            getattr(model_cfg, "use_pixel_decoder", False) if model_cfg else False
+        )
         if global_rank == 0:
             logging.info(
                 f"Creating model with {hidden_size} hs, {depth} layers, and spatial rope {use_calibrated_spatial}"
@@ -241,6 +241,7 @@ def load_trainable_model(
                 use_checkpointing=use_checkpointing,
                 use_rope_text_adapter=use_rope,
                 skip_checkpointing_layers=skip_checkpointing_layers,
+                use_pixel_decoder=use_pixel_decoder,
             )
             # if os.path.exists(unet_path):
             #     sd = load_file(unet_path, device="cpu")
@@ -287,6 +288,7 @@ def load_trainable_model(
                 skip_checkpointing_layers=skip_checkpointing_layers,
                 use_random_drop=use_random_drop,
                 use_calibrated_spatial=use_calibrated_spatial,
+                use_pixel_decoder=use_pixel_decoder,
             )
         else:
             unet = Unet.from_pretrained(
@@ -309,9 +311,7 @@ def load_trainable_model(
 
             if ckpt_dit_path and os.path.exists(ckpt_dit_path):
                 if global_rank == 0:
-                    logging.info(
-                        f"  -> Loading DiT weights from: {ckpt_dit_path}"
-                    )
+                    logging.info(f"  -> Loading DiT weights from: {ckpt_dit_path}")
                 sd = load_file(ckpt_dit_path, device="cpu")
                 sd = {
                     k.replace("_orig_mod.", "").replace("unet.", ""): v
@@ -321,7 +321,7 @@ def load_trainable_model(
                 unet.load_state_dict(sd, strict=False)
             elif resume_from_checkpoint:
                 raise FileNotFoundError(
-                    f"Could not find DiT weights in {resolved_ckpt_dir}"
+                    f"Could not find DiT weights in {resume_from_checkpoint}"
                 )
 
         # Offload EMA to CPU
@@ -339,9 +339,7 @@ def load_trainable_model(
             and resume_from_checkpoint
             and os.path.isdir(resume_from_checkpoint)
         ):
-            ema_path = os.path.join(
-                resume_from_checkpoint, "unet_ema.safetensors"
-            )
+            ema_path = os.path.join(resume_from_checkpoint, "unet_ema.safetensors")
             if os.path.exists(ema_path) and ema.use_ema:
                 logging.info(f"  -> Found EMA weights: {ema_path}")
                 ema.ema_model.load_state_dict(load_file(ema_path, device="cpu"))
@@ -357,7 +355,7 @@ def load_trainable_model(
             vae = AutoencoderKL.from_pretrained(
                 hf_vae_id,
                 torch_dtype=autocast_dtype,
-                cache_dir=None #f"{models_path}/vae",
+                cache_dir=None,  # f"{models_path}/vae",
             ).eval()
         else:
             vae_path = f"{models_path}/vae/diffusion_pytorch_model.safetensors"
@@ -388,7 +386,14 @@ def load_trainable_model(
         for param in unet.parameters():
             param.requires_grad = False
 
-        if hasattr(unet, "proj_out"):
+        if getattr(unet, "pixel_decoder", None) is not None:
+            for param in unet.pixel_decoder.parameters():
+                param.requires_grad = True
+            # Adapt newly initialized pixel input patch conv
+            if hasattr(unet, "x_embedder"):
+                for param in unet.x_embedder.parameters():
+                    param.requires_grad = True
+        elif hasattr(unet, "proj_out"):
             # DiT / Sprint
             for param in unet.proj_out.parameters():
                 param.requires_grad = True
@@ -446,8 +451,7 @@ def load_training_state(
         global_step = state.get("global_step", 0)
         if global_rank == 0:
             logging.info(
-                f"  -> Resuming from epoch {start_epoch}, "
-                f"global step {global_step}"
+                f"  -> Resuming from epoch {start_epoch}, global step {global_step}"
             )
     else:
         base_name = os.path.basename(os.path.normpath(checkpoint_path))
@@ -470,14 +474,9 @@ def load_training_state(
         if os.path.exists(optimizer_path):
             # Capture target LR and weight decay configured from cfg
             target_lrs = [g["lr"] for g in optimizer.param_groups]
-            target_wds = [
-                g.get("weight_decay", 0.0)
-                for g in optimizer.param_groups
-            ]
+            target_wds = [g.get("weight_decay", 0.0) for g in optimizer.param_groups]
 
-            optimizer.load_state_dict(
-                torch.load(optimizer_path, map_location=device)
-            )
+            optimizer.load_state_dict(torch.load(optimizer_path, map_location=device))
 
             # Override param_groups with new config values while keeping states
             if len(optimizer.param_groups) == len(target_lrs):
@@ -729,7 +728,7 @@ def create_optim(unet, text_encoder, conf: omegaconf.DictConfig):
         unet_high_lr_multiplier=1.05,
         unet_backbone_lr_multiplier=1.0,
         unet_low_lr_multiplier=1.0,
-        #model_type=model_type,
+        # model_type=model_type,
     )
 
     if conf.train.use_bitsandbytes:
@@ -746,6 +745,7 @@ def create_optim(unet, text_encoder, conf: omegaconf.DictConfig):
         )
 
     return optim
+
 
 def create_scheduler(
     optim,
@@ -769,9 +769,7 @@ def create_scheduler(
 
     warmup_ratio = conf.train.get("warmup", 0.04)
     warmup_steps = int(warmup_ratio * total_steps)
-    warmup_steps = (
-        min(warmup_steps, total_steps - 1) if total_steps > 1 else 0
-    )
+    warmup_steps = min(warmup_steps, total_steps - 1) if total_steps > 1 else 0
 
     decay_ratio = conf.train.get("decay_ratio", 0.0)
     decay_steps = int(decay_ratio * total_steps)

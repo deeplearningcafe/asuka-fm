@@ -51,6 +51,7 @@ def _worker_init_fn(worker_id: int) -> None:
     """Resets HTTP session pools per worker to prevent socket collisions."""
     _reset_http_sessions()
 
+
 def sniff_image_header(
     data: bytes,
 ) -> tuple[str, tuple[int, int] | None]:
@@ -91,6 +92,7 @@ def sniff_image_header(
 
     return "UNKNOWN", None
 
+
 def bytes_to_tensor(
     raw_bytes: bytes,
     shape: list[int] | tuple[int, ...],
@@ -98,7 +100,7 @@ def bytes_to_tensor(
 ) -> torch.Tensor:
     """Zero-copy bitcast deserialization of raw latent bytes."""
     dt = dtype_str.lower()
-    
+
     # latent is read only but pytorch modifies it only strides and offsets so no problem
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -107,9 +109,7 @@ def bytes_to_tensor(
             category=UserWarning,
         )
         if dt in ("bf16", "bfloat16"):
-            tensor = torch.frombuffer(raw_bytes, dtype=torch.int16).view(
-                torch.bfloat16
-            )
+            tensor = torch.frombuffer(raw_bytes, dtype=torch.int16).view(torch.bfloat16)
         elif dt in ("fp16", "float16"):
             tensor = torch.frombuffer(raw_bytes, dtype=torch.float16)
         else:
@@ -173,14 +173,24 @@ class StreamingImageDataset(IterableDataset):
         world_size: int = 1,
         low_ram: bool = False,
         is_latent: bool = False,
-        coord_system:str="aspect_norm",
+        coord_system: str = "aspect_norm",
+        pixel_training: bool = False,
     ):
         super().__init__()
+        self.pixel_training = pixel_training
         self.dataset_name = dataset_name
         self.dataset_path = dataset_path
         self.resolution = resolution
         self.patch_size = patch_size
-        self.latent_patch = patch_size * vae_downsample_factor
+
+        # In pixel space, there is no VAE downsampling (factor = 1)
+        if self.pixel_training:
+            self.vae_downsample_factor = 1
+            self.latent_patch = patch_size
+        else:
+            self.vae_downsample_factor = vae_downsample_factor
+            self.latent_patch = patch_size * vae_downsample_factor
+
         self.max_seq_len = max_seq_len
         self.tokenizer = tokenizer
         self.cfg_dropout_prob = cfg_dropout_prob
@@ -199,8 +209,7 @@ class StreamingImageDataset(IterableDataset):
         self.samples_per_shard = int(self.metadata.get("samples_per_shard", 10000))
         self.length_tiers = self.metadata.get("length_tiers", [77, 152, 227])
         self.bucket_info = self.metadata.get("bucket_info", [])
-        self.crop_latent_size = resolution // vae_downsample_factor
-        self.vae_downsample_factor = vae_downsample_factor
+        self.crop_latent_size = self.resolution // self.vae_downsample_factor
 
         if self.world_size > 1:
             self.num_samples = self.total_samples // self.world_size
@@ -233,10 +242,7 @@ class StreamingImageDataset(IterableDataset):
             dataset_path = Path(dataset_path)
             if dataset_path.is_dir():
                 parquet_files = sorted(
-                    [
-                        str(p)
-                        for p in dataset_path.glob("data_shard_*.parquet")
-                    ]
+                    [str(p) for p in dataset_path.glob("data_shard_*.parquet")]
                 )
                 if not parquet_files:
                     parquet_files = sorted(
@@ -246,9 +252,7 @@ class StreamingImageDataset(IterableDataset):
                     raise FileNotFoundError(
                         f"No parquet shards found in: {dataset_path}"
                     )
-                logging.info(
-                    f"Found {len(parquet_files)} local parquet shards."
-                )
+                logging.info(f"Found {len(parquet_files)} local parquet shards.")
                 self.hf_dataset = load_dataset(
                     "parquet",
                     data_files={"train": parquet_files},
@@ -263,7 +267,7 @@ class StreamingImageDataset(IterableDataset):
                 split="train",
                 streaming=True,
                 storage_options=storage_options,
-                    fragment_scan_options=scan_options,
+                fragment_scan_options=scan_options,
             )
 
         detected_shards = getattr(
@@ -271,9 +275,7 @@ class StreamingImageDataset(IterableDataset):
             "num_shards",
             getattr(self.hf_dataset, "n_shards", "unknown"),
         )
-        logging.info(
-            f"Initialized HF Streaming Dataset with {detected_shards} shards."
-        )
+        logging.info(f"Initialized HF Streaming Dataset with {detected_shards} shards.")
 
         # Split across DDP nodes/ranks ONCE at initialization
         if self.world_size > 1:
@@ -430,10 +432,8 @@ class StreamingImageDataset(IterableDataset):
         )
 
         return img_tensor, tokens, mask, pos_map, tag_weight, aes_tier
-    
-    def _extract_resized_image(
-        self, sample: dict
-    ) -> tuple[torch.Tensor, int, int]:
+
+    def _extract_resized_image(self, sample: dict) -> tuple[torch.Tensor, int, int]:
         """
         Resizes raw image to aspect ratio bucket preserving dimensions
         without cropping. Aligns to 8-pixel boundaries for VAE downsampling.
@@ -458,7 +458,6 @@ class StreamingImageDataset(IterableDataset):
 
         image = image.resize((resized_w, resized_h), Image.Resampling.BICUBIC)
         return self.normalize(image), resized_h, resized_w
-
 
     def set_epoch(self, epoch: int) -> None:
         """Updates epoch state and refreshes HTTP sessions between epochs."""
@@ -512,6 +511,7 @@ class StreamingImageDataset(IterableDataset):
                 yield self._process_sample(sample)
             except Exception:
                 continue
+
 
 class RAMCachedDataset(torch.utils.data.Dataset):
     """
@@ -610,9 +610,7 @@ class RAMCachedDataset(torch.utils.data.Dataset):
         tag_weight = torch.tensor(
             1.0 if is_uncond else raw_tag_weight, dtype=torch.float32
         )
-        aes_tier = torch.tensor(
-            float(self.aes_tiers[idx]), dtype=torch.float32
-        )
+        aes_tier = torch.tensor(float(self.aes_tiers[idx]), dtype=torch.float32)
 
         return (
             cropped_latent,
@@ -639,29 +637,18 @@ class PrecomputeExtractDataset(IterableDataset):
         # slices the assigned shard subset via get_worker_info().
         for raw_sample in self.streaming_dataset.hf_dataset:
             try:
-                if (
-                    self.streaming_dataset.is_latent
-                    or "latent" in raw_sample
-                ):
+                if self.streaming_dataset.is_latent or "latent" in raw_sample:
                     raw_bytes = raw_sample.get("latent")
-                    shape = raw_sample.get(
-                        "latent_shape", [32, 64, 64]
-                    )
-                    dtype_str = raw_sample.get(
-                        "latent_dtype", "bf16"
-                    )
-                    item_tensor = bytes_to_tensor(
-                        raw_bytes, shape, dtype_str
-                    )
+                    shape = raw_sample.get("latent_shape", [32, 64, 64])
+                    dtype_str = raw_sample.get("latent_dtype", "bf16")
+                    item_tensor = bytes_to_tensor(raw_bytes, shape, dtype_str)
                     res_h, res_w = int(shape[1]), int(shape[2])
                 else:
                     item_tensor, res_h, res_w = (
                         self.streaming_dataset._extract_resized_image(raw_sample)
                     )
             except Exception as e:
-                logging.warning(
-                    f"Worker failed to decode image: {e}. Skipping."
-                )
+                logging.warning(f"Worker failed to decode image: {e}. Skipping.")
                 continue
 
             prompt = raw_sample.get("prompt") or raw_sample.get("text", "")
@@ -750,9 +737,7 @@ def precompute_latents_to_ram(
             new_buf = torch.empty(
                 (new_size,), dtype=autocast_dtype, device="cpu"
             ).share_memory_()
-            new_buf[:current_flat_offset] = latents_flat_buf[
-                :current_flat_offset
-            ]
+            new_buf[:current_flat_offset] = latents_flat_buf[:current_flat_offset]
             latents_flat_buf = new_buf
 
         if sample_idx + needed_samples > offsets_buf.shape[0]:
@@ -783,9 +768,7 @@ def precompute_latents_to_ram(
                 tag_weight,
                 aes_tier,
             ) = item
-            flat_lat = latent.to(
-                dtype=autocast_dtype, device="cpu"
-            ).flatten()
+            flat_lat = latent.to(dtype=autocast_dtype, device="cpu").flatten()
             sample_numel = flat_lat.numel()
 
             _ensure_buffer_capacity(sample_numel, 1)
@@ -819,9 +802,7 @@ def precompute_latents_to_ram(
             imgs = torch.stack([it[0] for it in items], dim=0)
             imgs_gpu = imgs.to(device, non_blocking=True)
 
-            with torch.autocast(
-                device_type="cuda", dtype=autocast_dtype, enabled=True
-            ):
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=True):
                 enc = vae.encode(imgs_gpu)
                 dist = getattr(enc, "latent_dist", enc)
                 lats = dist.sample() if hasattr(dist, "sample") else dist
@@ -884,8 +865,8 @@ def precompute_latents_to_ram(
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.barrier()
-    
-    torch.cuda.empty_cache() 
+
+    torch.cuda.empty_cache()
     return RAMCachedDataset(
         latents_flat=latents_flat_buf[:current_flat_offset],
         offsets=offsets_buf[:sample_idx],
@@ -903,6 +884,7 @@ def precompute_latents_to_ram(
         tag_dropout_prob=dataset.tag_dropout_prob,
         shuffle_tags=dataset.shuffle_tags,
     )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

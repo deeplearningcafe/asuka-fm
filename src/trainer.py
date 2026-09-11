@@ -71,9 +71,14 @@ class Trainer:
         )
         # TODO: could compile vae?
         self.dataloader = create_dataloader(
-            cfg, self.global_rank, tokenizer=self.tokenizer, vae=self.vae, autocast_dtype=self.autocast_dtype,
+            cfg,
+            self.global_rank,
+            tokenizer=self.tokenizer,
+            vae=self.vae,
+            autocast_dtype=self.autocast_dtype,
         )
 
+        self.pixel_training = getattr(cfg.train, "pixel_training", False)
         self.is_latent = (
             cfg.data.get("is_latent", False)
             or getattr(cfg.data, "dataset_type", "") == "streaming_latents"
@@ -92,9 +97,13 @@ class Trainer:
         self.vae_std = torch.tensor(vae_std, device=self.device, dtype=self.dtype).view(
             1, -1, 1, 1
         )
-        self.vae_batch_size = cfg.train.get("vae_batch_size", 64)
+        self.vae_batch_size = cfg.models.get("vae_batch_size", 64)
         self.in_channels = cfg.models.get("in_channels", 4)
-        self.coord_system = "aspect_norm" if getattr(cfg.models, "use_calibrated_spatial", False) else "discrete"
+        self.coord_system = (
+            "aspect_norm"
+            if getattr(cfg.models, "use_calibrated_spatial", False)
+            else "discrete"
+        )
 
         self.optimizer = create_optim(self.unet, self.text_encoder, cfg)
         self.grad_offloader = None
@@ -137,9 +146,7 @@ class Trainer:
             if hasattr(self.dataloader, "__len__"):
                 grad_accum = self.cfg.train.gradient_accumulation_steps
                 steps_per_epoch = len(self.dataloader) // grad_accum
-                rem_epochs = max(
-                    1, self.cfg.train.epochs - self.start_epoch
-                )
+                rem_epochs = max(1, self.cfg.train.epochs - self.start_epoch)
                 remaining_steps = rem_epochs * steps_per_epoch
 
             self.lr_scheduler = create_scheduler(
@@ -210,7 +217,7 @@ class Trainer:
             # TODO: compile text_encoder and vae
             self.unet = torch.compile(self.unet)
             self.text_encoder = torch.compile(self.text_encoder)
-            #self.vae = torch.compile(self.vae)
+            # self.vae = torch.compile(self.vae)
             # if hasattr(self.objective, "_compiled_loss_step"):
             #     self.objective._compiled_loss_step = torch.compile(
             #         self.objective._compiled_loss_step
@@ -327,7 +334,7 @@ class Trainer:
         # Check if raw streaming batch or precomputed RAM batch (len >= 5)
         if len(batch) >= 5:
             images_or_lats, cond, mask, pos_map, tag_weights, *rest = batch
-            if not self.is_latent:
+            if not self.is_latent and not self.pixel_training:
                 # Raw RGB images -> Encode via VAE in-place
                 torch._dynamo.maybe_mark_dynamic(images_or_lats, 0)
                 with torch.no_grad():
@@ -678,7 +685,7 @@ class Trainer:
                             # if sprint multi images tokens by drop_ratio
                             # TODO: take into account enc and dec layers and drop target
                             images_interval = (
-                                images_interval * (1-self.cfg.models.drop_ratio)
+                                images_interval * (1 - self.cfg.models.drop_ratio)
                                 if self.model_type == "sprint_dual"
                                 else images_interval
                             )
@@ -760,7 +767,8 @@ class Trainer:
                                         use_unet_mult=False if self.is_dit else True,
                                         vae_mean=self.vae_mean,
                                         vae_std=self.vae_std,
-                                        in_channels=self.in_channels
+                                        in_channels=self.in_channels,
+                                        pixel_sampling=self.pixel_training,
                                     )
                                     prompts = [
                                         c.get("prompt") for c in self.sample_configs
@@ -845,7 +853,8 @@ class Trainer:
                         use_unet_mult=False if self.is_dit else True,
                         vae_mean=self.vae_mean,
                         vae_std=self.vae_std,
-                        in_channels=self.in_channels
+                        in_channels=self.in_channels,
+                        pixel_sampling=self.pixel_training,
                     )
                 prompts = [c.get("prompt") for c in self.sample_configs]
                 io_executor.submit(log_image, images, prompts, epoch, self.global_step)
@@ -855,7 +864,7 @@ class Trainer:
                     self.text_encoder.module
                     if self.is_ddp and self.train_te
                     else self.text_encoder
-                    )
+                )
                 save_checkpoint(
                     epoch,
                     self.global_step,

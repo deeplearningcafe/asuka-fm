@@ -1,3 +1,4 @@
+import os
 import torch
 import warnings
 import logging
@@ -19,6 +20,7 @@ from src.data.streaming_dataset import (
     precompute_latents_to_ram,
 )
 
+
 def worker_init_fn(worker_id: int) -> None:
     """
     Limits intra-op OpenMP threads per worker to prevent CPU thrashing
@@ -37,6 +39,7 @@ def worker_init_fn(worker_id: int) -> None:
     except (ImportError, AttributeError):
         pass
 
+
 def create_dataloader(
     cfg, rank, tokenizer=None, vae=None, autocast_dtype=torch.float32
 ) -> DataLoader:
@@ -51,24 +54,28 @@ def create_dataloader(
         logging.info(f"Loading {dataset_type} dataset")
 
     if dataset_type in ("streaming", "streaming_latents"):
-        is_latent = (
-            cfg.data.get("is_latent", False)
-            or (dataset_type == "streaming_latents")
+        is_latent = cfg.data.get("is_latent", False) or (
+            dataset_type == "streaming_latents"
         )
+        pixel_training = getattr(cfg.train, "pixel_training", False)
         if rank == 0:
             logging.info(f"Using latents {is_latent}")
 
-        coord_system = "aspect_norm" if getattr(cfg.models, "use_calibrated_spatial", False) else "discrete"
+        coord_system = (
+            "aspect_norm"
+            if getattr(cfg.models, "use_calibrated_spatial", False)
+            else "discrete"
+        )
         if rank == 0:
-            logging.info(
-                f"Creating with {is_latent} latents and rope {coord_system}"
-            )
+            logging.info(f"Creating with {is_latent} latents and rope {coord_system}")
         dataset = StreamingImageDataset(
             dataset_name=cfg.data.streaming_dataset_name,
             dataset_path=cfg.data.get("dataset_path", None),
             resolution=cfg.data.get("resolution", 512),
-            patch_size=cfg.data.get("patch_size", 2),
-            vae_downsample_factor=cfg.data.get("vae_downsample_factor", 8),
+            patch_size=cfg.data.get("patch_size", 16 if pixel_training else 2),
+            vae_downsample_factor=cfg.data.get(
+                "vae_downsample_factor", 8 if not pixel_training else 1
+            ),
             max_seq_len=cfg.data.get("max_seq_len", 256),
             tokenizer=tokenizer,
             cfg_dropout_prob=getattr(cfg.train, "cfg_dropout_prob", 0.0),
@@ -79,6 +86,7 @@ def create_dataloader(
             low_ram=getattr(cfg.data, "low_ram", False),
             is_latent=is_latent,
             coord_system=coord_system,
+            pixel_training=pixel_training,
         )
 
         tier_lengths = cfg.data.get(
@@ -124,9 +132,7 @@ def create_dataloader(
                 aesthetic_curriculum=cfg.data.get("aesthetic_curriculum", True),
             )
 
-            num_workers = cfg.train.get(
-                "num_workers", cfg.data.get("num_workers", 4)
-            )
+            num_workers = cfg.train.get("num_workers", cfg.data.get("num_workers", 4))
             return DataLoader(
                 ram_dataset,
                 batch_sampler=batch_sampler,

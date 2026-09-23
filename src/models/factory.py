@@ -478,14 +478,31 @@ def load_training_state(
 
             optimizer.load_state_dict(torch.load(optimizer_path, map_location=device))
 
-            # Override param_groups with new config values while keeping states
-            if len(optimizer.param_groups) == len(target_lrs):
-                for group, new_lr, new_wd in zip(
-                    optimizer.param_groups, target_lrs, target_wds
-                ):
-                    group["lr"] = new_lr
-                    group["initial_lr"] = new_lr
-                    group["weight_decay"] = new_wd
+            if reset_scheduler:
+                # When resetting scheduler, apply target LR from config
+                if len(optimizer.param_groups) == len(target_lrs):
+                    for group, new_lr, new_wd in zip(
+                        optimizer.param_groups, target_lrs, target_wds
+                    ):
+                        group["lr"] = new_lr
+                        group["initial_lr"] = new_lr
+                        group["weight_decay"] = new_wd
+                if global_rank == 0:
+                    logging.info(
+                        f"  -> Optimizer state loaded (re-applied target lr: "
+                        f"{target_lrs[0]:.2e})"
+                    )
+            else:
+                # Resuming: keep scheduled LR
+                if len(optimizer.param_groups) == len(target_wds):
+                    for group, new_wd in zip(optimizer.param_groups, target_wds):
+                        group["weight_decay"] = new_wd
+                if global_rank == 0:
+                    logging.info(
+                        f"  -> Optimizer state loaded (restored lr: "
+                        f"{optimizer.param_groups[0]['lr']:.2e})"
+                    )
+
             if global_rank == 0:
                 logging.info(
                     f"  -> Optimizer state loaded (re-applied target lr: "
@@ -502,8 +519,31 @@ def load_training_state(
                 scheduler.load_state_dict(
                     torch.load(scheduler_path, map_location=device)
                 )
+                # Synchronize optimizer LRs with scheduler.
+                if hasattr(scheduler, "get_last_lr"):
+                    for group, last_lr in zip(
+                        optimizer.param_groups, scheduler.get_last_lr()
+                    ):
+                        group["lr"] = last_lr
+
+                # Restore base_lrs into initial_lr to ensure subsequent phases work
+                base_lrs = getattr(scheduler, "base_lrs", None)
+                if (
+                    base_lrs is None
+                    and hasattr(scheduler, "_schedulers")
+                    and scheduler._schedulers
+                ):
+                    base_lrs = getattr(scheduler._schedulers[0], "base_lrs", None)
+                if base_lrs is not None:
+                    for group, b_lr in zip(optimizer.param_groups, base_lrs):
+                        group["initial_lr"] = b_lr
+
                 if global_rank == 0:
-                    logging.info("  -> Scheduler state loaded.")
+                    logging.info(
+                        f"  -> Scheduler state loaded (resumed lr: "
+                        f"{optimizer.param_groups[0]['lr']:.2e})."
+                    )
+
             except Exception as e:
                 if global_rank == 0:
                     logging.warning(

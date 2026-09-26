@@ -477,6 +477,8 @@ def main():
     unet.eval().requires_grad_(False)
     text_encoder.eval().requires_grad_(False)
     vae.eval().requires_grad_(False)
+    unet = torch.compile(unet)
+    text_encoder = torch.compile(text_encoder)
 
     if cfg.train.objective == "flow_matching":
         schedule = LinearSchedule(device=device)

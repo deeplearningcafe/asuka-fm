@@ -33,6 +33,19 @@ logging.basicConfig(
 )
 
 
+def make_preview_grid(
+    images: List[Image.Image], cols: int = 4, rows: int = 4
+) -> Image.Image:
+    """Stitches sample images into a preview grid."""
+    w, h = images[0].size
+    grid = Image.new("RGB", (cols * w, rows * h))
+    for idx, img in enumerate(images[: cols * rows]):
+        x = (idx % cols) * w
+        y = (idx // cols) * h
+        grid.paste(img, (x, y))
+    return grid
+
+
 def get_parquet_schema() -> pa.Schema:
     """PyArrow schema for synthetic pixel image shards."""
     return pa.schema(
@@ -230,9 +243,6 @@ def setup_cuda_environment(
         torch.set_float32_matmul_precision("medium")
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
-    elif capability[0] >= 7:
-        autocast_dtype = torch.float16
-        torch.set_float32_matmul_precision("high")
     else:
         autocast_dtype = torch.float32
 
@@ -256,6 +266,8 @@ def generate_and_upload_synthetic(
     ),
     resolution: Optional[int] = None,
     target_aesthetic_tiers: Optional[List[int]] = None,
+    vae_batch_size: int = 16,
+    preview_dir: Optional[str] = None,
     avif_quality: int = 80,
     avif_speed: int = 6,
     hf_token: Optional[str] = None,
@@ -288,6 +300,8 @@ def generate_and_upload_synthetic(
     unet.eval().requires_grad_(False)
     text_encoder.eval().requires_grad_(False)
     vae.eval().requires_grad_(False)
+    unet = torch.compile(unet)
+    text_encoder = torch.compile(text_encoder)
 
     diffusion_type = cfg.train.get("objective", "flow_matching")
     if diffusion_type == "flow_matching":
@@ -357,10 +371,11 @@ def generate_and_upload_synthetic(
 
     batch_configs: List[Dict[str, Any]] = []
     batch_metas: List[Dict[str, Any]] = []
+    has_saved_preview = False
 
     def _process_batch():
         nonlocal shard_counter, current_shard_columns, current_shard_count
-        nonlocal total_generated
+        nonlocal total_generated, has_saved_preview
 
         if not batch_configs:
             return
@@ -384,7 +399,22 @@ def generate_and_upload_synthetic(
             in_channels=in_channels,
             coord_system=coord_system,
             pixel_sampling=False,
+            vae_batch_size=vae_batch_size,
         )
+
+        # Save first batch 16-sample grid and JSON metadata to disk
+        if preview_dir and not has_saved_preview and len(images) >= 16:
+            p_dir = Path(preview_dir)
+            p_dir.mkdir(parents=True, exist_ok=True)
+
+            grid_img = make_preview_grid(images[:16], cols=4, rows=4)
+            grid_img.save(p_dir / "preview_grid.png")
+
+            with open(p_dir / "first_batch_meta.json", "w", encoding="utf-8") as f:
+                json.dump(batch_metas[:16], f, indent=4)
+
+            logging.info(f"Saved 16-sample preview grid and metadata to {p_dir}.")
+            has_saved_preview = True
 
         # Encode PIL images to AVIF binary format in memory concurrently
         with ThreadPoolExecutor(max_workers=min(len(images), 8)) as ex:
@@ -606,6 +636,12 @@ def main():
         help="Default negative prompt for CFG inference.",
     )
     parser.add_argument(
+        "--vae_batch_size",
+        type=int,
+        default=16,
+        help="Batch size for VAE decoding.",
+    )
+    parser.add_argument(
         "--avif_quality",
         type=int,
         default=80,
@@ -652,6 +688,8 @@ def main():
         negative_prompt=args.negative_prompt,
         resolution=args.resolution,
         target_aesthetic_tiers=args.target_aesthetic_tiers,
+        vae_batch_size=args.vae_batch_size,
+        preview_dir=save_dir,
         avif_quality=args.avif_quality,
         hf_token=args.hf_token,
         device=args.device,

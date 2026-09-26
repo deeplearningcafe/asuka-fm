@@ -438,6 +438,7 @@ def generate_samples(
     clip_prediction: bool = False,
     dynamic_thresholding: bool = False,
     cfg_interval: tuple[float, float] = (0.0, 1.0),
+    vae_batch_size: int = 4,
 ) -> List[Image.Image]:
     """
     Main entry point for generating samples during training.
@@ -605,18 +606,34 @@ def generate_samples(
                         all_images[orig_idx] = Image.fromarray(img)
                 else:
                     vae_dtype = next(vae.parameters()).dtype
-                    for j, latent in enumerate(latents):
-                        orig_idx = batch_indices[j]
-                        raw_lat = (
-                            latent.unsqueeze(0).to(torch.float32) * vae_std
-                        ) + vae_mean
-                        torch._dynamo.maybe_mark_dynamic(raw_lat, 2)
-                        torch._dynamo.maybe_mark_dynamic(raw_lat, 3)
-                        image = vae.decode(raw_lat.to(vae_dtype)).sample
-                        image = (image.to(torch.float32) / 2.0 + 0.5).clamp(0, 1)
-                        image = image.cpu().permute(0, 2, 3, 1).numpy()[0]
-                        image = (image * 255).round().astype("uint8")
-                        all_images[orig_idx] = Image.fromarray(image)
+                    num_latents = latents.shape[0]
+
+                    for v_start in range(0, num_latents, vae_batch_size):
+                        v_end = min(v_start + vae_batch_size, num_latents)
+                        chunk = latents[v_start:v_end]
+                        raw_lat = (chunk.to(torch.float32) * vae_std) + vae_mean
+
+                        with torch.autocast(
+                            device_type="cuda",
+                            dtype=autocast_dtype,
+                            enabled=True,
+                        ):
+                            decoded = vae.decode(raw_lat.to(vae_dtype)).sample
+
+                        # Convert to uint8 on GPU to minimize PCIe host transfer
+                        decoded = (decoded.to(torch.float32) / 2.0 + 0.5).clamp(0, 1)
+                        decoded_np = (
+                            (decoded.permute(0, 2, 3, 1) * 255.0)
+                            .round()
+                            .to(torch.uint8)
+                            .cpu()
+                            .numpy()
+                        )
+
+                        for k in range(v_end - v_start):
+                            orig_idx = batch_indices[v_start + k]
+                            all_images[orig_idx] = Image.fromarray(decoded_np[k])
+
     # vae.to("cpu")
 
     return [all_images[k] for k in range(total_samples)]

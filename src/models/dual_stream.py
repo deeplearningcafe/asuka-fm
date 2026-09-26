@@ -304,10 +304,23 @@ class LocalDecoder(nn.Module):
         self._initialize_weights()
 
     def _initialize_weights(self) -> None:
-        """Zero-initialize the final conv to start with zero velocity output."""
-        nn.init.zeros_(self.out_conv.weight)
-        if self.out_conv.bias is not None:
-            nn.init.zeros_(self.out_conv.bias)
+        """
+        Initializes U-Net with Kaiming Normal for SiLU activations.
+        Under x0-pred, out_conv uses Xavier Uniform to avoid -x_t/(1-t) spikes;
+        under v-pred, out_conv is zeroed out to start with zero velocity.
+        """
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                if m is self.out_conv:
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                else:
+                    nn.init.kaiming_normal_(
+                        m.weight, mode="fan_in", nonlinearity="relu"
+                    )
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         """
@@ -391,6 +404,7 @@ class DualStreamDiT(nn.Module):
         self.x_embedder = nn.Conv2d(
             in_channels, hidden_size, kernel_size=patch_size, stride=patch_size
         )
+        self._initialize_patch_embed()
 
         # 2. Time Embedder (Used as a prepended token)
         self.time_embedding = TimeEmbeddings(sinusoidal_dim=256, output_dim=hidden_size)
@@ -485,6 +499,13 @@ class DualStreamDiT(nn.Module):
             for p in last_block.mlp_text.parameters():
                 p.requires_grad = False
 
+    def _initialize_patch_embed(self) -> None:
+        """Initialize patch embedding like nn.Linear (standard DiT practice)."""
+        w = self.x_embedder.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        if self.x_embedder.bias is not None:
+            nn.init.zeros_(self.x_embedder.bias)
+
     def _zero_initialize_output(self):
         """Crucial for diffusion/flow matching: start by predicting zero velocity/noise."""
         if self.proj_out is not None:
@@ -559,9 +580,13 @@ class DualStreamDiT(nn.Module):
 
         if self.pixel_decoder is not None:
             num_patches = h_patches * w_patches
+            k = self.patch_size // 16
             s_cond = s.reshape(bsz * num_patches, self.hidden_size, 1, 1)
+            if k > 1:
+                s_cond = s_cond.expand(-1, -1, k, k)
 
             # Extract patches: [B, C, H, W] -> [B * N, C, P, P]
+            # TODO: chunk anc act checkpoint
             x_patches = (
                 x.view(bsz, self.in_channels, h_patches, p, w_patches, p)
                 .permute(0, 2, 4, 1, 3, 5)

@@ -51,6 +51,10 @@ class Trainer:
         self.cfg_dropout_prob = cfg.train.cfg_dropout_prob
         self.model_type = getattr(cfg.models, "model_type", "unet")
 
+        self.prediction_target = getattr(cfg.train, "prediction_target", "v")
+        self.noise_scale = float(getattr(cfg.train, "noise_scale", 1.0))
+        self.pixel_training = getattr(cfg.train, "pixel_training", False)
+
         self.unet, self.text_encoder, self.vae, self.tokenizer, self.ema = (
             load_trainable_model(
                 models_path=cfg.paths.models,
@@ -168,13 +172,19 @@ class Trainer:
             )
             timestep_sampling = self.cfg.train.get("timestep_fn", "uniform")
 
+            loss_target = getattr(cfg.train, "loss_target", "v")
+
             self.objective = FlowMatchingObjective(
                 self.schedule,
+                prediction_target=self.prediction_target,
+                loss_target=loss_target,
+                noise_scale=self.noise_scale,
                 timestep_sampling=timestep_sampling,
                 shift=cfg.train.shift,
                 use_ot=cfg.train.get("use_ot", False),
                 use_unet_mult=False if self.is_dit else True,
             )
+
         else:
             self.schedule = DDPMSchedule(device=self.device)
             self.objective = DDPMObjective(
@@ -769,6 +779,25 @@ class Trainer:
                                         vae_std=self.vae_std,
                                         in_channels=self.in_channels,
                                         pixel_sampling=self.pixel_training,
+                                        prediction_target=self.prediction_target,
+                                        noise_scale=self.noise_scale,
+                                        clip_prediction=getattr(
+                                            self.cfg.sampling,
+                                            "clip_prediction",
+                                            self.pixel_training,
+                                        ),
+                                        dynamic_thresholding=getattr(
+                                            self.cfg.sampling,
+                                            "dynamic_thresholding",
+                                            self.pixel_training,
+                                        ),
+                                        cfg_interval=getattr(
+                                            self.cfg.sampling,
+                                            "cfg_interval",
+                                            (0.11, 0.97)
+                                            if self.pixel_training
+                                            else (0.0, 1.0),
+                                        ),
                                     )
                                     prompts = [
                                         c.get("prompt") for c in self.sample_configs
@@ -855,6 +884,23 @@ class Trainer:
                         vae_std=self.vae_std,
                         in_channels=self.in_channels,
                         pixel_sampling=self.pixel_training,
+                        prediction_target=self.prediction_target,
+                        noise_scale=self.noise_scale,
+                        clip_prediction=getattr(
+                            self.cfg.sampling,
+                            "clip_prediction",
+                            self.pixel_training,
+                        ),
+                        dynamic_thresholding=getattr(
+                            self.cfg.sampling,
+                            "dynamic_thresholding",
+                            self.pixel_training,
+                        ),
+                        cfg_interval=getattr(
+                            self.cfg.sampling,
+                            "cfg_interval",
+                            (0.11, 0.97) if self.pixel_training else (0.0, 1.0),
+                        ),
                     )
                 prompts = [c.get("prompt") for c in self.sample_configs]
                 io_executor.submit(log_image, images, prompts, epoch, self.global_step)

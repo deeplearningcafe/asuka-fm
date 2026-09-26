@@ -2,11 +2,72 @@ import json
 import logging
 import os
 from typing import Any, Dict, Optional, Union
-from safetensors.torch import save_file
+from safetensors.torch import save_file, load_file
 import torch
 from omegaconf import DictConfig, OmegaConf
+import math
 
 import src.utils.logging as logging_utils
+
+PIXEL_EXPLICIT_MODULES = {
+    "x_embedder",
+    "conv_in",
+    "pixel_decoder",
+    "proj_out",
+    "conv_out",
+    "norm_final",
+    "norm_out",
+    "conv_norm_out",
+    "final_layer",
+}
+
+
+def _normalize_param_key(k: str) -> str:
+    """Removes torch.compile wrappers and module prefixes for matching."""
+    k = k.replace("_orig_mod.", "")
+    if k.startswith("unet."):
+        k = k[5:]
+    return k
+
+
+def adapt_patch_embed_weight(
+    src_weight: torch.Tensor,
+    target_shape: tuple[int, ...],
+) -> torch.Tensor:
+    """
+    Adapts patch embedding weights when expanding patch size (e.g. ps16->ps32).
+    Follows Jiang et al. (2026): W' = (1/k) * [W, ..., W], replicating
+    kernel weights across sub-patches to preserve output variance.
+    """
+    if src_weight.shape == target_shape:
+        return src_weight
+
+    # 4D Conv2d weights: [out_channels, in_channels, kh, kw]
+    if src_weight.ndim == 4 and len(target_shape) == 4:
+        k_h = target_shape[2] // src_weight.shape[2]
+        k_w = target_shape[3] // src_weight.shape[3]
+        if (
+            k_h == k_w
+            and k_h > 1
+            and target_shape[2] == src_weight.shape[2] * k_h
+            and target_shape[3] == src_weight.shape[3] * k_w
+        ):
+            return src_weight.repeat(1, 1, k_h, k_w) / float(k_h)
+
+    # 2D Linear weights: [hidden_size, in_channels * p^2]
+    if src_weight.ndim == 2 and len(target_shape) == 2:
+        ratio = target_shape[1] // src_weight.shape[1]
+        k = int(math.isqrt(ratio))
+        if k * k == ratio and k > 1:
+            d, in_features = src_weight.shape
+            p_old = int(math.isqrt(in_features // 3))
+            w_2d = src_weight.view(d, 3, p_old, p_old)
+            w_tiled = w_2d.repeat(1, 1, k, k) / float(k)
+            return w_tiled.reshape(d, target_shape[1])
+
+    raise ValueError(
+        f"Cannot adapt patch embed weight from {src_weight.shape} to {target_shape}."
+    )
 
 
 def save_checkpoint(
@@ -28,9 +89,7 @@ def save_checkpoint(
     Weights are cast to bfloat16 to optimize storage and I/O throughput.
     """
     save_dir = os.path.join(base_dir, f"epoch_{epoch}_step_{global_step}")
-    checkpoint_dir = os.path.join(
-        save_dir, f"epoch_{epoch}_step_{global_step}"
-    )
+    checkpoint_dir = os.path.join(save_dir, f"epoch_{epoch}_step_{global_step}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     logging.info(f"Saving checkpoint to {checkpoint_dir}...")
 
@@ -44,17 +103,14 @@ def save_checkpoint(
     }
 
     if train_only_output:
-        logging.info("Filtering state dict: Saving only output head.")
-        keys_to_save = [
-            k
-            for k in clean_unet_dict.keys()
-            if "conv_out" in k or "conv_norm_out" in k or "final_layer" in k
-        ]
-        clean_unet_dict = {k: clean_unet_dict[k] for k in keys_to_save}
+        logging.info("Filtering state dict: Saving only output head / pixel modules.")
+        clean_unet_dict = {
+            k: v
+            for k, v in clean_unet_dict.items()
+            if any(mod in k for mod in PIXEL_EXPLICIT_MODULES)
+        }
 
-    save_file(
-        clean_unet_dict, os.path.join(checkpoint_dir, "unet.safetensors")
-    )
+    save_file(clean_unet_dict, os.path.join(checkpoint_dir, "unet.safetensors"))
 
     # 2. Save EMA model weights in bf16 if active
     if ema is not None and getattr(ema, "use_ema", False):
@@ -71,14 +127,11 @@ def save_checkpoint(
             for k, v in ema_state.items()
         }
         if train_only_output:
-            keys_to_save = [
-                k
-                for k in clean_ema_dict.keys()
-                if "conv_out" in k
-                or "conv_norm_out" in k
-                or "final_layer" in k
-            ]
-            clean_ema_dict = {k: clean_ema_dict[k] for k in keys_to_save}
+            clean_ema_dict = {
+                k: v
+                for k, v in clean_ema_dict.items()
+                if any(mod in k for mod in PIXEL_EXPLICIT_MODULES)
+            }
         save_file(
             clean_ema_dict,
             os.path.join(checkpoint_dir, "unet_ema.safetensors"),
@@ -129,11 +182,7 @@ def save_checkpoint(
         else:
             cfg_dict = dict(config)
 
-        models_cfg = (
-            cfg_dict.get("models", {})
-            if "models" in cfg_dict
-            else cfg_dict
-        )
+        models_cfg = cfg_dict.get("models", {}) if "models" in cfg_dict else cfg_dict
 
         hf_config = {
             "_class_name": models_cfg.get("model_type", "dual_stream"),
@@ -146,9 +195,7 @@ def save_checkpoint(
             "decoder_depth": models_cfg.get("decoder_depth", 2),
             "drop_ratio": models_cfg.get("drop_ratio", 0.0),
             "drop_target": models_cfg.get("drop_target", "image"),
-            "residual_type": models_cfg.get(
-                "residual_type", "concat_linear"
-            ),
+            "residual_type": models_cfg.get("residual_type", "concat_linear"),
             "hf_text_encoder": models_cfg.get("hf_text_encoder", ""),
             "hf_vae": models_cfg.get("hf_vae", ""),
             "vae_mean": models_cfg.get("vae_mean", 0.0),
@@ -170,9 +217,7 @@ def save_checkpoint(
     logging.info("Checkpoint saved successfully.")
 
     if logging_utils.is_hfapi_initialized() and hf_repo:
-        logging.info(
-            f"Uploading checkpoint to Hugging Face repo: {hf_repo}"
-        )
+        logging.info(f"Uploading checkpoint to Hugging Face repo: {hf_repo}")
         logging_utils.log_folder(save_dir, hf_repo)
         logging.info("Upload complete.")
 
@@ -184,3 +229,76 @@ def load_checkpoint_config(checkpoint_dir: str) -> dict:
         with open(config_path, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
+
+
+def load_pixel_weights(
+    model: torch.nn.Module,
+    checkpoint_path: str,
+    ema: Any = None,
+) -> torch.nn.Module:
+    """Loads only explicit pixel adaptation layers into model and EMA."""
+    logging.info(f"Loading pixel adaptation weights from: {checkpoint_path}")
+    cand_path = checkpoint_path
+    if os.path.isdir(checkpoint_path):
+        for fname in ["unet.safetensors", "model.safetensors"]:
+            p = os.path.join(checkpoint_path, fname)
+            if os.path.exists(p):
+                cand_path = p
+                break
+
+    if not os.path.isfile(cand_path):
+        raise FileNotFoundError(f"No pixel weights found at path: {checkpoint_path}")
+
+    state_dict = load_file(cand_path, device="cpu")
+    if "model" in state_dict:
+        state_dict = state_dict["model"]
+    elif "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+
+    target_state = model.state_dict()
+    target_key_map = {_normalize_param_key(k): k for k in target_state.keys()}
+    pixel_dict = {}
+
+    for k, v in state_dict.items():
+        norm_k = _normalize_param_key(k)
+        if any(mod in norm_k for mod in PIXEL_EXPLICIT_MODULES):
+            if norm_k in target_key_map:
+                target_key = target_key_map[norm_k]
+                if target_state[target_key].shape == v.shape:
+                    pixel_dict[target_key] = v
+                else:
+                    logging.warning(
+                        f"Skipping pixel layer {target_key} due to shape "
+                        f"mismatch: {target_state[target_key].shape} vs {v.shape}"
+                    )
+
+    if not pixel_dict:
+        raise KeyError(
+            f"No matching pixel adaptation weights found in {checkpoint_path}."
+        )
+
+    model.load_state_dict(pixel_dict, strict=False)
+    logging.info(f"Loaded {len(pixel_dict)} pixel adaptation layers successfully.")
+
+    if ema is not None and getattr(ema, "use_ema", False):
+        ema_target = (
+            ema.ema_model.state_dict()
+            if hasattr(ema, "ema_model") and ema.ema_model is not None
+            else ema.state_dict()
+        )
+        ema_key_map = {_normalize_param_key(k): k for k in ema_target.keys()}
+        clean_ema = {}
+        for k, v in pixel_dict.items():
+            norm_k = _normalize_param_key(k)
+            if norm_k in ema_key_map:
+                target_k = ema_key_map[norm_k]
+                if ema_target[target_k].shape == v.shape:
+                    clean_ema[target_k] = v
+
+        if clean_ema:
+            if hasattr(ema, "ema_model") and ema.ema_model is not None:
+                ema.ema_model.load_state_dict(clean_ema, strict=False)
+            elif hasattr(ema, "load_state_dict"):
+                ema.load_state_dict(clean_ema, strict=False)
+
+    return model

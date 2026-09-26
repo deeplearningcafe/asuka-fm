@@ -113,25 +113,64 @@ class FlowMatchingObjective(DiffusionObjective):
     def __init__(
         self,
         schedule: BaseSchedule,
+        prediction_target: str = "v",
+        loss_target: str = "v",
+        noise_scale: float = 1.0,
         timestep_sampling: str = "logit-normal",
         shift: float = 1.0,
         use_ot: bool = False,
         use_unet_mult: bool = True,
     ):
         super().__init__(schedule)
+        self.prediction_target = prediction_target
+        self.loss_target = loss_target
+        self.noise_scale = float(noise_scale)
         self.shift = shift
         self.use_ot = use_ot
         self.use_unet_mult = use_unet_mult
         self.timestep_sampling_fn = get_timestep_sampling_fn(timestep_sampling)
 
-    def _compute_ot_eps(self, x_start: torch.Tensor, epsilon: torch.Tensor):
-        """Computes Optimal Transport assignment in eager mode."""
-        b = x_start.shape[0]
-        data_flat = x_start.view(b, -1)
-        eps_flat = epsilon.view(b, -1)
+    def _solve_linear_system(
+        self,
+        pred: torch.Tensor,
+        z_t: torch.Tensor,
+        alpha: torch.Tensor,
+        sigma: torch.Tensor,
+        d_alpha: torch.Tensor,
+        d_sigma: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Solves linear system to convert model prediction to (x, eps, v)."""
+        alpha = alpha.clamp(min=1e-5)
+        sigma = sigma.clamp(min=1e-5)
+
+        det = alpha * d_sigma - sigma * d_alpha
+        det_safe = torch.where(det.abs() < 1e-5, 1e-5 * torch.sign(det + 1e-35), det)
+
+        if self.prediction_target == "x":
+            x_pred = pred
+            eps_pred = (z_t - alpha * x_pred) / sigma
+            v_pred = d_alpha * x_pred + d_sigma * eps_pred
+        elif self.prediction_target == "eps":
+            eps_pred = pred
+            x_pred = (z_t - sigma * eps_pred) / alpha
+            v_pred = d_alpha * x_pred + d_sigma * eps_pred
+        elif self.prediction_target == "v":
+            v_pred = pred
+            x_pred = (d_sigma * z_t - sigma * v_pred) / det_safe
+            eps_pred = (alpha * v_pred - d_alpha * z_t) / det_safe
+        else:
+            raise ValueError(f"Unknown prediction target: {self.prediction_target}")
+
+        return x_pred, eps_pred, v_pred
+
+    def _compute_ot_eps(self, data: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
+        """Solves optimal transport assignment under L2 distance in eager mode."""
+        b = data.shape[0]
+        data_flat = data.view(b, -1)
+        eps_flat = eps.view(b, -1)
         _, (row_idx, col_idx) = euclidean_optimal_transport(data_flat, eps_flat)
-        eps_sorted = torch.empty_like(epsilon)
-        eps_sorted[row_idx] = epsilon[col_idx]
+        eps_sorted = torch.empty_like(eps)
+        eps_sorted[row_idx] = eps[col_idx]
         return eps_sorted
 
     def _compiled_loss_step(
@@ -152,6 +191,10 @@ class FlowMatchingObjective(DiffusionObjective):
         t_view = t.view(-1, *([1] * (x_start.ndim - 1)))
         alpha, sigma, d_alpha, d_sigma = self.schedule.get_coefficients(t_view)
 
+        if self.noise_scale != 1.0:
+            sigma = sigma * self.noise_scale
+            d_sigma = d_sigma * self.noise_scale
+
         x_t = alpha * x_start + sigma * epsilon
         v_target = d_alpha * x_start + d_sigma * epsilon
 
@@ -168,9 +211,25 @@ class FlowMatchingObjective(DiffusionObjective):
 
         model_output = model(x_t, t_input, **model_kwargs)
 
+        x_pred, eps_pred, v_pred = self._solve_linear_system(
+            model_output, x_t, alpha, sigma, d_alpha, d_sigma
+        )
+
+        if self.loss_target == "x":
+            pred = x_pred
+            target = x_start
+        elif self.loss_target == "eps":
+            pred = eps_pred
+            target = epsilon
+        elif self.loss_target == "v":
+            pred = v_pred
+            target = v_target
+        else:
+            raise ValueError(f"Unknown loss target: {self.loss_target}")
+
         loss = F.mse_loss(
-            model_output.to(torch.float32),
-            v_target.to(torch.float32),
+            pred.to(torch.float32),
+            target.to(torch.float32),
             reduction="none",
         )
         raw_loss = loss.mean(dim=[1, 2, 3])
@@ -181,9 +240,9 @@ class FlowMatchingObjective(DiffusionObjective):
         final_loss = final_loss.mean()
 
         pred_norm = torch.norm(model_output.detach())
-        target_norm = torch.norm(v_target.detach())
+        target_norm = torch.norm(target.detach())
         pred_abs = torch.mean(torch.abs(model_output.detach()))
-        target_abs = torch.mean(torch.abs(v_target.detach()))
+        target_abs = torch.mean(torch.abs(target.detach()))
 
         metrics = {
             "loss": final_loss.detach(),
@@ -198,94 +257,26 @@ class FlowMatchingObjective(DiffusionObjective):
 
     def forward(
         self,
-        model,
-        x_start,
-        condition,
+        model: torch.nn.Module,
+        x_start: torch.Tensor,
+        condition: torch.Tensor,
         weights=None,
         attention_mask=None,
         pos_map=None,
-    ):
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Public entrypoint generating Gaussian noise and executing loss step.
+        """
         epsilon = torch.randn_like(x_start)
         if self.use_ot:
             epsilon = self._compute_ot_eps(x_start, epsilon)
 
         return self._compiled_loss_step(
-            model,
-            x_start,
-            condition,
-            epsilon,
+            model=model,
+            x_start=x_start,
+            condition=condition,
+            epsilon=epsilon,
             weights=weights,
             attention_mask=attention_mask,
             pos_map=pos_map,
         )
-
-
-class DDPMObjective(DiffusionObjective):
-    """
-    Standard DDPM Epsilon Prediction.
-    """
-
-    def __init__(
-        self,
-        schedule: BaseSchedule,
-        min_snr_gamma: float = 5.0,
-        input_perturb: float = 0.0,
-    ):
-        super().__init__(schedule)
-        self.min_snr_gamma = min_snr_gamma
-        self.input_perturb = input_perturb
-
-    def forward(self, model, x_start, condition, weights=None, attention_mask=None):
-        b, c, h, w = x_start.shape
-        device = x_start.device
-
-        t_idx = torch.randint(0, 1000, (b,), device=device).long()
-
-        # Normalize t for schedule query
-        t_norm = t_idx.float() / 1000.0
-
-        alpha, sigma, _, _ = self.schedule.get_coefficients(t_norm)
-        alpha = alpha.view(b, 1, 1, 1)
-        sigma = sigma.view(b, 1, 1, 1)
-
-        # Noise with Perturbation
-        noise = torch.randn_like(x_start)
-        if self.input_perturb > 0:
-            noise = noise + self.input_perturb * torch.rand_like(x_start)
-
-        x_t = alpha * x_start + sigma * noise
-
-        model_output = model(
-            x_t, t_idx, encoder_hidden_states=condition, attention_mask=attention_mask
-        )
-
-        loss = F.mse_loss(model_output, noise, reduction="none")
-        raw_loss = loss.mean(dim=[1, 2, 3])
-
-        v_pred_metrics = []
-        v_true_metrics = []
-        with torch.no_grad():
-            v_pred_metrics.append(torch.norm(model_output.detach()))
-            v_true_metrics.append(torch.norm(noise.detach()))
-            v_pred_metrics.append(torch.mean(torch.abs(model_output.detach())))
-            v_true_metrics.append(torch.mean(torch.abs(noise.detach())))
-
-        # Min-SNR Weighting
-        snr_weights = torch.ones_like(raw_loss)
-        if self.min_snr_gamma > 0.0:
-            snr = (alpha / sigma) ** 2
-            snr_weights = torch.clamp(self.min_snr_gamma / snr, max=1.0).squeeze()
-
-        loss = raw_loss * snr_weights
-
-        if weights is not None:
-            loss = loss * weights
-
-        return loss.mean(), {
-            "loss": loss.mean().detach(),
-            "raw_loss": raw_loss.mean().detach(),
-            "pred_norm": v_pred_metrics[0],
-            "pred_mean_abs": v_pred_metrics[1],
-            "target_norm": v_true_metrics[0],
-            "target_mean_abs": v_true_metrics[1],
-        }

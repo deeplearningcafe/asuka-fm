@@ -82,8 +82,19 @@ def generate_images_ui(
     coord_system = model_bundle["coord_system"]
     objective = cfg.train.get("objective", "flow_matching")
 
-    base_seed = seed if (seed is not None and seed >= 0) else random.randint(
-        0, 2**31 - 1
+    pixel_sampling = getattr(cfg.train, "pixel_training", False)
+    prediction_target = getattr(cfg.train, "prediction_target", "v")
+    noise_scale = float(getattr(cfg.train, "noise_scale", 1.0))
+    clip_prediction = getattr(cfg.sampling, "clip_prediction", pixel_sampling)
+    dynamic_thresholding = getattr(cfg.sampling, "dynamic_thresholding", pixel_sampling)
+    cfg_interval = getattr(
+        cfg.sampling,
+        "cfg_interval",
+        (0.11, 0.97) if pixel_sampling else (0.0, 1.0),
+    )
+
+    base_seed = (
+        seed if (seed is not None and seed >= 0) else random.randint(0, 2**31 - 1)
     )
 
     sample_configs = []
@@ -121,6 +132,12 @@ def generate_images_ui(
         vae_std=vae_std,
         in_channels=in_channels,
         coord_system=coord_system,
+        pixel_sampling=pixel_sampling,
+        prediction_target=prediction_target,
+        noise_scale=noise_scale,
+        clip_prediction=clip_prediction,
+        dynamic_thresholding=dynamic_thresholding,
+        cfg_interval=cfg_interval,
     )
 
     grid_img = make_image_grid(all_images)
@@ -145,9 +162,7 @@ def generate_images_ui(
             "seed": c["seed"],
             "objective": objective,
             "model_type": getattr(cfg.models, "model_type", "unet"),
-            "checkpoint": getattr(
-                cfg.models, "resume_from_checkpoint", "base"
-            ),
+            "checkpoint": getattr(cfg.models, "resume_from_checkpoint", "base"),
         }
         png_info = PngInfo()
         png_info.add_text("parameters", json.dumps(meta_payload))
@@ -159,11 +174,11 @@ def generate_images_ui(
         grid_info = PngInfo()
         grid_info.add_text(
             "parameters",
-            json.dumps({"prompt": prompt, "neg_prompt": neg_prompt, "base_seed": base_seed}),
+            json.dumps(
+                {"prompt": prompt, "neg_prompt": neg_prompt, "base_seed": base_seed}
+            ),
         )
-        grid_img.save(
-            os.path.join(save_path, f"grid_{ts_ms}.png"), pnginfo=grid_info
-        )
+        grid_img.save(os.path.join(save_path, f"grid_{ts_ms}.png"), pnginfo=grid_info)
 
     return [grid_img] + all_images if grid_img is not None else all_images
 
@@ -242,8 +257,7 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
                         )
                         neg_prompt = gr.Textbox(
                             value=(
-                                "very displeasing, displeasing, bad score, "
-                                "worse score"
+                                "very displeasing, displeasing, bad score, worse score"
                             ),
                             label="Negative Prompt",
                             lines=2,
@@ -251,10 +265,10 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
 
                         with gr.Row():
                             height = gr.Slider(
-                                128, 1024, value=256, step=64, label="Height"
+                                128, 2048, value=256, step=64, label="Height"
                             )
                             width = gr.Slider(
-                                128, 1024, value=256, step=64, label="Width"
+                                128, 2048, value=256, step=64, label="Width"
                             )
 
                         with gr.Row():
@@ -295,9 +309,7 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
                         output_dir = gr.Textbox(
                             value=default_out_dir, label="Output Root Directory"
                         )
-                        generate_btn = gr.Button(
-                            "Generate Samples", variant="primary"
-                        )
+                        generate_btn = gr.Button("Generate Samples", variant="primary")
 
                     with gr.Column(scale=1):
                         gallery = gr.Gallery(
@@ -440,10 +452,7 @@ def main():
     autocast_dtype = torch.bfloat16
     if torch.cuda.is_available():
         capability = torch.cuda.get_device_capability()
-        if capability[0] >= 7 and capability[0] < 8:
-            autocast_dtype = torch.float16
-            torch.set_float32_matmul_precision("high")
-        elif capability[0] >= 8:
+        if capability[0] >= 8:
             torch.set_float32_matmul_precision("medium")
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cuda.matmul.allow_tf32 = True

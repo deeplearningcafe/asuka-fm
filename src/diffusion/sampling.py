@@ -128,6 +128,34 @@ def compute_inference_pos_map(
     return pos_map.to(dtype=dtype)
 
 
+def apply_dynamic_threshold(
+    pred_x: torch.Tensor,
+    percentile: float = 0.995,
+    max_val: float = 1.0,
+) -> torch.Tensor:
+    """
+    Applies Imagen-style dynamic thresholding across spatial dimensions
+    to preserve chromaticity ratios and prevent color gamut burn.
+    """
+    if not (0.0 < percentile <= 1.0):
+        return pred_x.clamp(-max_val, max_val)
+
+    orig_dtype = pred_x.dtype
+    bsz = pred_x.shape[0]
+    flat = pred_x.detach().abs().reshape(bsz, -1)
+
+    num_elements = flat.shape[1]
+    k = min(num_elements, max(1, int(num_elements * percentile)))
+
+    s = torch.kthvalue(flat, k, dim=1).values
+    s = torch.clamp(s, min=max_val)
+
+    view_shape = (bsz,) + (1,) * (pred_x.ndim - 1)
+    s = s.view(view_shape).to(orig_dtype)
+
+    return (pred_x / s).clamp(-max_val, max_val)
+
+
 class CFGModelWrapper:
     """
     Wraps the model for CFG. When cfg_scale <= 1.0 or unconditional
@@ -146,6 +174,7 @@ class CFGModelWrapper:
         use_unet_mult: bool = True,
         pos_map: Optional[torch.Tensor] = None,
         is_conditional: bool = True,
+        cfg_interval: tuple[float, float] = (0.0, 1.0),
     ):
         self.unet = unet
         self.combined_embeddings = combined_embeddings
@@ -157,11 +186,15 @@ class CFGModelWrapper:
         self.use_unet_mult = use_unet_mult
         self.pos_map = pos_map
         self.is_conditional = is_conditional
+        self.cfg_interval = tuple(cfg_interval)
 
     def __call__(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         batch_size = x.shape[0]
 
-        if self.is_conditional and self.cfg_scale > 1.0:
+        t_val = t[0].item() / 1000.0 if self.use_unet_mult else t[0].item()
+        in_interval = self.cfg_interval[0] <= t_val <= self.cfg_interval[1]
+        active_cfg = self.cfg_scale if in_interval else 1.0
+        if self.is_conditional and active_cfg > 1.0:
             x_in = torch.cat([x] * 2, dim=0)
             t_in = torch.cat([t] * 2, dim=0)
             t_model = t_in * 1000.0 if self.use_unet_mult else t_in
@@ -181,7 +214,7 @@ class CFGModelWrapper:
                     **model_kwargs,
                 )
             out_uncond, out_cond = out.chunk(2, dim=0)
-            return out_uncond + self.cfg_scale * (out_cond - out_uncond)
+            return out_uncond + active_cfg * (out_cond - out_uncond)
         else:
             t_model = t * 1000.0 if self.use_unet_mult else t
             model_kwargs = {}
@@ -220,12 +253,18 @@ def linear_shift_schedule(steps, shift=1.0):
 @torch.no_grad()
 def sample_euler(
     model_wrapper: CFGModelWrapper,
+    schedule: BaseSchedule,
     x: torch.Tensor,
+    prediction_target: str = "v",
     num_steps: int = 25,
     shift: float = 1.0,
+    clip_prediction: bool = False,
+    noise_scale: float = 1.0,
+    dynamic_thresholding: bool = False,
 ) -> torch.Tensor:
     """
-    Standard Forward Euler ODE Solver integrating t=0 (Noise) -> t=1 (Data).
+    Forward Euler ODE Solver integrating t=0 (Noise) -> t=1 (Data)
+    with prediction target inversion, noise scale, and thresholding.
     """
     device = x.device
     z = x.clone()
@@ -241,8 +280,42 @@ def sample_euler(
         dt = dt_steps[i]
 
         t_input = torch.full((z.shape[0],), t_curr, device=device)
-        v_pred = model_wrapper(z, t_input)
-        z = z + v_pred * dt
+        pred = model_wrapper(z, t_input)
+
+        view_shape = (-1,) + (1,) * (z.ndim - 1)
+        alpha, sigma, d_alpha, d_sigma = [
+            coeff.view(view_shape) for coeff in schedule.get_coefficients(t_input)
+        ]
+
+        if noise_scale != 1.0:
+            sigma = sigma * noise_scale
+            d_sigma = d_sigma * noise_scale
+
+        if prediction_target == "v":
+            v = pred
+        elif prediction_target == "x":
+            # Dynamic thresholding or clamping on x0 prediction
+            if dynamic_thresholding:
+                pred = apply_dynamic_threshold(pred)
+            elif clip_prediction:
+                pred = pred.clamp(-1.0, 1.0)
+
+            sigma_safe = sigma.clamp(min=1e-5)
+            eps_recon = (z - alpha * pred) / sigma_safe
+            v = d_alpha * pred + d_sigma * eps_recon
+        elif prediction_target == "eps":
+            alpha_safe = alpha.clamp(min=1e-5)
+            x_recon = (z - sigma * pred) / alpha_safe
+            if clip_prediction:
+                x_recon = x_recon.clamp(-1.0, 1.0)
+            v = d_alpha * x_recon + d_sigma * pred
+        else:
+            raise ValueError(f"Unknown prediction target: {prediction_target}")
+
+        z = z + v * dt
+
+    if clip_prediction:
+        z = z.clamp(-1.0, 1.0)
 
     return z
 
@@ -360,6 +433,11 @@ def generate_samples(
     in_channels: int = 4,
     coord_system: str = "aspect_norm",
     pixel_sampling: bool = False,
+    prediction_target: str = "v",
+    noise_scale: float = 1.0,
+    clip_prediction: bool = False,
+    dynamic_thresholding: bool = False,
+    cfg_interval: tuple[float, float] = (0.0, 1.0),
 ) -> List[Image.Image]:
     """
     Main entry point for generating samples during training.
@@ -417,6 +495,7 @@ def generate_samples(
                         generator=gen,
                         dtype=dtype,
                     )
+                    lat = lat * noise_scale
                     latents_list.append(lat)
                 latents = torch.cat(latents_list, dim=0)
 
@@ -493,6 +572,7 @@ def generate_samples(
                     attention_mask=attention_mask,
                     use_unet_mult=use_unet_mult,
                     pos_map=pos_map,
+                    cfg_interval=cfg_interval,
                 )
 
                 # 6. Trajectory integration (DDPM or Flow Matching Euler ODE)
@@ -502,7 +582,15 @@ def generate_samples(
                     latents = sample_ddpm(model_wrapper, schedule, latents, steps)
                 else:
                     latents = sample_euler(
-                        model_wrapper, latents, num_steps=steps, shift=shift
+                        model_wrapper=model_wrapper,
+                        schedule=schedule,
+                        x=latents,
+                        prediction_target=prediction_target,
+                        num_steps=steps,
+                        shift=shift,
+                        clip_prediction=clip_prediction,
+                        noise_scale=noise_scale,
+                        dynamic_thresholding=dynamic_thresholding,
                     )
 
                 # 7. VAE Decode into original index locations

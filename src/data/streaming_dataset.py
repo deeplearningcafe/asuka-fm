@@ -175,6 +175,7 @@ class StreamingImageDataset(IterableDataset):
         is_latent: bool = False,
         coord_system: str = "aspect_norm",
         pixel_training: bool = False,
+        target_aesthetic_tiers: list[int] | tuple[int, ...] | None = None,
     ):
         super().__init__()
         self.pixel_training = pixel_training
@@ -202,7 +203,30 @@ class StreamingImageDataset(IterableDataset):
         self.coord_system = coord_system
 
         self.metadata = self._load_metadata(dataset_name)
-        self.total_samples = int(self.metadata.get("total_samples", 0))
+
+        raw_total = int(self.metadata.get("total_samples", 0))
+        self.aesthetic_tier_counts = self.metadata.get("aesthetic_tier_counts", {})
+
+        if self.target_aesthetic_tiers is not None and raw_total > 0:
+            exact_count = 0
+            has_counts = False
+            for tier in self.target_aesthetic_tiers:
+                # int or str support
+                count = self.aesthetic_tier_counts.get(
+                    str(tier), self.aesthetic_tier_counts.get(tier, None)
+                )
+                if count is not None:
+                    exact_count += int(count)
+                    has_counts = True
+
+            if has_counts and exact_count > 0:
+                self.total_samples = exact_count
+            else:
+                tier_ratio = len(self.target_aesthetic_tiers) / 5.0
+                self.total_samples = max(1, int(raw_total * tier_ratio))
+        else:
+            self.total_samples = raw_total
+
         self.num_shards = int(
             self.metadata.get("num_shards", len(self.metadata.get("shards", [])))
         )
@@ -316,6 +340,15 @@ class StreamingImageDataset(IterableDataset):
             warnings_msg = f"Could not load metadata.json for {dataset_name}: {e}"
             print(f"[Warning] {warnings_msg}")
             return {}
+
+    def _is_target_aesthetic(self, sample: dict) -> bool:
+        """Validates aesthetic tier safely against target whitelist."""
+        if self.target_aesthetic_tiers is None:
+            return True
+        raw_val = sample.get("aesthetic_tier")
+        if raw_val is None:
+            return False
+        return int(raw_val) in self.target_aesthetic_tiers
 
     def _process_latent_sample(
         self, sample: dict
@@ -487,6 +520,8 @@ class StreamingImageDataset(IterableDataset):
         while retries < max_retries:
             try:
                 for sample in self._get_worker_stream():
+                    if not self._is_target_aesthetic(sample):
+                        continue
                     yield sample
                 break
             except RuntimeError as e:
@@ -506,7 +541,7 @@ class StreamingImageDataset(IterableDataset):
                     raise e
 
     def __iter__(self):
-        for sample in self._get_worker_stream():
+        for sample in self.iter_raw():
             try:
                 yield self._process_sample(sample)
             except Exception:
@@ -635,7 +670,7 @@ class PrecomputeExtractDataset(IterableDataset):
     def __iter__(self):
         # Iterating hf_dataset within a DataLoader worker automatically
         # slices the assigned shard subset via get_worker_info().
-        for raw_sample in self.streaming_dataset.hf_dataset:
+        for raw_sample in self.streaming_dataset.iter_raw():
             try:
                 if self.streaming_dataset.is_latent or "latent" in raw_sample:
                     raw_bytes = raw_sample.get("latent")

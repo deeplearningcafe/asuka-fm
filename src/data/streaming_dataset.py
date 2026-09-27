@@ -7,6 +7,7 @@ import argparse
 from pathlib import Path
 from collections import Counter, defaultdict
 import warnings
+from typing import Any, Optional, Union
 
 import torch
 import json
@@ -14,7 +15,7 @@ from torch.utils.data import IterableDataset, DataLoader
 from huggingface_hub import hf_hub_download
 from torchvision.transforms import v2
 from PIL import Image, ImageFile, PngImagePlugin
-from datasets import load_dataset
+from datasets import load_dataset, interleave_datasets
 import pyarrow
 import pyarrow.dataset
 import fsspec.spec
@@ -29,6 +30,58 @@ from src.models.text_encoders.tokenizer import BaseTokenizer
 PngImagePlugin.MAX_TEXT_CHUNK = 64 * 1024 * 1024
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
+
+
+def _normalize_string_list(val: Any) -> list[str]:
+    """Normalizes str, list, tuple, or OmegaConf ListConfig to str list."""
+    if val is None:
+        return []
+    if isinstance(val, (list, tuple)):
+        return [str(v) for v in val]
+    if hasattr(val, "__iter__") and not isinstance(val, (str, bytes, dict)):
+        return [str(v) for v in val]
+    return [str(val)]
+
+
+def _load_single_dataset(
+    path_or_name: str,
+    is_local: bool,
+    storage_options: dict,
+    scan_options: Any,
+) -> Any:
+    """Loads a single streaming IterableDataset from local path or Hub."""
+    if is_local:
+        dir_path = Path(path_or_name)
+        if not dir_path.is_dir():
+            if dir_path.is_file() and dir_path.suffix == ".parquet":
+                parquet_files = [str(dir_path)]
+            else:
+                raise FileNotFoundError(
+                    f"Local dataset path does not exist: {dir_path}"
+                )
+        else:
+            parquet_files = sorted(
+                [str(p) for p in dir_path.glob("data_shard_*.parquet")]
+            )
+            if not parquet_files:
+                parquet_files = sorted([str(p) for p in dir_path.rglob("*.parquet")])
+            if not parquet_files:
+                raise FileNotFoundError(f"No parquet shards found in: {dir_path}")
+        logging.info(f"Found {len(parquet_files)} parquet shards in {dir_path}.")
+        return load_dataset(
+            "parquet",
+            data_files={"train": parquet_files},
+            split="train",
+            streaming=True,
+        )
+    return load_dataset(
+        path_or_name,
+        data_files={"train": "data_shard_*.parquet"},
+        split="train",
+        streaming=True,
+        storage_options=storage_options,
+        fragment_scan_options=scan_options,
+    )
 
 
 def _reset_http_sessions() -> None:
@@ -176,6 +229,9 @@ class StreamingImageDataset(IterableDataset):
         coord_system: str = "aspect_norm",
         pixel_training: bool = False,
         target_aesthetic_tiers: list[int] | tuple[int, ...] | None = None,
+        probabilities: Optional[list[float]] = None,
+        stopping_strategy: str = "all_exhausted",
+        seed: int = 42,
     ):
         super().__init__()
         self.pixel_training = pixel_training
@@ -183,6 +239,9 @@ class StreamingImageDataset(IterableDataset):
         self.dataset_path = dataset_path
         self.resolution = resolution
         self.patch_size = patch_size
+        self.probabilities = probabilities
+        self.stopping_strategy = stopping_strategy
+        self.seed = seed
 
         # In pixel space, there is no VAE downsampling (factor = 1)
         if self.pixel_training:
@@ -202,7 +261,12 @@ class StreamingImageDataset(IterableDataset):
         self.is_latent = is_latent
         self.coord_system = coord_system
 
-        self.metadata = self._load_metadata(dataset_name)
+        local_paths = _normalize_string_list(dataset_path)
+        remote_names = _normalize_string_list(dataset_name)
+        is_local = len(local_paths) > 0
+        sources = local_paths if is_local else remote_names
+
+        self.metadata = self._load_metadata(sources)
 
         raw_total = int(self.metadata.get("total_samples", 0))
         self.aesthetic_tier_counts = self.metadata.get("aesthetic_tier_counts", {})
@@ -226,6 +290,19 @@ class StreamingImageDataset(IterableDataset):
                 self.total_samples = max(1, int(raw_total * tier_ratio))
         else:
             self.total_samples = raw_total
+
+        num_sources = len(sources)
+        probs = (
+            self.probabilities
+            if self.probabilities is not None
+            else [1.0 / max(1, num_sources)] * num_sources
+        )
+        if num_sources > 1 and self.stopping_strategy == "all_exhausted":
+            per_ds = self.metadata.get("per_dataset_samples", [])
+            if len(per_ds) == num_sources and all(c > 0 for c in per_ds):
+                self.total_samples = int(max(c / p for c, p in zip(per_ds, probs)))
+            else:
+                self.total_samples = int(self.total_samples * num_sources)
 
         self.num_shards = int(
             self.metadata.get("num_shards", len(self.metadata.get("shards", [])))
@@ -262,36 +339,38 @@ class StreamingImageDataset(IterableDataset):
             }
             logging.info("Using high ram settings!")
 
-        if dataset_path is not None:
-            dataset_path = Path(dataset_path)
-            if dataset_path.is_dir():
-                parquet_files = sorted(
-                    [str(p) for p in dataset_path.glob("data_shard_*.parquet")]
-                )
-                if not parquet_files:
-                    parquet_files = sorted(
-                        [str(p) for p in dataset_path.rglob("*.parquet")]
-                    )
-                if not parquet_files:
-                    raise FileNotFoundError(
-                        f"No parquet shards found in: {dataset_path}"
-                    )
-                logging.info(f"Found {len(parquet_files)} local parquet shards.")
-                self.hf_dataset = load_dataset(
-                    "parquet",
-                    data_files={"train": parquet_files},
-                    split="train",
-                    streaming=True,
-                )
-        else:
-            # Explicitly match all 34 root data_shard_*.parquet files on Hub
-            self.hf_dataset = load_dataset(
-                dataset_name,
-                data_files={"train": "data_shard_*.parquet"},
-                split="train",
-                streaming=True,
+        datasets_list = []
+        for src in sources:
+            ds = _load_single_dataset(
+                src,
+                is_local=is_local,
                 storage_options=storage_options,
-                fragment_scan_options=scan_options,
+                scan_options=scan_options,
+            )
+            datasets_list.append(ds)
+
+        if len(datasets_list) == 1:
+            self.hf_dataset = datasets_list[0]
+        else:
+            # Align common columns to prevent schema mismatch exceptions
+            all_cols = [
+                set(ds.column_names)
+                for ds in datasets_list
+                if getattr(ds, "column_names", None)
+            ]
+            if len(all_cols) == len(datasets_list) and len(all_cols) > 1:
+                common_cols = sorted(list(set.intersection(*all_cols)))
+                datasets_list = [ds.select_columns(common_cols) for ds in datasets_list]
+
+            logging.info(
+                f"Interleaving {len(datasets_list)} datasets with probs "
+                f"{probs} and strategy '{self.stopping_strategy}'."
+            )
+            self.hf_dataset = interleave_datasets(
+                datasets_list,
+                probabilities=probs,
+                seed=self.seed,
+                stopping_strategy=self.stopping_strategy,
             )
 
         detected_shards = getattr(
@@ -321,25 +400,55 @@ class StreamingImageDataset(IterableDataset):
             ]
         )
 
-    def _load_metadata(self, dataset_name: str) -> dict:
-        """Loads metadata.json from local path or downloads from HF Hub."""
-        local_path = Path(dataset_name) / "metadata.json"
+    def _load_single_metadata(self, name_or_path: str) -> dict:
+        """Loads metadata.json from local directory or HuggingFace Hub."""
+        local_path = Path(name_or_path) / "metadata.json"
         if local_path.exists():
-            with open(local_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            try:
+                with open(local_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logging.warning(f"Failed to read {local_path}: {e}")
 
         try:
             downloaded = hf_hub_download(
-                repo_id=dataset_name,
+                repo_id=name_or_path,
                 filename="metadata.json",
                 repo_type="dataset",
             )
             with open(downloaded, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            warnings_msg = f"Could not load metadata.json for {dataset_name}: {e}"
-            print(f"[Warning] {warnings_msg}")
+            logging.warning(f"Could not load metadata.json for {name_or_path}: {e}")
             return {}
+
+    def _load_metadata(self, names_or_paths: list[str]) -> dict:
+        """Aggregates metadata across single or multiple dataset sources."""
+        combined = {
+            "total_samples": 0,
+            "aesthetic_tier_counts": defaultdict(int),
+            "length_tiers": [77, 152, 227],
+            "samples_per_shard": 10000,
+            "shards": [],
+            "per_dataset_samples": [],
+        }
+        for item in names_or_paths:
+            meta = self._load_single_metadata(item)
+            count = int(meta.get("total_samples", 0))
+            combined["per_dataset_samples"].append(count)
+            combined["total_samples"] += count
+
+            for tier, c in meta.get("aesthetic_tier_counts", {}).items():
+                combined["aesthetic_tier_counts"][str(tier)] += int(c)
+
+            if "length_tiers" in meta:
+                combined["length_tiers"] = meta["length_tiers"]
+            if "samples_per_shard" in meta:
+                combined["samples_per_shard"] = meta["samples_per_shard"]
+            combined["shards"].extend(meta.get("shards", []))
+
+        combined["aesthetic_tier_counts"] = dict(combined["aesthetic_tier_counts"])
+        return combined
 
     def _is_target_aesthetic(self, sample: dict) -> bool:
         """Validates aesthetic tier safely against target whitelist."""

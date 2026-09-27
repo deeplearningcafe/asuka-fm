@@ -249,7 +249,7 @@ def setup_cuda_environment(
     return device_obj, autocast_dtype
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def generate_and_upload_synthetic(
     cfg: DictConfig,
     src_dataset: Optional[str] = None,
@@ -266,7 +266,9 @@ def generate_and_upload_synthetic(
     ),
     resolution: Optional[int] = None,
     target_aesthetic_tiers: Optional[List[int]] = None,
-    vae_batch_size: int = 16,
+    vae_batch_size: int = 4,
+    cfg_interval: Tuple[float, float] = (0.08, 0.92),
+    compile_vae: bool = True,
     preview_dir: Optional[str] = None,
     avif_quality: int = 80,
     avif_speed: int = 6,
@@ -302,6 +304,13 @@ def generate_and_upload_synthetic(
     vae.eval().requires_grad_(False)
     unet = torch.compile(unet)
     text_encoder = torch.compile(text_encoder)
+
+    if compile_vae and hasattr(torch, "compile"):
+        try:
+            logging.info("Compiling VAE decode stage with torch.compile...")
+            vae.decode = torch.compile(vae.decode)
+        except Exception as e:
+            logging.warning(f"Could not compile VAE decode: {e}")
 
     diffusion_type = cfg.train.get("objective", "flow_matching")
     if diffusion_type == "flow_matching":
@@ -373,14 +382,66 @@ def generate_and_upload_synthetic(
     batch_metas: List[Dict[str, Any]] = []
     has_saved_preview = False
 
-    def _process_batch():
+    pipeline_executor = ThreadPoolExecutor(max_workers=1)
+    pending_encode_future: Optional[Future] = None
+
+    def _sync_encode_and_stage(
+        images: List[Image.Image],
+        metas: List[Dict[str, Any]],
+    ) -> None:
+        """Encodes images to AVIF and stages columns in background thread."""
         nonlocal shard_counter, current_shard_columns, current_shard_count
-        nonlocal total_generated, has_saved_preview
+        nonlocal total_generated
+
+        with ThreadPoolExecutor(max_workers=min(len(images), 8)) as ex:
+            avif_bytes = list(
+                ex.map(
+                    lambda im: image_to_avif_bytes(
+                        im, quality=avif_quality, speed=avif_speed
+                    ),
+                    images,
+                )
+            )
+
+        n_done = len(metas)
+        current_shard_columns["booru_id"].extend([m["booru_id"] for m in metas])
+        current_shard_columns["image"].extend(avif_bytes)
+        current_shard_columns["prompt"].extend([m["prompt"] for m in metas])
+        current_shard_columns["bucket_idx"].extend([m["bucket_idx"] for m in metas])
+        current_shard_columns["target_width"].extend([m["target_width"] for m in metas])
+        current_shard_columns["target_height"].extend(
+            [m["target_height"] for m in metas]
+        )
+        current_shard_columns["original_width"].extend(
+            [m["original_width"] for m in metas]
+        )
+        current_shard_columns["original_height"].extend(
+            [m["original_height"] for m in metas]
+        )
+        current_shard_columns["aspect_ratio"].extend([m["aspect_ratio"] for m in metas])
+        current_shard_columns["tier"].extend([m["tier"] for m in metas])
+        current_shard_columns["aesthetic_tier"].extend(
+            [m["aesthetic_tier"] for m in metas]
+        )
+        current_shard_columns["tag_weight"].extend([m["tag_weight"] for m in metas])
+
+        current_shard_count += n_done
+        total_generated += n_done
+        pbar.update(n_done)
+
+        if current_shard_count >= samples_per_shard:
+            meta_info = uploader.stage_and_upload(current_shard_columns, shard_counter)
+            shard_metadata_list.append(meta_info)
+            shard_counter += 1
+            current_shard_columns = create_empty_columns()
+            current_shard_count = 0
+
+    def _process_batch():
+        nonlocal pending_encode_future, has_saved_preview
 
         if not batch_configs:
             return
 
-        # Generate images through latent diffusion and decode to RGB PIL
         images = generate_samples(
             unet=unet,
             text_encoder=text_encoder,
@@ -400,76 +461,31 @@ def generate_and_upload_synthetic(
             coord_system=coord_system,
             pixel_sampling=False,
             vae_batch_size=vae_batch_size,
+            cfg_interval=cfg_interval,
         )
 
-        # Save first batch 16-sample grid and JSON metadata to disk
         if preview_dir and not has_saved_preview and len(images) >= 16:
             p_dir = Path(preview_dir)
             p_dir.mkdir(parents=True, exist_ok=True)
-
             grid_img = make_preview_grid(images[:16], cols=4, rows=4)
             grid_img.save(p_dir / "preview_grid.png")
-
             with open(p_dir / "first_batch_meta.json", "w", encoding="utf-8") as f:
                 json.dump(batch_metas[:16], f, indent=4)
-
-            logging.info(f"Saved 16-sample preview grid and metadata to {p_dir}.")
+            logging.info(f"Saved 16-sample preview grid to {p_dir}.")
             has_saved_preview = True
 
-        # Encode PIL images to AVIF binary format in memory concurrently
-        with ThreadPoolExecutor(max_workers=min(len(images), 8)) as ex:
-            avif_bytes = list(
-                ex.map(
-                    lambda im: image_to_avif_bytes(
-                        im, quality=avif_quality, speed=avif_speed
-                    ),
-                    images,
-                )
-            )
+        if pending_encode_future is not None:
+            pending_encode_future.result()
 
-        n_done = len(batch_configs)
-        current_shard_columns["booru_id"].extend([m["booru_id"] for m in batch_metas])
-        current_shard_columns["image"].extend(avif_bytes)
-        current_shard_columns["prompt"].extend([m["prompt"] for m in batch_metas])
-        current_shard_columns["bucket_idx"].extend(
-            [m["bucket_idx"] for m in batch_metas]
+        # Dispatch current batch encoding to background thread
+        pending_encode_future = pipeline_executor.submit(
+            _sync_encode_and_stage,
+            images,
+            list(batch_metas),
         )
-        current_shard_columns["target_width"].extend(
-            [m["target_width"] for m in batch_metas]
-        )
-        current_shard_columns["target_height"].extend(
-            [m["target_height"] for m in batch_metas]
-        )
-        current_shard_columns["original_width"].extend(
-            [m["original_width"] for m in batch_metas]
-        )
-        current_shard_columns["original_height"].extend(
-            [m["original_height"] for m in batch_metas]
-        )
-        current_shard_columns["aspect_ratio"].extend(
-            [m["aspect_ratio"] for m in batch_metas]
-        )
-        current_shard_columns["tier"].extend([m["tier"] for m in batch_metas])
-        current_shard_columns["aesthetic_tier"].extend(
-            [m["aesthetic_tier"] for m in batch_metas]
-        )
-        current_shard_columns["tag_weight"].extend(
-            [m["tag_weight"] for m in batch_metas]
-        )
-
-        current_shard_count += n_done
-        total_generated += n_done
-        pbar.update(n_done)
 
         batch_configs.clear()
         batch_metas.clear()
-
-        if current_shard_count >= samples_per_shard:
-            meta_info = uploader.stage_and_upload(current_shard_columns, shard_counter)
-            shard_metadata_list.append(meta_info)
-            shard_counter += 1
-            current_shard_columns = create_empty_columns()
-            current_shard_count = 0
 
     sample_seed = cfg.train.get("seed", 42)
 
@@ -529,6 +545,10 @@ def generate_and_upload_synthetic(
 
     if batch_configs and total_generated < max_samples:
         _process_batch()
+
+    if pending_encode_future is not None:
+        pending_encode_future.result()
+    pipeline_executor.shutdown(wait=True)
 
     if current_shard_count > 0:
         meta_info = uploader.stage_and_upload(current_shard_columns, shard_counter)
@@ -611,6 +631,13 @@ def main():
         help="Classifier-free guidance scale.",
     )
     parser.add_argument(
+        "--cfg_interval",
+        nargs=2,
+        type=float,
+        default=[0.08, 0.92],
+        help="Active interval [min, max] for CFG application.",
+    )
+    parser.add_argument(
         "--shift",
         type=float,
         default=1.0,
@@ -640,6 +667,12 @@ def main():
         type=int,
         default=16,
         help="Batch size for VAE decoding.",
+    )
+    parser.add_argument(
+        "--compile_vae",
+        action="store_true",
+        default=True,
+        help="Compile VAE decoder to optimize memory bandwidth on A40.",
     )
     parser.add_argument(
         "--avif_quality",

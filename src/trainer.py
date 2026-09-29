@@ -55,6 +55,32 @@ class Trainer:
         self.noise_scale = float(getattr(cfg.train, "noise_scale", 1.0))
         self.pixel_training = getattr(cfg.train, "pixel_training", False)
 
+        latent_checkpoint = getattr(
+            cfg.models,
+            "latent_checkpoint",
+            getattr(cfg.train, "latent_checkpoint", None),
+        )
+        pixel_dir = getattr(
+            cfg.models,
+            "pixel_dir",
+            getattr(cfg.models, "output_head_path", None),
+        )
+        resume_checkpoint = getattr(cfg.models, "resume_from_checkpoint", None)
+
+        if (
+            self.pixel_training
+            and getattr(cfg.train, "train_only_output", False)
+            and resume_checkpoint
+            and not latent_checkpoint
+        ):
+            if self.global_rank == 0:
+                logging.warning(
+                    f"Redirecting 'resume_from_checkpoint' ({resume_checkpoint}) "
+                    f"to 'latent_checkpoint' for Stage-1 pixel adaptation."
+                )
+            latent_checkpoint = resume_checkpoint
+            resume_checkpoint = None
+
         self.unet, self.text_encoder, self.vae, self.tokenizer, self.ema = (
             load_trainable_model(
                 models_path=cfg.paths.models,
@@ -71,6 +97,8 @@ class Trainer:
                 model_type=self.model_type,
                 model_cfg=cfg.models,
                 autocast_dtype=self.autocast_dtype,
+                latent_checkpoint=latent_checkpoint,
+                pixel_dir=pixel_dir,
             )
         )
         # TODO: could compile vae?

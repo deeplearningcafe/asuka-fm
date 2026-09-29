@@ -107,7 +107,7 @@ def save_checkpoint(
         clean_unet_dict = {
             k: v
             for k, v in clean_unet_dict.items()
-            if any(mod in k for mod in PIXEL_EXPLICIT_MODULES)
+            if set(k.split(".")) & PIXEL_EXPLICIT_MODULES
         }
 
     save_file(clean_unet_dict, os.path.join(checkpoint_dir, "unet.safetensors"))
@@ -130,7 +130,7 @@ def save_checkpoint(
             clean_ema_dict = {
                 k: v
                 for k, v in clean_ema_dict.items()
-                if any(mod in k for mod in PIXEL_EXPLICIT_MODULES)
+                if set(k.split(".")) & PIXEL_EXPLICIT_MODULES
             }
         save_file(
             clean_ema_dict,
@@ -231,6 +231,115 @@ def load_checkpoint_config(checkpoint_dir: str) -> dict:
     return {}
 
 
+def load_latent_to_pixel_weights(
+    model: torch.nn.Module,
+    checkpoint_path: str,
+    ema: Any = None,
+    prefer_ema: bool = True,
+) -> torch.nn.Module:
+    """
+    Transfers Transformer backbone and conditioning weights from a latent
+    checkpoint to a pixel DiT model. Explicitly skips patch embedders and
+    pixel decoders with granular logging.
+    """
+    logging.info(f"Transferring latent priors from: {checkpoint_path}")
+    cand_path = checkpoint_path
+    if os.path.isdir(checkpoint_path):
+        for fname in ["unet.safetensors", "model.safetensors"]:
+            p = os.path.join(checkpoint_path, fname)
+            if os.path.exists(p):
+                cand_path = p
+                break
+
+    if not os.path.isfile(cand_path):
+        raise FileNotFoundError(f"Latent checkpoint not found at: {checkpoint_path}")
+
+    sd = load_file(cand_path, device="cpu")
+    if "ema_model" in sd and prefer_ema:
+        sd = sd["ema_model"]
+    elif "model" in sd:
+        sd = sd["model"]
+    elif "state_dict" in sd:
+        sd = sd["state_dict"]
+
+    target_state = model.state_dict()
+    target_key_map = {_normalize_param_key(k): k for k in target_state.keys()}
+
+    clean_sd = {}
+    transferred = []
+    skipped = []
+
+    for k, v in sd.items():
+        if k.startswith("text_enc."):
+            continue
+        norm_k = _normalize_param_key(k)
+        if norm_k not in target_key_map:
+            continue
+
+        real_k = target_key_map[norm_k]
+        target_p = target_state[real_k]
+
+        # Check for pixel-specific module names
+        parts = set(norm_k.split("."))
+        is_pixel_mod = bool(parts & PIXEL_EXPLICIT_MODULES)
+
+        # 1. Exact shape match: load if not an explicit pixel module
+        if target_p.shape == v.shape:
+            if is_pixel_mod and ("x_embedder" in norm_k or "conv_in" in norm_k):
+                # Guard against reusing latent patch embed bias across spaces
+                skipped.append(f"{real_k} (isolated pixel embedder bias reset)")
+                continue
+            clean_sd[real_k] = v
+            transferred.append(real_k)
+
+        # 2. Patch embedding spatial adaptation (ps16 -> ps32)
+        elif "x_embedder.weight" in norm_k or "conv_in.weight" in norm_k:
+            if v.ndim == 4 and target_p.ndim == 4 and v.shape[1] != target_p.shape[1]:
+                skipped.append(
+                    f"{real_k} (in_channels mismatch: ckpt "
+                    f"{v.shape[1]} vs model {target_p.shape[1]})"
+                )
+                continue
+            try:
+                adapted_v = adapt_patch_embed_weight(v, target_p.shape)
+                if adapted_v.shape == target_p.shape:
+                    clean_sd[real_k] = adapted_v
+                    transferred.append(real_k)
+                else:
+                    skipped.append(
+                        f"{real_k} (adapted {adapted_v.shape} != {target_p.shape})"
+                    )
+            except Exception as e:
+                skipped.append(f"{real_k} ({e})")
+        else:
+            skipped.append(f"{real_k} (shape {v.shape} != target {target_p.shape})")
+
+    model.load_state_dict(clean_sd, strict=False)
+
+    missing_in_ckpt = [
+        k for k in target_state.keys() if _normalize_param_key(k) not in clean_sd
+    ]
+
+    logging.info(
+        f"Successfully transferred {len(transferred)} layers from {checkpoint_path}."
+    )
+    logging.info(
+        f"Skipped {len(skipped)} non-matching layers (expected for patch "
+        f"embedder and pixel decoder): {skipped[:3]}"
+    )
+    logging.info(
+        f"{len(missing_in_ckpt)} model layers freshly initialized (not "
+        f"present in latent checkpoint)."
+    )
+
+    if ema is not None and getattr(ema, "use_ema", False):
+        logging.info("Synchronizing target EMA shadow weights with model...")
+        if hasattr(ema, "initialize"):
+            ema.initialize(model)
+
+    return model
+
+
 def load_pixel_weights(
     model: torch.nn.Module,
     checkpoint_path: str,
@@ -261,16 +370,26 @@ def load_pixel_weights(
 
     for k, v in state_dict.items():
         norm_k = _normalize_param_key(k)
-        if any(mod in norm_k for mod in PIXEL_EXPLICIT_MODULES):
-            if norm_k in target_key_map:
-                target_key = target_key_map[norm_k]
-                if target_state[target_key].shape == v.shape:
-                    pixel_dict[target_key] = v
-                else:
-                    logging.warning(
-                        f"Skipping pixel layer {target_key} due to shape "
-                        f"mismatch: {target_state[target_key].shape} vs {v.shape}"
-                    )
+        parts = set(norm_k.split("."))
+        if not (parts & PIXEL_EXPLICIT_MODULES):
+            continue
+
+        if norm_k in target_key_map:
+            target_key = target_key_map[norm_k]
+            target_p = target_state[target_key]
+            if target_p.shape == v.shape:
+                pixel_dict[target_key] = v
+            elif "x_embedder.weight" in norm_k or "conv_in.weight" in norm_k:
+                pixel_dict[target_key] = adapt_patch_embed_weight(v, target_p.shape)
+                logging.info(
+                    f"Adapted pixel weight '{target_key}' from {v.shape} "
+                    f"to {target_p.shape}."
+                )
+            else:
+                logging.warning(
+                    f"Skipping pixel layer {target_key} due to shape mismatch: "
+                    f"{target_p.shape} vs {v.shape}"
+                )
 
     if not pixel_dict:
         raise KeyError(
@@ -292,8 +411,7 @@ def load_pixel_weights(
             norm_k = _normalize_param_key(k)
             if norm_k in ema_key_map:
                 target_k = ema_key_map[norm_k]
-                if ema_target[target_k].shape == v.shape:
-                    clean_ema[target_k] = v
+                clean_ema[target_k] = v
 
         if clean_ema:
             if hasattr(ema, "ema_model") and ema.ema_model is not None:

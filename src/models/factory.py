@@ -22,6 +22,7 @@ from src.models.text_encoders.text_encoders import (
 from src.models.text_encoders.tokenizer import HFLLMTokenizer
 from src.utils.checkpointing import (
     load_pixel_weights,
+    load_latent_to_pixel_weights,
     _normalize_param_key,
     PIXEL_EXPLICIT_MODULES,
     adapt_patch_embed_weight,
@@ -138,6 +139,48 @@ class ModelInspector:
         logging.info("Removed all stability check hooks.")
 
 
+def set_trainable_layers(
+    model: nn.Module,
+    train_output_only: bool = False,
+) -> nn.Module:
+    """
+    Configures parameter gradients for two-stage adaptation.
+    If train_output_only is True, freezes all backbone and conditioning
+    modules while keeping pixel-adaptation input, output, and final norm
+    layers trainable.
+    """
+    if not train_output_only:
+        return model
+
+    trainable_count = 0
+    frozen_count = 0
+
+    target_model = (
+        model["unet"]
+        if isinstance(model, (dict, nn.ModuleDict)) and "unet" in model
+        else model
+    )
+
+    for name, param in target_model.named_parameters():
+        clean_name = (
+            name[len("_orig_mod.") :] if name.startswith("_orig_mod.") else name
+        )
+        parts = set(clean_name.split("."))
+        is_trainable = bool(parts & PIXEL_EXPLICIT_MODULES)
+
+        param.requires_grad = is_trainable
+        if is_trainable:
+            trainable_count += param.numel()
+        else:
+            frozen_count += param.numel()
+
+    logging.info(
+        f"Stage-1 Adaptation: {trainable_count / 1e6:.2f}M trainable params, "
+        f"{frozen_count / 1e6:.2f}M frozen params."
+    )
+    return model
+
+
 def load_trainable_model(
     models_path,
     device,
@@ -153,6 +196,8 @@ def load_trainable_model(
     model_type: str = "unet",
     model_cfg: omegaconf.DictConfig = None,
     autocast_dtype=torch.float32,
+    latent_checkpoint: str = None,
+    pixel_dir: str = None,
 ):
     """
     Loads models (UNet, TE, VAE) and configures them for training (gradients, dtype).
@@ -303,71 +348,7 @@ def load_trainable_model(
                 output_head_path=output_head_path,
             ).eval()
 
-        # Load weights for DiT architectures from checkpoint or base path
-        if is_dit:
-            ckpt_dit_path = None
-            if resume_from_checkpoint and os.path.isdir(resume_from_checkpoint):
-                for fname in ["unet.safetensors", "model.safetensors"]:
-                    candidate = os.path.join(resume_from_checkpoint, fname)
-                    if os.path.exists(candidate):
-                        ckpt_dit_path = candidate
-                        break
-            elif os.path.exists(unet_path):
-                ckpt_dit_path = unet_path
-
-            if ckpt_dit_path and os.path.exists(ckpt_dit_path):
-                if global_rank == 0:
-                    logging.info(f"  -> Loading DiT weights from: {ckpt_dit_path}")
-                sd = load_file(ckpt_dit_path, device="cpu")
-                sd = {
-                    _normalize_param_key(k): v
-                    for k, v in sd.items()
-                    if not k.startswith("text_enc.")
-                }
-                target_state = unet.state_dict()
-                target_map = {_normalize_param_key(k): k for k in target_state.keys()}
-                clean_sd = {}
-                skipped = []
-                for k, v in sd.items():
-                    if k in target_map:
-                        real_k = target_map[k]
-                        if target_state[real_k].shape == v.shape:
-                            clean_sd[real_k] = v
-                        # Adapt patch embedding weight for ps16 -> ps32 transitions
-                        elif "x_embedder.weight" in k or "conv_in.weight" in k:
-                            try:
-                                clean_sd[real_k] = adapt_patch_embed_weight(
-                                    v, target_state[real_k].shape
-                                )
-                                if global_rank == 0:
-                                    logging.info(
-                                        f"  -> Adapted patch embed weight "
-                                        f"'{real_k}' from {v.shape} to "
-                                        f"{target_state[real_k].shape}."
-                                    )
-                            except ValueError as e:
-                                skipped.append(f"{real_k} ({e})")
-                        else:
-                            skipped.append(
-                                f"{real_k} ({v.shape} != {target_state[real_k].shape})"
-                            )
-
-                unet.load_state_dict(clean_sd, strict=False)
-                if global_rank == 0 and skipped:
-                    logging.info(
-                        f"  -> Safely skipped {len(skipped)} shape-mismatched "
-                        f"layers for pixel adaptation: {skipped[:2]}..."
-                    )
-
-            # Load stage-1 output head / pixel weights if specified
-            if output_head_path and os.path.exists(output_head_path):
-                if global_rank == 0:
-                    logging.info(
-                        f"  -> Loading explicit output head weights: {output_head_path}"
-                    )
-                load_pixel_weights(unet, output_head_path, ema=None)
-
-        # Offload EMA to CPU
+        # EMA initialization
         actual_use_ema = use_ema and (global_rank == 0)
         ema = EMAModel(
             unet,
@@ -376,37 +357,59 @@ def load_trainable_model(
             device=torch.device("cpu"),
         )
 
-        if resume_from_checkpoint and os.path.isdir(resume_from_checkpoint):
-            for ema_name in ["unet_ema.safetensors", "ema_model.safetensors"]:
-                ema_path = os.path.join(resume_from_checkpoint, ema_name)
-                if os.path.exists(ema_path) and ema.use_ema:
-                    if global_rank == 0:
-                        logging.info(f"  -> Found EMA weights: {ema_path}")
-                    ema_dict = load_file(ema_path, device="cpu")
-                    ema_dict = {
-                        _normalize_param_key(k): v
-                        for k, v in ema_dict.items()
-                        if not k.startswith("text_enc.")
-                    }
-                    target_state = (
-                        ema.ema_model.state_dict()
-                        if hasattr(ema, "ema_model") and ema.ema_model
-                        else unet.state_dict()
-                    )
-                    target_map = {
-                        _normalize_param_key(k): k for k in target_state.keys()
-                    }
-                    clean_ema = {
-                        target_map[k]: v
-                        for k, v in ema_dict.items()
-                        if k in target_map
-                        and target_state[target_map[k]].shape == v.shape
-                    }
-                    if hasattr(ema, "ema_model") and ema.ema_model is not None:
-                        ema.ema_model.load_state_dict(clean_ema, strict=False)
-                    break
+        # 1. Transfer latent priors if latent_checkpoint is provided
+        if is_dit and latent_checkpoint:
+            if global_rank == 0:
+                logging.info(f"Transferring latent priors from: {latent_checkpoint}")
+            load_latent_to_pixel_weights(
+                unet, latent_checkpoint, ema=ema, prefer_ema=True
+            )
 
-        # text_encoder = Clip.from_pretrained(ClipConfig(), te_path).eval()
+        # 2. Resume full pixel training checkpoint if explicitly provided
+        elif is_dit and resume_from_checkpoint:
+            ckpt_dit_path = None
+            if os.path.isdir(resume_from_checkpoint):
+                for fname in ["unet.safetensors", "model.safetensors"]:
+                    cand = os.path.join(resume_from_checkpoint, fname)
+                    if os.path.exists(cand):
+                        ckpt_dit_path = cand
+                        break
+            if ckpt_dit_path and os.path.exists(ckpt_dit_path):
+                if global_rank == 0:
+                    logging.info(f"  -> Resuming DiT weights from: {ckpt_dit_path}")
+                sd = load_file(ckpt_dit_path, device="cpu")
+                sd = {
+                    _normalize_param_key(k): v
+                    for k, v in sd.items()
+                    if not k.startswith("text_enc.")
+                }
+                unet.load_state_dict(sd, strict=False)
+
+                # Load EMA weights
+                for ema_name in [
+                    "unet_ema.safetensors",
+                    "ema_model.safetensors",
+                ]:
+                    ema_path = os.path.join(resume_from_checkpoint, ema_name)
+                    if os.path.exists(ema_path) and ema.use_ema:
+                        ema_dict = load_file(ema_path, device="cpu")
+                        ema_dict = {
+                            _normalize_param_key(k): v
+                            for k, v in ema_dict.items()
+                            if not k.startswith("text_enc.")
+                        }
+                        if hasattr(ema, "ema_model") and ema.ema_model is not None:
+                            ema.ema_model.load_state_dict(ema_dict, strict=False)
+                        break
+
+        # 3. Load Stage-1 pixel adaptation weights if provided
+        active_pixel_dir = pixel_dir or output_head_path
+        if active_pixel_dir and os.path.exists(active_pixel_dir):
+            if global_rank == 0:
+                logging.info(
+                    f"Loading Stage-1 pixel adaptation weights: {active_pixel_dir}"
+                )
+            load_pixel_weights(unet, active_pixel_dir, ema=ema)
 
         hf_vae_id = getattr(model_cfg, "hf_vae", None) or getattr(
             model_cfg, "vae_pretrained", None
@@ -444,44 +447,7 @@ def load_trainable_model(
 
     if train_only_output:
         logging.info("Configuring for Stage-1 Output/Pixel Head training only.")
-        for param in unet.parameters():
-            param.requires_grad = False
-
-        trainable_count = 0
-        if getattr(unet, "pixel_decoder", None) is not None:
-            # DiP Pixel Decoder path
-            for param in unet.pixel_decoder.parameters():
-                param.requires_grad = True
-                trainable_count += param.numel()
-            if hasattr(unet, "x_embedder"):
-                for param in unet.x_embedder.parameters():
-                    param.requires_grad = True
-                    trainable_count += param.numel()
-            if hasattr(unet, "norm_final"):
-                for param in unet.norm_final.parameters():
-                    param.requires_grad = True
-                    trainable_count += param.numel()
-        elif hasattr(unet, "proj_out") and unet.proj_out is not None:
-            for param in unet.proj_out.parameters():
-                param.requires_grad = True
-                trainable_count += param.numel()
-            if hasattr(unet, "norm_final"):
-                for param in unet.norm_final.parameters():
-                    param.requires_grad = True
-                    trainable_count += param.numel()
-        elif hasattr(unet, "conv_out"):
-            # DDPM -> FM UNet backward compatibility
-            if hasattr(unet, "conv_norm_out") and unet.conv_norm_out:
-                unet.conv_norm_out.bias.requires_grad = True
-                unet.conv_norm_out.weight.requires_grad = True
-                trainable_count += unet.conv_norm_out.weight.numel()
-            unet.conv_out.bias.requires_grad = True
-            unet.conv_out.weight.requires_grad = True
-            trainable_count += unet.conv_out.weight.numel()
-
-        logging.info(
-            f"Stage-1 active: {trainable_count / 1e6:.2f}M trainable parameters."
-        )
+        set_trainable_layers(unet, train_output_only=True)
 
     unet.train()
 

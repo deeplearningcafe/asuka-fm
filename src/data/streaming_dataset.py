@@ -32,6 +32,52 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
 
 
+class AestheticTierFilter:
+    """Picklable predicate to filter streaming shards before interleaving."""
+
+    def __init__(self, target_tiers: set[int]):
+        self.target_tiers = set(target_tiers)
+
+    def __call__(self, sample: dict) -> bool:
+        raw_val = sample.get("aesthetic_tier")
+        if raw_val is None:
+            return False
+        try:
+            return int(raw_val) in self.target_tiers
+        except (ValueError, TypeError):
+            return False
+
+
+def inspect_parquet_tier_counts(
+    path_or_dir: str,
+    target_tiers: set[int] | None = None,
+) -> tuple[int, int]:
+    """
+    Reads Parquet metadata footers and scans only the aesthetic_tier column.
+    Takes <50ms and avoids raster/binary decompression.
+    """
+    p = Path(path_or_dir)
+    if p.is_file():
+        files = [str(p)]
+    else:
+        files = sorted([str(f) for f in p.glob("data_shard_*.parquet")])
+        if not files:
+            files = sorted([str(f) for f in p.rglob("*.parquet")])
+    if not files:
+        return 0, 0
+
+    dataset = pyarrow.dataset.dataset(files, format="parquet")
+    total_raw = dataset.count_rows()
+
+    if target_tiers is None:
+        return total_raw, total_raw
+
+    table = dataset.to_table(columns=["aesthetic_tier"])
+    aes_col = table["aesthetic_tier"].to_pylist()
+    filtered = sum(1 for v in aes_col if v is not None and int(v) in target_tiers)
+    return total_raw, filtered
+
+
 def _normalize_string_list(val: Any) -> list[str]:
     """Normalizes str, list, tuple, or OmegaConf ListConfig to str list."""
     if val is None:
@@ -268,41 +314,68 @@ class StreamingImageDataset(IterableDataset):
 
         self.metadata = self._load_metadata(sources)
 
-        raw_total = int(self.metadata.get("total_samples", 0))
-        self.aesthetic_tier_counts = self.metadata.get("aesthetic_tier_counts", {})
-
-        if self.target_aesthetic_tiers is not None and raw_total > 0:
-            exact_count = 0
-            has_counts = False
-            for tier in self.target_aesthetic_tiers:
-                # int or str support
-                count = self.aesthetic_tier_counts.get(
-                    str(tier), self.aesthetic_tier_counts.get(tier, None)
-                )
-                if count is not None:
-                    exact_count += int(count)
-                    has_counts = True
-
-            if has_counts and exact_count > 0:
-                self.total_samples = exact_count
+        # Normalize aesthetic
+        if target_aesthetic_tiers is not None:
+            if isinstance(target_aesthetic_tiers, (int, str)):
+                self.target_aesthetic_tiers = {int(target_aesthetic_tiers)}
             else:
-                tier_ratio = len(self.target_aesthetic_tiers) / 5.0
-                self.total_samples = max(1, int(raw_total * tier_ratio))
+                self.target_aesthetic_tiers = {int(t) for t in target_aesthetic_tiers}
         else:
-            self.total_samples = raw_total
+            self.target_aesthetic_tiers = None
 
         num_sources = len(sources)
-        probs = (
-            self.probabilities
-            if self.probabilities is not None
-            else [1.0 / max(1, num_sources)] * num_sources
-        )
-        if num_sources > 1 and self.stopping_strategy == "all_exhausted":
-            per_ds = self.metadata.get("per_dataset_samples", [])
-            if len(per_ds) == num_sources and all(c > 0 for c in per_ds):
-                self.total_samples = int(max(c / p for c, p in zip(per_ds, probs)))
+        target_counts = []
+        raw_counts = []
+
+        for src in sources:
+            if is_local and Path(src).exists():
+                raw_c, filt_c = inspect_parquet_tier_counts(
+                    src, self.target_aesthetic_tiers
+                )
             else:
-                self.total_samples = int(self.total_samples * num_sources)
+                # Fallback to metadata counts if remote
+                meta = self._load_single_metadata(src)
+                raw_c = int(meta.get("total_samples", 0))
+                aes_meta = meta.get("aesthetic_tier_counts", {})
+                if self.target_aesthetic_tiers is not None:
+                    filt_c = sum(
+                        int(aes_meta.get(str(t), aes_meta.get(t, 0)))
+                        for t in self.target_aesthetic_tiers
+                    )
+                else:
+                    filt_c = raw_c
+            raw_counts.append(raw_c)
+            target_counts.append(filt_c)
+
+        if self.rank == 0:
+            logging.info(f"Target aesthetic tiers: {self.target_aesthetic_tiers}")
+            for idx, src in enumerate(sources):
+                logging.info(
+                    f"  -> Source [{idx}] '{src}': "
+                    f"Total = {raw_counts[idx]}, "
+                    f"Filtered Tier-3 = {target_counts[idx]}"
+                )
+
+        # Resolve probabilities
+        if self.probabilities is not None:
+            raw_p = [float(p) for p in self.probabilities]
+            total_p = sum(raw_p)
+            probs = [p / total_p for p in raw_p]
+        else:
+            total_target = sum(target_counts)
+            if total_target > 0 and num_sources > 1:
+                probs = [c / total_target for c in target_counts]
+            else:
+                probs = [1.0 / max(1, num_sources)] * num_sources
+
+        if num_sources > 1 and all(c > 0 for c in target_counts):
+            if self.stopping_strategy == "all_exhausted":
+                s_stream = max(c / p for c, p in zip(target_counts, probs) if p > 0)
+            else:
+                s_stream = min(c / p for c, p in zip(target_counts, probs) if p > 0)
+            self.total_samples = max(1, int(round(s_stream)))
+        else:
+            self.total_samples = max(1, sum(target_counts))
 
         self.num_shards = int(
             self.metadata.get("num_shards", len(self.metadata.get("shards", [])))
@@ -349,6 +422,10 @@ class StreamingImageDataset(IterableDataset):
             )
             datasets_list.append(ds)
 
+        if self.target_aesthetic_tiers is not None:
+            tier_filter = AestheticTierFilter(self.target_aesthetic_tiers)
+            datasets_list = [ds.filter(tier_filter) for ds in datasets_list]
+
         if len(datasets_list) == 1:
             self.hf_dataset = datasets_list[0]
         else:
@@ -362,9 +439,11 @@ class StreamingImageDataset(IterableDataset):
                 common_cols = sorted(list(set.intersection(*all_cols)))
                 datasets_list = [ds.select_columns(common_cols) for ds in datasets_list]
 
+            formatted_probs = [round(p, 4) for p in probs]
             logging.info(
-                f"Interleaving {len(datasets_list)} datasets with probs "
-                f"{probs} and strategy '{self.stopping_strategy}'."
+                f"Interleaving {len(datasets_list)} filtered datasets with "
+                f"probs {formatted_probs} and strategy "
+                f"'{self.stopping_strategy}'."
             )
             self.hf_dataset = interleave_datasets(
                 datasets_list,
@@ -431,6 +510,7 @@ class StreamingImageDataset(IterableDataset):
             "samples_per_shard": 10000,
             "shards": [],
             "per_dataset_samples": [],
+            "per_dataset_aesthetic_counts": [],  # Track counts per source
         }
         for item in names_or_paths:
             meta = self._load_single_metadata(item)
@@ -438,7 +518,9 @@ class StreamingImageDataset(IterableDataset):
             combined["per_dataset_samples"].append(count)
             combined["total_samples"] += count
 
-            for tier, c in meta.get("aesthetic_tier_counts", {}).items():
+            tier_counts = meta.get("aesthetic_tier_counts", {})
+            combined["per_dataset_aesthetic_counts"].append(tier_counts)
+            for tier, c in tier_counts.items():
                 combined["aesthetic_tier_counts"][str(tier)] += int(c)
 
             if "length_tiers" in meta:
@@ -457,7 +539,10 @@ class StreamingImageDataset(IterableDataset):
         raw_val = sample.get("aesthetic_tier")
         if raw_val is None:
             return False
-        return int(raw_val) in self.target_aesthetic_tiers
+        try:
+            return int(raw_val) in self.target_aesthetic_tiers
+        except (ValueError, TypeError):
+            return False
 
     def _process_latent_sample(
         self, sample: dict

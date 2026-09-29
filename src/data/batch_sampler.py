@@ -136,7 +136,14 @@ class StreamingTokenTierBatchSampler(IterableDataset):
         self.num_aesthetic_tiers = 5
         self.epoch = 0
         self.samples_yielded = 0
-        self.total_samples = int(getattr(dataset, "total_samples", 0))
+        self.num_samples = int(
+            getattr(
+                dataset,
+                "num_samples",
+                getattr(dataset, "total_samples", 0),
+            )
+        )
+        self.total_samples = self.num_samples
 
         self.generator = torch.Generator()
         self.generator.manual_seed(self.seed + self.rank)
@@ -187,16 +194,8 @@ class StreamingTokenTierBatchSampler(IterableDataset):
         elif isinstance(sample, (tuple, list)):
             tokens = sample[1]
             aes_val = sample[5]
-            tier_val = (
-                tokens.shape[-1]
-                if hasattr(tokens, "shape")
-                else len(tokens)
-            )
-            aes_raw = (
-                int(aes_val.item())
-                if hasattr(aes_val, "item")
-                else int(aes_val)
-            )
+            tier_val = tokens.shape[-1] if hasattr(tokens, "shape") else len(tokens)
+            aes_raw = int(aes_val.item()) if hasattr(aes_val, "item") else int(aes_val)
         else:
             tier_val = self.tier_lengths[-1]
             aes_raw = -1
@@ -256,13 +255,10 @@ class StreamingTokenTierBatchSampler(IterableDataset):
         the main thread assembles and yields balanced batches.
         """
         bins: List[List[List[Any]]] = [
-            [[] for _ in range(self.num_aesthetic_tiers)]
-            for _ in range(self.num_tiers)
+            [[] for _ in range(self.num_aesthetic_tiers)] for _ in range(self.num_tiers)
         ]
         tier_counts = [0] * self.num_tiers
-        aes_counts = [
-            [0] * self.num_aesthetic_tiers for _ in range(self.num_tiers)
-        ]
+        aes_counts = [[0] * self.num_aesthetic_tiers for _ in range(self.num_tiers)]
 
         lock = threading.Lock()
         has_data = threading.Condition(lock)
@@ -291,18 +287,14 @@ class StreamingTokenTierBatchSampler(IterableDataset):
                     break
 
                 with has_data:
-                    self._push_sample(
-                        sample, bins, tier_counts, aes_counts
-                    )
+                    self._push_sample(sample, bins, tier_counts, aes_counts)
                     has_data.notify()
 
             stream_finished.set()
             with has_data:
                 has_data.notify_all()
 
-        prod_thread = threading.Thread(
-            target=producer_worker, daemon=True
-        )
+        prod_thread = threading.Thread(target=producer_worker, daemon=True)
         prod_thread.start()
 
         while True:
@@ -321,14 +313,10 @@ class StreamingTokenTierBatchSampler(IterableDataset):
 
                 if not ready_tiers:
                     if stream_finished.is_set():
-                        non_empty = [
-                            i for i, c in enumerate(tier_counts) if c > 0
-                        ]
+                        non_empty = [i for i, c in enumerate(tier_counts) if c > 0]
                         if not non_empty or self.drop_last:
                             break
-                        chosen_tier = max(
-                            non_empty, key=lambda i: tier_counts[i]
-                        )
+                        chosen_tier = max(non_empty, key=lambda i: tier_counts[i])
                         if tier_counts[chosen_tier] < self.min_batch_size:
                             break
                         target_bs = tier_counts[chosen_tier]
@@ -358,29 +346,21 @@ class StreamingTokenTierBatchSampler(IterableDataset):
                     if self.aesthetic_curriculum:
                         prog = min(
                             1.0,
-                            self.samples_yielded
-                            / max(1, self.total_samples),
+                            self.samples_yielded / max(1, self.total_samples),
                         )
                         p_simple = (1.0 - prog) * 0.4 + prog * 0.25
                         p_complex = (1.0 - prog) * 0.1 + prog * 0.25
                         weights = [
-                            p_simple if a in (1, 2) else p_complex
-                            for a in avail_aes
+                            p_simple if a in (1, 2) else p_complex for a in avail_aes
                         ]
                     else:
-                        weights = [
-                            float(aes_counts[chosen_tier][a])
-                            for a in avail_aes
-                        ]
+                        weights = [float(aes_counts[chosen_tier][a]) for a in avail_aes]
 
                     aes_tensor = torch.tensor(weights, dtype=torch.float32)
-                    if (
-                        aes_tensor.sum() <= 0
-                        or not torch.all(torch.isfinite(aes_tensor))
+                    if aes_tensor.sum() <= 0 or not torch.all(
+                        torch.isfinite(aes_tensor)
                     ):
-                        aes_tensor = torch.ones(
-                            len(avail_aes), dtype=torch.float32
-                        )
+                        aes_tensor = torch.ones(len(avail_aes), dtype=torch.float32)
 
                     aes_slot = torch.multinomial(
                         aes_tensor, 1, generator=self.generator
@@ -992,6 +972,7 @@ class BucketBatchSampler(BaseBatchSampler):
         self.epoch = epoch
         self.generator.manual_seed(self.seed + self.rank + epoch)
 
+
 class RAMTokenTierBatchSampler(BaseBatchSampler):
     """
     Map-style batch sampler mirroring StreamingTokenTierBatchSampler.
@@ -1003,7 +984,7 @@ class RAMTokenTierBatchSampler(BaseBatchSampler):
 
     def __init__(
         self,
-        dataset: "RAMCachedDataset",
+        dataset,
         base_batch_size: int,
         tier_lengths: Optional[List[int]] = None,
         base_sequence_length: Optional[int] = None,
@@ -1042,8 +1023,7 @@ class RAMTokenTierBatchSampler(BaseBatchSampler):
 
         # Group indices assigned to this rank into [tier_idx][aesthetic_tier_idx]
         self.bins: List[List[List[int]]] = [
-            [[] for _ in range(self.num_aesthetic_tiers)]
-            for _ in range(self.num_tiers)
+            [[] for _ in range(self.num_aesthetic_tiers)] for _ in range(self.num_tiers)
         ]
         for global_idx in self.indices:
             seq_len = self.dataset.tiers[global_idx]
@@ -1076,22 +1056,17 @@ class RAMTokenTierBatchSampler(BaseBatchSampler):
 
     def __iter__(self) -> Iterator[List[int]]:
         remaining = [
-            [list(aes_list) for aes_list in tier_list]
-            for tier_list in self.bins
+            [list(aes_list) for aes_list in tier_list] for tier_list in self.bins
         ]
         tier_counts = [0] * self.num_tiers
-        aes_counts = [
-            [0] * self.num_aesthetic_tiers for _ in range(self.num_tiers)
-        ]
+        aes_counts = [[0] * self.num_aesthetic_tiers for _ in range(self.num_tiers)]
 
         # Shuffle indices within bins and initialize counters
         for t_idx in range(self.num_tiers):
             for a_idx in range(self.num_aesthetic_tiers):
                 lst = remaining[t_idx][a_idx]
                 if lst:
-                    perm = torch.randperm(
-                        len(lst), generator=self.generator
-                    ).tolist()
+                    perm = torch.randperm(len(lst), generator=self.generator).tolist()
                     remaining[t_idx][a_idx] = [lst[i] for i in perm]
                 count = len(remaining[t_idx][a_idx])
                 aes_counts[t_idx][a_idx] = count
@@ -1109,9 +1084,7 @@ class RAMTokenTierBatchSampler(BaseBatchSampler):
             ready_weights = torch.tensor(
                 [tier_counts[i] for i in ready_tiers], dtype=torch.float32
             )
-            slot = torch.multinomial(
-                ready_weights, 1, generator=self.generator
-            ).item()
+            slot = torch.multinomial(ready_weights, 1, generator=self.generator).item()
             chosen_tier = ready_tiers[slot]
             target_bs = self._calculate_batch_size(chosen_tier)
 
@@ -1136,9 +1109,7 @@ class RAMTokenTierBatchSampler(BaseBatchSampler):
                         p_simple if a in (1, 2) else p_complex for a in avail_aes
                     ]
                 else:
-                    weights = [
-                        float(aes_counts[chosen_tier][a]) for a in avail_aes
-                    ]
+                    weights = [float(aes_counts[chosen_tier][a]) for a in avail_aes]
 
                 aes_tensor = torch.tensor(weights, dtype=torch.float32)
                 aes_slot = torch.multinomial(

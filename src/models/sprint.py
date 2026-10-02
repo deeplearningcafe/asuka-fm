@@ -149,6 +149,7 @@ class SprintDualStreamDiT(DualStreamDiT):
         use_random_drop: bool = False,
         use_calibrated_spatial: bool = True,
         use_pixel_decoder: bool = False,
+        input_level: str = "patch_level",
     ):
         # Prevent base constructor block initialization
         nn.Module.__init__(self)
@@ -170,6 +171,7 @@ class SprintDualStreamDiT(DualStreamDiT):
         self.use_random_drop = use_random_drop
         self.use_calibrated_spatial = use_calibrated_spatial
         self.use_pixel_decoder = use_pixel_decoder
+        self.input_level = input_level
 
         def should_checkpoint(layer_idx: int) -> bool:
             return self.use_checkpointing and (

@@ -142,14 +142,15 @@ class ModelInspector:
 def set_trainable_layers(
     model: nn.Module,
     train_output_only: bool = False,
+    shallow_tuning: bool = False,
 ) -> nn.Module:
     """
     Configures parameter gradients for two-stage adaptation.
-    If train_output_only is True, freezes all backbone and conditioning
-    modules while keeping pixel-adaptation input, output, and final norm
-    layers trainable.
+    - If train_output_only: trains only patch embedder and pixel decoder.
+    - If shallow_tuning (L2P): freezes mid_blocks, trains in/out blocks.
+    - Otherwise: trains all layers.
     """
-    if not train_output_only:
+    if not train_output_only and not shallow_tuning:
         return model
 
     trainable_count = 0
@@ -166,7 +167,18 @@ def set_trainable_layers(
             name[len("_orig_mod.") :] if name.startswith("_orig_mod.") else name
         )
         parts = set(clean_name.split("."))
-        is_trainable = bool(parts & PIXEL_EXPLICIT_MODULES)
+        if train_output_only:
+            is_trainable = bool(parts & PIXEL_EXPLICIT_MODULES)
+        elif shallow_tuning:
+            # L2P recipe: freeze deep intermediate blocks and text adapter
+            is_frozen = (
+                clean_name.startswith("mid_blocks.")
+                or clean_name.startswith("text_adapter.")
+                or "renoise_linear" in clean_name
+            )
+            is_trainable = not is_frozen
+        else:
+            is_trainable = True
 
         param.requires_grad = is_trainable
         if is_trainable:
@@ -174,8 +186,9 @@ def set_trainable_layers(
         else:
             frozen_count += param.numel()
 
+    mode_str = "Stage-1 Output-Only" if train_output_only else "L2P Shallow"
     logging.info(
-        f"Stage-1 Adaptation: {trainable_count / 1e6:.2f}M trainable params, "
+        f"{mode_str} Adaptation: {trainable_count / 1e6:.2f}M trainable, "
         f"{frozen_count / 1e6:.2f}M frozen params."
     )
     return model
@@ -198,6 +211,7 @@ def load_trainable_model(
     autocast_dtype=torch.float32,
     latent_checkpoint: str = None,
     pixel_dir: str = None,
+    shallow_tuning: bool = False,
 ):
     """
     Loads models (UNet, TE, VAE) and configures them for training (gradients, dtype).
@@ -275,6 +289,11 @@ def load_trainable_model(
         use_pixel_decoder = (
             getattr(model_cfg, "use_pixel_decoder", False) if model_cfg else False
         )
+        input_level = (
+            getattr(model_cfg, "input_level", "patch_level")
+            if model_cfg
+            else "patch_level"
+        )
         if global_rank == 0:
             logging.info(
                 f"Creating model with {hidden_size} hs, {depth} layers, and spatial rope {use_calibrated_spatial}"
@@ -293,6 +312,7 @@ def load_trainable_model(
                 use_rope_text_adapter=use_rope,
                 skip_checkpointing_layers=skip_checkpointing_layers,
                 use_pixel_decoder=use_pixel_decoder,
+                input_level=input_level,
             )
             # if os.path.exists(unet_path):
             #     sd = load_file(unet_path, device="cpu")
@@ -340,6 +360,7 @@ def load_trainable_model(
                 use_random_drop=use_random_drop,
                 use_calibrated_spatial=use_calibrated_spatial,
                 use_pixel_decoder=use_pixel_decoder,
+                input_level=input_level,
             )
         else:
             unet = Unet.from_pretrained(
@@ -445,9 +466,11 @@ def load_trainable_model(
         logging.info(f"ERROR: Could not load model: {e}")
         raise
 
-    if train_only_output:
+    if train_only_output or shallow_tuning:
         logging.info("Configuring for Stage-1 Output/Pixel Head training only.")
-        set_trainable_layers(unet, train_output_only=True)
+        set_trainable_layers(
+            unet, train_output_only=train_only_output, shallow_tuning=shallow_tuning
+        )
 
     unet.train()
 

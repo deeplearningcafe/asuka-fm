@@ -340,6 +340,9 @@ class LocalDecoder(nn.Module):
         enc4_out = self.enc4(p3)
         p4 = self.pool4(enc4_out)
 
+        if c.shape[-2:] != p4.shape[-2:]:
+            c = F.interpolate(c, size=p4.shape[-2:], mode="nearest")
+
         bottleneck_in = torch.cat([p4, c], dim=1)
         b_out = self.bottleneck(bottleneck_in)
 
@@ -381,6 +384,7 @@ class DualStreamDiT(nn.Module):
         activation_func: str = "geglu",
         skip_checkpointing_layers: int = 0,
         use_pixel_decoder: bool = False,
+        input_level: str = "patch_level",
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -392,6 +396,7 @@ class DualStreamDiT(nn.Module):
         # in the original i1 paper the don't use it
         self.use_rope_text_adapter = use_rope_text_adapter
         self.use_pixel_decoder = use_pixel_decoder
+        self.input_level = input_level
 
         def should_checkpoint(layer_idx: int) -> bool:
             return self.use_checkpointing and (
@@ -579,28 +584,33 @@ class DualStreamDiT(nn.Module):
         s = self.norm_final(image_tokens)
 
         if self.pixel_decoder is not None:
-            num_patches = h_patches * w_patches
-            k = self.patch_size // 16
-            s_cond = s.reshape(bsz * num_patches, self.hidden_size, 1, 1)
-            if k > 1:
-                s_cond = s_cond.expand(-1, -1, k, k)
+            if self.input_level == "patch_level":
+                num_patches = h_patches * w_patches
+                k = self.patch_size // 16
+                s_cond = s.reshape(bsz * num_patches, self.hidden_size, 1, 1)
+                if k > 1:
+                    s_cond = s_cond.expand(-1, -1, k, k)
 
-            # Extract patches: [B, C, H, W] -> [B * N, C, P, P]
-            # TODO: chunk anc act checkpoint
-            x_patches = (
-                x.view(bsz, self.in_channels, h_patches, p, w_patches, p)
-                .permute(0, 2, 4, 1, 3, 5)
-                .reshape(bsz * num_patches, self.in_channels, p, p)
-            )
-            out_patches = self.pixel_decoder(x_patches, s_cond)
+                # Extract patches: [B, C, H, W] -> [B * N, C, P, P]
+                # TODO: chunk anc act checkpoint
+                x_patches = (
+                    x.view(bsz, self.in_channels, h_patches, p, w_patches, p)
+                    .permute(0, 2, 4, 1, 3, 5)
+                    .reshape(bsz * num_patches, self.in_channels, p, p)
+                )
+                out_patches = self.pixel_decoder(x_patches, s_cond)
 
-            # Fold patches back into full image: [B * N, C, P, P] -> [B, C, H, W]
-            tokens = (
-                out_patches.view(bsz, h_patches, w_patches, self.out_channels, p, p)
-                .permute(0, 3, 1, 4, 2, 5)
-                .reshape(bsz, self.out_channels, H, W)
-            )
-            return tokens
+                # Fold patches back into full image: [B * N, C, P, P] -> [B, C, H, W]
+                tokens = (
+                    out_patches.view(bsz, h_patches, w_patches, self.out_channels, p, p)
+                    .permute(0, 3, 1, 4, 2, 5)
+                    .reshape(bsz, self.out_channels, H, W)
+                )
+                return tokens
+            elif self.input_level == "image_level":
+                s_cond = s.view(bsz, h_patches, w_patches, self.hidden_size)
+                s_cond = s_cond.permute(0, 3, 1, 2).contiguous()
+                return self.pixel_decoder(x, s_cond)
 
         tokens = self.proj_out(self.norm_final(image_tokens))  # [B, H*W, p*p*C_out]
         tokens = tokens.reshape(bsz, h_patches, w_patches, p, p, self.out_channels)

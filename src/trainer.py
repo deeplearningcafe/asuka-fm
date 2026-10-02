@@ -99,6 +99,7 @@ class Trainer:
                 autocast_dtype=self.autocast_dtype,
                 latent_checkpoint=latent_checkpoint,
                 pixel_dir=pixel_dir,
+                shallow_tuning=cfg.train.shallow_tuning,
             )
         )
         # TODO: could compile vae?

@@ -129,6 +129,7 @@ class FlowMatchingObjective(DiffusionObjective):
         self.use_ot = use_ot
         self.use_unet_mult = use_unet_mult
         self.timestep_sampling_fn = get_timestep_sampling_fn(timestep_sampling)
+        self.clip_denom = self.prediction_target == "x" and self.loss_target == "v"
 
     def _solve_linear_system(
         self,
@@ -141,7 +142,7 @@ class FlowMatchingObjective(DiffusionObjective):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Solves linear system to convert model prediction to (x, eps, v)."""
         alpha = alpha.clamp(min=1e-5)
-        sigma = sigma.clamp(min=1e-5)
+        sigma = sigma.clamp(min=1e-5 if not self.clip_denom else 1e-2)
 
         det = alpha * d_sigma - sigma * d_alpha
         det_safe = torch.where(det.abs() < 1e-5, 1e-5 * torch.sign(det + 1e-35), det)
@@ -183,11 +184,13 @@ class FlowMatchingObjective(DiffusionObjective):
         attention_mask=None,
         pos_map=None,
     ):
-        """Compilable forward loss step free of graph breaks."""
         b = x_start.shape[0]
+        """Compilable forward loss step free of graph breaks."""
         device = x_start.device
 
         t = self.timestep_sampling_fn(b, device, shift=self.shift)
+        if self.clip_denom:
+            t = t.clamp(min=1e-3, max=0.98)
         t_view = t.view(-1, *([1] * (x_start.ndim - 1)))
         alpha, sigma, d_alpha, d_sigma = self.schedule.get_coefficients(t_view)
 
@@ -280,3 +283,74 @@ class FlowMatchingObjective(DiffusionObjective):
             attention_mask=attention_mask,
             pos_map=pos_map,
         )
+
+
+class DDPMObjective(DiffusionObjective):
+    """
+    Standard DDPM Epsilon Prediction.
+    """
+
+    def __init__(
+        self,
+        schedule: BaseSchedule,
+        min_snr_gamma: float = 5.0,
+        input_perturb: float = 0.0,
+    ):
+        super().__init__(schedule)
+        self.min_snr_gamma = min_snr_gamma
+        self.input_perturb = input_perturb
+
+    def forward(self, model, x_start, condition, weights=None, attention_mask=None):
+        b, c, h, w = x_start.shape
+        device = x_start.device
+
+        t_idx = torch.randint(0, 1000, (b,), device=device).long()
+
+        # Normalize t for schedule query
+        t_norm = t_idx.float() / 1000.0
+
+        alpha, sigma, _, _ = self.schedule.get_coefficients(t_norm)
+        alpha = alpha.view(b, 1, 1, 1)
+        sigma = sigma.view(b, 1, 1, 1)
+
+        # Noise with Perturbation
+        noise = torch.randn_like(x_start)
+        if self.input_perturb > 0:
+            noise = noise + self.input_perturb * torch.rand_like(x_start)
+
+        x_t = alpha * x_start + sigma * noise
+
+        model_output = model(
+            x_t, t_idx, encoder_hidden_states=condition, attention_mask=attention_mask
+        )
+
+        loss = F.mse_loss(model_output, noise, reduction="none")
+        raw_loss = loss.mean(dim=[1, 2, 3])
+
+        v_pred_metrics = []
+        v_true_metrics = []
+        with torch.no_grad():
+            v_pred_metrics.append(torch.norm(model_output.detach()))
+            v_true_metrics.append(torch.norm(noise.detach()))
+            v_pred_metrics.append(torch.mean(torch.abs(model_output.detach())))
+            v_true_metrics.append(torch.mean(torch.abs(noise.detach())))
+
+        # Min-SNR Weighting
+        snr_weights = torch.ones_like(raw_loss)
+        if self.min_snr_gamma > 0.0:
+            snr = (alpha / sigma) ** 2
+            snr_weights = torch.clamp(self.min_snr_gamma / snr, max=1.0).squeeze()
+
+        loss = raw_loss * snr_weights
+
+        if weights is not None:
+            loss = loss * weights
+
+        return loss.mean(), {
+            "loss": loss.mean().detach(),
+            "raw_loss": raw_loss.mean().detach(),
+            "pred_norm": v_pred_metrics[0],
+            "pred_mean_abs": v_pred_metrics[1],
+            "target_norm": v_true_metrics[0],
+            "target_mean_abs": v_true_metrics[1],
+        }

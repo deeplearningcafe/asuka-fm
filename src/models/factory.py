@@ -297,6 +297,7 @@ def load_trainable_model(
         if global_rank == 0:
             logging.info(
                 f"Creating model with {hidden_size} hs, {depth} layers, and spatial rope {use_calibrated_spatial}"
+                f"Use pixel decoder {use_pixel_decoder} and input level {input_level}"
             )
         if model_type == "dual_stream":
             # TODO: channels dynamically from vae meta
@@ -635,61 +636,99 @@ def create_optimizer_param_groups(
     unet_low_lr_multiplier: float = 1.0,
     text_encoder_lr_multiplier: float = 0.5,
     model_type: str = "unet",
+    dit_pixel_lr_multiplier: Optional[float] = None,
+    dit_backbone_lr_multiplier: Optional[float] = None,
 ) -> List[Dict]:
     """Creates parameter groups with specific LRs and Weight Decay rules."""
     no_decay_keywords = ["bias", "norm"]
     param_groups = []
 
-    def get_params(model, prefixes, invert_prefix=False):
-        decay, no_decay = [], []
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if name.startswith("_orig_mod."):
-                name = name[len("_orig_mod.") :]
+    is_dit = (
+        model_type in ["dual_stream", "sprint_dual"]
+        or hasattr(unet_model, "x_embedder")
+        or hasattr(getattr(unet_model, "module", None), "x_embedder")
+    )
 
-            match = any(name.startswith(p) for p in prefixes)
-            if invert_prefix:
-                match = not match
+    if is_dit:
+        pixel_mult = (
+            dit_pixel_lr_multiplier
+            if dit_pixel_lr_multiplier is not None
+            else unet_output_lr_multiplier
+        )
+        backbone_mult = (
+            dit_backbone_lr_multiplier
+            if dit_backbone_lr_multiplier is not None
+            else 1.0
+        )
 
-            if match:
-                if any(k in name for k in no_decay_keywords):
-                    no_decay.append(param)
-                else:
-                    decay.append(param)
-        return decay, no_decay
+        pix_d, pix_nd = [], []
+        bb_d, bb_nd = [], []
 
-    if model_type in ["dual_stream", "sprint_dual"]:
-        decay, no_decay = [], []
         for name, param in unet_model.named_parameters():
             if not param.requires_grad:
                 continue
             if name.startswith("_orig_mod."):
                 name = name[len("_orig_mod.") :]
-            if any(k in name for k in no_decay_keywords):
-                no_decay.append(param)
-            else:
-                decay.append(param)
 
-        param_groups.append(
-            {
-                "params": decay,
-                "lr": base_lr,
-                "weight_decay": weight_decay,
-                "name": "dit_decay",
-            }
-        )
-        param_groups.append(
-            {
-                "params": no_decay,
-                "lr": base_lr,
-                "weight_decay": 0.0,
-                "name": "dit_no_decay",
-            }
-        )
+            parts = set(name.split("."))
+            is_pixel_mod = bool(parts & PIXEL_EXPLICIT_MODULES)
+            is_no_decay = any(k in name for k in no_decay_keywords)
+
+            if is_pixel_mod:
+                if is_no_decay:
+                    pix_nd.append(param)
+                else:
+                    pix_d.append(param)
+            else:
+                if is_no_decay:
+                    bb_nd.append(param)
+                else:
+                    bb_d.append(param)
+
+        if pix_d:
+            param_groups.append(
+                {
+                    "params": pix_d,
+                    "lr": base_lr * pixel_mult,
+                    "weight_decay": weight_decay,
+                    "name": "dit_pixel_decay",
+                }
+            )
+        if pix_nd:
+            param_groups.append(
+                {
+                    "params": pix_nd,
+                    "lr": base_lr * pixel_mult,
+                    "weight_decay": 0.0,
+                    "name": "dit_pixel_no_decay",
+                }
+            )
+
+        if bb_d:
+            param_groups.append(
+                {
+                    "params": bb_d,
+                    "lr": base_lr * backbone_mult,
+                    "weight_decay": weight_decay,
+                    "name": "dit_backbone_decay",
+                }
+            )
+        if bb_nd:
+            param_groups.append(
+                {
+                    "params": bb_nd,
+                    "lr": base_lr * backbone_mult,
+                    "weight_decay": 0.0,
+                    "name": "dit_backbone_no_decay",
+                }
+            )
     else:
         unet_output_prefixes = ("conv_out.", "conv_norm_out.", "down_blocks.0.")
-        unet_high_lr_prefixes = ("time_embedding.", "down_blocks.1.", "down_blocks.2.")
+        unet_high_lr_prefixes = (
+            "time_embedding.",
+            "down_blocks.1.",
+            "down_blocks.2.",
+        )
         unet_low_lr_prefixes = ("up_blocks.2.", "up_blocks.3.")
 
         u_out_d, u_out_nd = [], []
@@ -718,9 +757,24 @@ def create_optimizer_param_groups(
             target_list.append(param)
 
         groups_config = [
-            (u_out_d, u_out_nd, base_lr * unet_output_lr_multiplier, "unet_output"),
-            (u_high_d, u_high_nd, base_lr * unet_high_lr_multiplier, "unet_high"),
-            (u_low_d, u_low_nd, base_lr * unet_low_lr_multiplier, "unet_low"),
+            (
+                u_out_d,
+                u_out_nd,
+                base_lr * unet_output_lr_multiplier,
+                "unet_output",
+            ),
+            (
+                u_high_d,
+                u_high_nd,
+                base_lr * unet_high_lr_multiplier,
+                "unet_high",
+            ),
+            (
+                u_low_d,
+                u_low_nd,
+                base_lr * unet_low_lr_multiplier,
+                "unet_low",
+            ),
             (
                 u_base_d,
                 u_base_nd,
@@ -823,6 +877,14 @@ def create_optimizer_param_groups(
 
 def create_optim(unet, text_encoder, conf: omegaconf.DictConfig):
     model_type = getattr(conf.models, "model_type", "unet")
+    dit_pixel_mult = conf.train.get(
+        "dit_pixel_lr_multiplier",
+        conf.train.get("pixel_lr_multiplier", 2.0),
+    )
+    dit_bb_mult = conf.train.get(
+        "dit_backbone_lr_multiplier",
+        conf.train.get("backbone_lr_multiplier", 1.0),
+    )
     param_groups = create_optimizer_param_groups(
         unet_model=unet,
         text_encoder_model=text_encoder,
@@ -833,7 +895,9 @@ def create_optim(unet, text_encoder, conf: omegaconf.DictConfig):
         unet_high_lr_multiplier=1.05,
         unet_backbone_lr_multiplier=1.0,
         unet_low_lr_multiplier=1.0,
-        # model_type=model_type,
+        model_type=model_type,
+        dit_pixel_lr_multiplier=dit_pixel_mult,
+        dit_backbone_lr_multiplier=dit_bb_mult,
     )
 
     if conf.train.use_bitsandbytes:

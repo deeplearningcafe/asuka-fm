@@ -592,13 +592,26 @@ class DualStreamDiT(nn.Module):
                     s_cond = s_cond.expand(-1, -1, k, k)
 
                 # Extract patches: [B, C, H, W] -> [B * N, C, P, P]
-                # TODO: chunk anc act checkpoint
                 x_patches = (
                     x.view(bsz, self.in_channels, h_patches, p, w_patches, p)
                     .permute(0, 2, 4, 1, 3, 5)
                     .reshape(bsz * num_patches, self.in_channels, p, p)
                 )
-                out_patches = self.pixel_decoder(x_patches, s_cond)
+                # Extract patches: [B, C, H, W] -> [B * N, C, P, P]
+                chunk_size = 8192
+                total_patches = bsz * num_patches
+                if total_patches > chunk_size:
+                    out_list = []
+                    for idx in range(0, total_patches, chunk_size):
+                        end_idx = min(idx + chunk_size, total_patches)
+                        chunk_out = self.pixel_decoder(
+                            x_patches[idx:end_idx],
+                            s_cond[idx:end_idx],
+                        )
+                        out_list.append(chunk_out)
+                    out_patches = torch.cat(out_list, dim=0)
+                else:
+                    out_patches = self.pixel_decoder(x_patches, s_cond)
 
                 # Fold patches back into full image: [B * N, C, P, P] -> [B, C, H, W]
                 tokens = (

@@ -66,8 +66,10 @@ def create_dataloader(
             if getattr(cfg.models, "use_calibrated_spatial", False)
             else "discrete"
         )
+        target_aesthetic_tiers = cfg.data.get("target_aesthetic_tiers", None)
         if rank == 0:
             logging.info(f"Creating with {is_latent} latents and rope {coord_system}")
+            logging.info(f"Using aesthetic tiers {target_aesthetic_tiers}")
         dataset = StreamingImageDataset(
             dataset_name=cfg.data.streaming_dataset_name,
             dataset_path=cfg.data.get("dataset_path", None),
@@ -87,6 +89,9 @@ def create_dataloader(
             is_latent=is_latent,
             coord_system=coord_system,
             pixel_training=pixel_training,
+            target_aesthetic_tiers=target_aesthetic_tiers,
+            probabilities=cfg.data.get("probabilities", None),
+            stopping_strategy=cfg.data.get("stopping_strategy", "all_exhausted"),
         )
 
         tier_lengths = cfg.data.get(

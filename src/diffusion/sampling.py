@@ -300,7 +300,8 @@ def sample_euler(
             elif clip_prediction:
                 pred = pred.clamp(-1.0, 1.0)
 
-            sigma_safe = sigma.clamp(min=1e-5)
+            # here we could use jit 0.05
+            sigma_safe = sigma.clamp(min=1e-2)
             eps_recon = (z - alpha * pred) / sigma_safe
             v = d_alpha * pred + d_sigma * eps_recon
         elif prediction_target == "eps":
@@ -530,9 +531,15 @@ def generate_samples(
 
                 # 5. Build per-sample RoPE Continuous 2D Position Map
                 patch_size = getattr(unet, "patch_size", None)
+                if patch_size is None and hasattr(unet, "_orig_mod"):
+                    patch_size = getattr(unet._orig_mod, "patch_size", None)
                 if patch_size is None and hasattr(unet, "module"):
-                    patch_size = getattr(unet.module, "patch_size", None)
-                p_size = patch_size if patch_size is not None else 2
+                    target = unet.module
+                    patch_size = getattr(target, "patch_size", None)
+                    if patch_size is None and hasattr(target, "_orig_mod"):
+                        patch_size = getattr(target._orig_mod, "patch_size", None)
+                default_p = 16 if pixel_sampling else 2
+                p_size = patch_size if patch_size is not None else default_p
 
                 pos_maps = []
                 for c in batch_configs:

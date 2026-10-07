@@ -142,7 +142,7 @@ class FlowMatchingObjective(DiffusionObjective):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Solves linear system to convert model prediction to (x, eps, v)."""
         alpha = alpha.clamp(min=1e-5)
-        min_sigma = 0.05 if self.clip_denom else 1e-4
+        min_sigma = 0.05 * self.noise_scale if self.clip_denom else 1e-4
         sigma_safe = sigma.clamp(min=min_sigma)
 
         det = alpha * d_sigma - sigma * d_alpha

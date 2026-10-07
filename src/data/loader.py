@@ -27,9 +27,9 @@ def worker_init_fn(worker_id: int) -> None:
     on shared machines and resets HTTP connection pools.
     """
     # Prevent each worker from spawning multiple CPU threads
-    torch.set_num_threads(1)
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
+    #torch.set_num_threads(1)
+    #os.environ["OMP_NUM_THREADS"] = "1"
+    #os.environ["MKL_NUM_THREADS"] = "1"
 
     try:
         if hasattr(_http, "reset_sessions"):
@@ -39,6 +39,16 @@ def worker_init_fn(worker_id: int) -> None:
     except (ImportError, AttributeError):
         pass
 
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is not None:
+        dataset = worker_info.dataset
+        # Unwrap IterableDataset wrappers if present
+        if hasattr(dataset, "dataset") and isinstance(
+            dataset.dataset, H5LatentDataset
+        ):
+            dataset.dataset._initialize_worker()
+        elif isinstance(dataset, H5LatentDataset):
+            dataset._initialize_worker()
 
 def create_dataloader(
     cfg, rank, tokenizer=None, vae=None, autocast_dtype=torch.float32

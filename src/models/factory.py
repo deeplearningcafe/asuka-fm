@@ -450,6 +450,9 @@ def load_trainable_model(
         # TODO: dynamically move to cpu
         vae.to(device)
 
+        for param in vae.parameters():
+            param.requires_grad = True
+
         if global_rank == 0:
             logging.info(f"Moving models to {device} and converting to {dtype}")
         unet.to(device)

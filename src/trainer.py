@@ -202,6 +202,7 @@ class Trainer:
             timestep_sampling = self.cfg.train.get("timestep_fn", "uniform")
 
             loss_target = getattr(cfg.train, "loss_target", "v")
+            logging.info(f"Using {self.prediction_target} pred and {loss_target} loss")
 
             self.objective = FlowMatchingObjective(
                 self.schedule,
@@ -806,6 +807,7 @@ class Trainer:
                                         use_unet_mult=False if self.is_dit else True,
                                         vae_mean=self.vae_mean,
                                         vae_std=self.vae_std,
+                                        vae_batch_size=1,
                                         in_channels=self.in_channels,
                                         pixel_sampling=self.pixel_training,
                                         prediction_target=self.prediction_target,

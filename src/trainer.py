@@ -825,7 +825,7 @@ class Trainer:
                                         cfg_interval=getattr(
                                             self.cfg.sampling,
                                             "cfg_interval",
-                                            (0.11, 0.97)
+                                            (0.0, 0.90)
                                             if self.pixel_training
                                             else (0.0, 1.0),
                                         ),

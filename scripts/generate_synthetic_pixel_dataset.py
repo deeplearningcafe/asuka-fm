@@ -40,6 +40,7 @@ def make_preview_grid(
     w, h = images[0].size
     grid = Image.new("RGB", (cols * w, rows * h))
     for idx, img in enumerate(images[: cols * rows]):
+        logging.info(f"Image shape: {img.size}")
         x = (idx % cols) * w
         y = (idx // cols) * h
         grid.paste(img, (x, y))
@@ -488,6 +489,8 @@ def generate_and_upload_synthetic(
         batch_metas.clear()
 
     sample_seed = cfg.train.get("seed", 42)
+    patch_size = getattr(cfg.models, "patch_size", 2)
+    align_down = patch_size * 8
 
     for raw_sample in streaming_dataset.iter_raw():
         if total_generated + len(batch_configs) >= max_samples:
@@ -509,9 +512,19 @@ def generate_and_upload_synthetic(
         tag_weight = float(raw_sample.get("tag_weight", 1.0))
         bucket_idx = int(raw_sample.get("bucket_idx", -1))
 
-        res_w = int(raw_sample.get("target_width", target_res))
-        res_h = int(raw_sample.get("target_height", target_res))
+        #res_w = int(raw_sample.get("target_width", target_res))
+        #res_h = int(raw_sample.get("target_height", target_res))
 
+        target_width = int(raw_sample.get("target_width", target_res))
+        target_height = int(raw_sample.get("target_height", target_res))
+        min_orig = max(1, min(target_height, target_width))
+        scale = target_res / min_orig
+        scaled_w = max(target_res, int(round(target_width * scale)))
+        scaled_h = max(target_res, int(round(target_height * scale)))
+
+        # Align dimensions to patch_size * vae_downsample_factor (16px)
+        res_w = (scaled_w // align_down) * align_down
+        res_h = (scaled_h // align_down) * align_down
         sample_seed += 1
         sample_cfg = {
             "prompt": prompt,

@@ -239,10 +239,14 @@ class LocalDecoder(nn.Module):
         in_channels: int = 3,
         out_channels: int = 3,
         cond_hidden_size: int = 768,
+        upsample_mode: str = "nearest_conv",
+        use_checkpointing: bool = True,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.upsample_mode = upsample_mode
+        self.use_checkpointing = use_checkpointing
 
         # Encoder: 16x16 -> 8x8 -> 4x4 -> 2x2 -> 1x1
         self.enc1 = nn.Sequential(
@@ -276,25 +280,41 @@ class LocalDecoder(nn.Module):
         )
 
         # Decoder: 1x1 -> 2x2 -> 4x4 -> 8x8 -> 16x16
-        self.up4 = nn.ConvTranspose2d(512, 512, kernel_size=2, stride=2)
+        if self.upsample_mode == "nearest_conv":
+            self.up4 = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="nearest"),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            )
+            self.up3 = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="nearest"),
+                nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            )
+            self.up2 = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="nearest"),
+                nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            )
+            self.up1 = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="nearest"),
+                nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            )
+        else:
+            self.up4 = nn.ConvTranspose2d(512, 512, kernel_size=2, stride=2)
+            self.up3 = nn.ConvTranspose2d(256, 256, kernel_size=2, stride=2)
+            self.up2 = nn.ConvTranspose2d(128, 128, kernel_size=2, stride=2)
+            self.up1 = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2)
+
         self.dec4 = nn.Sequential(
             nn.Conv2d(512 + 512, 256, kernel_size=3, padding=1),
             nn.SiLU(),
         )
-
-        self.up3 = nn.ConvTranspose2d(256, 256, kernel_size=2, stride=2)
         self.dec3 = nn.Sequential(
             nn.Conv2d(256 + 256, 128, kernel_size=3, padding=1),
             nn.SiLU(),
         )
-
-        self.up2 = nn.ConvTranspose2d(128, 128, kernel_size=2, stride=2)
         self.dec2 = nn.Sequential(
             nn.Conv2d(128 + 128, 64, kernel_size=3, padding=1),
             nn.SiLU(),
         )
-
-        self.up1 = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2)
         self.dec1 = nn.Sequential(
             nn.Conv2d(64 + 64, 64, kernel_size=3, padding=1),
             nn.SiLU(),
@@ -328,37 +348,44 @@ class LocalDecoder(nn.Module):
             x: Raw noisy pixel patch tensor of shape [B * N, C, 16, 16].
             c: DiT conditioning token tensor of shape [B * N, D, 1, 1].
         """
-        enc1_out = self.enc1(x)
-        p1 = self.pool1(enc1_out)
+        def _forward_impl(x_in, c_in):
+            enc1_out = self.enc1(x_in)
+            p1 = self.pool1(enc1_out)
 
-        enc2_out = self.enc2(p1)
-        p2 = self.pool2(enc2_out)
+            enc2_out = self.enc2(p1)
+            p2 = self.pool2(enc2_out)
 
-        enc3_out = self.enc3(p2)
-        p3 = self.pool3(enc3_out)
+            enc3_out = self.enc3(p2)
+            p3 = self.pool3(enc3_out)
 
-        enc4_out = self.enc4(p3)
-        p4 = self.pool4(enc4_out)
+            enc4_out = self.enc4(p3)
+            p4 = self.pool4(enc4_out)
 
-        if c.shape[-2:] != p4.shape[-2:]:
-            c = F.interpolate(c, size=p4.shape[-2:], mode="nearest")
+            if c_in.shape[-2:] != p4.shape[-2:]:
+                c_in = F.interpolate(c_in, size=p4.shape[-2:], mode="nearest")
 
-        bottleneck_in = torch.cat([p4, c], dim=1)
-        b_out = self.bottleneck(bottleneck_in)
+            bottleneck_in = torch.cat([p4, c_in], dim=1)
+            b_out = self.bottleneck(bottleneck_in)
 
-        d4 = self.up4(b_out)
-        d4 = self.dec4(torch.cat([d4, enc4_out], dim=1))
+            d4 = self.up4(b_out)
+            d4 = self.dec4(torch.cat([d4, enc4_out], dim=1))
 
-        d3 = self.up3(d4)
-        d3 = self.dec3(torch.cat([d3, enc3_out], dim=1))
+            d3 = self.up3(d4)
+            d3 = self.dec3(torch.cat([d3, enc3_out], dim=1))
 
-        d2 = self.up2(d3)
-        d2 = self.dec2(torch.cat([d2, enc2_out], dim=1))
+            d2 = self.up2(d3)
+            d2 = self.dec2(torch.cat([d2, enc2_out], dim=1))
 
-        d1 = self.up1(d2)
-        d1 = self.dec1(torch.cat([d1, enc1_out], dim=1))
+            d1 = self.up1(d2)
+            d1 = self.dec1(torch.cat([d1, enc1_out], dim=1))
 
-        return self.out_conv(d1)
+            return self.out_conv(d1)
+
+        if self.use_checkpointing and self.training:
+            return torch.utils.checkpoint.checkpoint(
+                _forward_impl, x, c, use_reentrant=False
+            )
+        return _forward_impl(x, c)
 
 
 class DualStreamDiT(nn.Module):
@@ -385,6 +412,7 @@ class DualStreamDiT(nn.Module):
         skip_checkpointing_layers: int = 0,
         use_pixel_decoder: bool = False,
         input_level: str = "patch_level",
+        upsample_mode: str = "ConvTranspose",
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -487,6 +515,8 @@ class DualStreamDiT(nn.Module):
                 in_channels=in_channels,
                 out_channels=out_channels,
                 cond_hidden_size=hidden_size,
+                upsample_mode=upsample_mode,
+                use_checkpointing=self.use_checkpointing,
             )
             self.proj_out = None
         else:

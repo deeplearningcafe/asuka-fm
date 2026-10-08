@@ -150,6 +150,7 @@ class SprintDualStreamDiT(DualStreamDiT):
         use_calibrated_spatial: bool = True,
         use_pixel_decoder: bool = False,
         input_level: str = "patch_level",
+        upsample_mode: str = "ConvTranspose",
     ):
         # Prevent base constructor block initialization
         nn.Module.__init__(self)
@@ -268,6 +269,8 @@ class SprintDualStreamDiT(DualStreamDiT):
                 in_channels=in_channels,
                 out_channels=out_channels,
                 cond_hidden_size=hidden_size,
+                upsample_mode=upsample_mode,
+                use_checkpointing=self.use_checkpointing,
             )
             self.proj_out = None
         else:

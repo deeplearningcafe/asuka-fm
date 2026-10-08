@@ -294,6 +294,11 @@ def load_trainable_model(
             if model_cfg
             else "patch_level"
         )
+        upsample_mode = (
+            getattr(model_cfg, "upsample_mode", "ConvTranspose")
+            if model_cfg
+            else "ConvTranspose"
+        )
         if global_rank == 0:
             logging.info(
                 f"Creating model with {hidden_size} hs, {depth} layers, and spatial rope {use_calibrated_spatial}"

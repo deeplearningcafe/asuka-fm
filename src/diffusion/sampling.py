@@ -132,12 +132,14 @@ def apply_dynamic_threshold(
     pred_x: torch.Tensor,
     percentile: float = 0.995,
     max_val: float = 1.0,
+    t_val: float = 1.0,
 ) -> torch.Tensor:
     """
     Applies Imagen-style dynamic thresholding across spatial dimensions
     to preserve chromaticity ratios and prevent color gamut burn.
     """
-    if not (0.0 < percentile <= 1.0):
+    # Only apply once coarse structure has formed (t >= 0.3)
+    if t_val < 0.3 or not (0.0 < percentile <= 1.0):
         return pred_x.clamp(-max_val, max_val)
 
     orig_dtype = pred_x.dtype
@@ -296,12 +298,18 @@ def sample_euler(
         elif prediction_target == "x":
             # Dynamic thresholding or clamping on x0 prediction
             if dynamic_thresholding:
-                pred = apply_dynamic_threshold(pred)
+                pred = apply_dynamic_threshold(pred, t_val=t_curr.item())
             elif clip_prediction:
                 pred = pred.clamp(-1.0, 1.0)
 
+            # Direct step to clean target at final boundary
+            if (i == num_steps - 1) or (t_curr + dt >= 0.999):
+                z = pred
+                break
+
             # here we could use jit 0.05
-            sigma_safe = sigma.clamp(min=1e-2)
+            min_sigma = 0.05 * noise_scale if (clip_prediction or dynamic_thresholding) else 1e-2
+            sigma_safe = sigma.clamp(min=min_sigma)
             eps_recon = (z - alpha * pred) / sigma_safe
             v = d_alpha * pred + d_sigma * eps_recon
         elif prediction_target == "eps":

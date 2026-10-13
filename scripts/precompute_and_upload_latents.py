@@ -684,7 +684,11 @@ def precompute_and_upload(
         i1_dataset=is_i1,
     )
 
-    extract_dataset = LatentExtractDataset(streaming_dataset, existing_ids=existing_ids)
+    extract_dataset = LatentExtractDataset(
+        streaming_dataset,
+        existing_ids=existing_ids,
+        i1_dataset=is_i1,
+    )
     prefetch_loader = DataLoader(
         extract_dataset,
         batch_size=None,
@@ -914,4 +918,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

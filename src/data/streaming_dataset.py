@@ -7,7 +7,8 @@ import argparse
 from pathlib import Path
 from collections import Counter, defaultdict
 import warnings
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, List
+import re
 
 import torch
 import json
@@ -30,6 +31,32 @@ from src.models.text_encoders.tokenizer import BaseTokenizer
 PngImagePlugin.MAX_TEXT_CHUNK = 64 * 1024 * 1024
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
+
+
+def normalize_prompt_entry(raw_prompt: Any) -> Union[List[str], str]:
+    """Recovers the 5-caption list if serialized as individual characters."""
+    if isinstance(raw_prompt, (list, tuple)):
+        # Detect bugged character-level list from Parquet serialization
+        if len(raw_prompt) > 0 and len(raw_prompt[0]) == 1:
+            full_text = "".join(raw_prompt).strip()
+            # Split on period + comma followed by capital letter
+            parts = re.split(r"\.,\s+(?=[A-Z])", full_text)
+            if len(parts) != 5:
+                # Fallback split on generic period + comma
+                parts = re.split(r"\.,\s+", full_text)
+
+            captions = []
+            for p in parts:
+                p_clean = p.strip()
+                if not p_clean:
+                    continue
+                if not p_clean.endswith((".", "!", "?")):
+                    p_clean += "."
+                captions.append(p_clean)
+
+            return captions if len(captions) > 1 else full_text
+        return [str(p) for p in raw_prompt]
+    return str(raw_prompt) if raw_prompt is not None else ""
 
 
 class AestheticTierFilter:
@@ -577,8 +604,10 @@ class StreamingImageDataset(IterableDataset):
 
         tier_len = int(sample.get("tier", 227))
         raw_prompt = sample.get("prompt") or sample.get("text", "")
+        is_natural_language = False
         if isinstance(raw_prompt, (list, tuple)):
             prompt = random.choice(raw_prompt) if len(raw_prompt) > 0 else ""
+            is_natural_language = True
         else:
             prompt = str(raw_prompt)
         tokens, mask = self.tokenizer.encode(
@@ -587,6 +616,7 @@ class StreamingImageDataset(IterableDataset):
             cfg_dropout_prob=self.cfg_dropout_prob,
             tag_dropout_prob=self.tag_dropout_prob,
             shuffle_tags=self.shuffle_tags,
+            is_natural_language=is_natural_language,
         )
         is_uncond = mask.sum().item() <= 1
         raw_tag_weight = float(sample.get("tag_weight", 1.0))
@@ -644,8 +674,10 @@ class StreamingImageDataset(IterableDataset):
         )
         tier_len = int(sample.get("tier", 227))
         raw_prompt = sample.get("prompt") or sample.get("text", "")
+        is_natural_language = False
         if isinstance(raw_prompt, (list, tuple)):
             prompt = random.choice(raw_prompt) if len(raw_prompt) > 0 else ""
+            is_natural_language = True
         else:
             prompt = str(raw_prompt)
         # sample until tier len
@@ -655,6 +687,7 @@ class StreamingImageDataset(IterableDataset):
             cfg_dropout_prob=self.cfg_dropout_prob,
             tag_dropout_prob=self.tag_dropout_prob,
             shuffle_tags=self.shuffle_tags,
+            is_natural_language=is_natural_language,
         )
         is_uncond = mask.sum().item() <= 1
         raw_tag_weight = float(sample.get("tag_weight", 1.0))
@@ -834,8 +867,10 @@ class RAMCachedDataset(torch.utils.data.Dataset):
 
         # Dynamic text tokenization on-the-fly
         raw_prompt = self.prompts[idx]
+        is_natural_language = False
         if isinstance(raw_prompt, (list, tuple)):
             prompt = random.choice(raw_prompt) if len(raw_prompt) > 0 else ""
+            is_natural_language = True
         else:
             prompt = str(raw_prompt)
 
@@ -846,6 +881,7 @@ class RAMCachedDataset(torch.utils.data.Dataset):
             cfg_dropout_prob=self.cfg_dropout_prob,
             tag_dropout_prob=self.tag_dropout_prob,
             shuffle_tags=self.shuffle_tags,
+            is_natural_language=is_natural_language,
         )
         is_uncond = mask.sum().item() <= 1
         raw_tag_weight = self.tag_weights[idx]
@@ -940,7 +976,7 @@ def precompute_latents_to_ram(
         (est_elements,), dtype=autocast_dtype, device="cpu"
     ).share_memory_()
 
-    prompts_list: list[str] = []
+    prompts_list: List[Union[str, List[str]]] = []
     tiers_list: list[int] = []
     tag_weights_list: list[float] = []
     aes_tiers_list: list[int] = []
@@ -1022,7 +1058,7 @@ def precompute_latents_to_ram(
             shapes_buf[sample_idx, 0] = h_lat
             shapes_buf[sample_idx, 1] = w_lat
 
-            prompts_list.append(prompt)
+            prompts_list.append(normalize_prompt_entry(prompt))
             tiers_list.append(tier)
             tag_weights_list.append(tag_weight)
             aes_tiers_list.append(aes_tier)
@@ -1067,7 +1103,7 @@ def precompute_latents_to_ram(
                 shapes_buf[sample_idx, 1] = w_lat
 
                 _, prompt, tier, tag_weight, aes_tier = items[i]
-                prompts_list.append(prompt)
+                prompts_list.append(normalize_prompt_entry(prompt))
                 tiers_list.append(tier)
                 tag_weights_list.append(tag_weight)
                 aes_tiers_list.append(aes_tier)

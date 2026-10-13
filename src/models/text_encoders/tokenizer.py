@@ -117,9 +117,12 @@ class HFLLMTokenizer(BaseTokenizer):
         cfg_dropout_prob: float = 0.0,
         tag_dropout_prob: float = 0.0,
         shuffle_tags: bool = False,
+        is_natural_language: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if cfg_dropout_prob > 0.0 and random.random() < cfg_dropout_prob:
             processed = ""
+        elif is_natural_language:
+            processed = prompt
         else:
             # TODO: metadata ends with aesthetic or year
             tags = [t.strip() for t in prompt.split(",") if t.strip()]

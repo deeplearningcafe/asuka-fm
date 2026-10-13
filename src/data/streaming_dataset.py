@@ -576,7 +576,11 @@ class StreamingImageDataset(IterableDataset):
         )
 
         tier_len = int(sample.get("tier", 227))
-        prompt = sample.get("prompt") or sample.get("text", "")
+        raw_prompt = sample.get("prompt") or sample.get("text", "")
+        if isinstance(raw_prompt, (list, tuple)):
+            prompt = random.choice(raw_prompt) if len(raw_prompt) > 0 else ""
+        else:
+            prompt = str(raw_prompt)
         tokens, mask = self.tokenizer.encode(
             prompt,
             max_len=tier_len,
@@ -639,7 +643,11 @@ class StreamingImageDataset(IterableDataset):
             coord_system=self.coord_system,
         )
         tier_len = int(sample.get("tier", 227))
-        prompt = sample.get("prompt") or sample.get("text", "")
+        raw_prompt = sample.get("prompt") or sample.get("text", "")
+        if isinstance(raw_prompt, (list, tuple)):
+            prompt = random.choice(raw_prompt) if len(raw_prompt) > 0 else ""
+        else:
+            prompt = str(raw_prompt)
         # sample until tier len
         tokens, mask = self.tokenizer.encode(
             prompt,
@@ -825,7 +833,12 @@ class RAMCachedDataset(torch.utils.data.Dataset):
         )
 
         # Dynamic text tokenization on-the-fly
-        prompt = self.prompts[idx]
+        raw_prompt = self.prompts[idx]
+        if isinstance(raw_prompt, (list, tuple)):
+            prompt = random.choice(raw_prompt) if len(raw_prompt) > 0 else ""
+        else:
+            prompt = str(raw_prompt)
+
         tier_len = self.tiers[idx]
         tokens, mask = self.tokenizer.encode(
             prompt,

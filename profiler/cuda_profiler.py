@@ -37,9 +37,68 @@ from src.utils.act_grad_checkpointing import (
     CPUGradientAccumulator,
 )
 
+from src.diffusion.sampling import generate_samples
 
 MAX_BATCH_SIZE = 64
 TIME_FORMAT_STR: str = "%b_%d_%H_%M_%S"
+
+
+def unpack_batch(
+    batch: Any,
+    vae: Optional[nn.Module],
+    device: torch.device,
+    dtype: torch.dtype,
+    autocast_dtype: torch.dtype,
+    vae_mean: torch.Tensor,
+    vae_std: torch.Tensor,
+    vae_batch_size: int = 64,
+    is_latent: bool = False,
+    pixel_training: bool = False,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+]:
+    """
+    Unpacks batch tensors with support for online VAE, precomputed latents,
+    and pixel-space training (DiP). Fully backward-compatible.
+    """
+    pos_map = None
+    if len(batch) >= 5:
+        # Streaming dataset format: images_or_lats, cond, mask, pos_map, ...
+        images_or_lats, cond, mask, pos_map, tag_weights, *rest = batch
+
+        if not is_latent and not pixel_training and vae is not None:
+            # Online VAE encoding branch
+            with torch.no_grad():
+                latents = encode_vae_latents_profiling(
+                    images=images_or_lats,
+                    vae=vae,
+                    device=device,
+                    autocast_dtype=autocast_dtype,
+                    vae_mean=vae_mean,
+                    vae_std=vae_std,
+                    chunk_size=vae_batch_size,
+                )
+        else:
+            # Precomputed latents or direct pixel images [-1, 1]
+            latents = images_or_lats.to(device=device, dtype=dtype, non_blocking=True)
+
+        attention_mask = mask.to(device, non_blocking=True)
+        cond = cond.to(device, non_blocking=True)
+        if pos_map is not None:
+            pos_map = pos_map.to(device, non_blocking=True)
+        tag_weights = tag_weights.to(device, dtype=dtype, non_blocking=True)
+    else:
+        # H5LatentDataset batch format
+        latents = batch[0].to(device, dtype=dtype, non_blocking=True) * 0.18215
+        cond = batch[1].to(device, non_blocking=True)
+        tag_weights = batch[2].to(device, dtype=dtype, non_blocking=True)
+        attention_mask = batch[3].to(device, non_blocking=True)
+
+    return latents, cond, attention_mask, tag_weights, pos_map
 
 
 def encode_vae_latents_profiling(
@@ -58,9 +117,7 @@ def encode_vae_latents_profiling(
         chunk = images[i : i + chunk_size].to(
             device=device, dtype=vae_dtype, non_blocking=True
         )
-        with torch.autocast(
-            device_type="cuda", dtype=autocast_dtype, enabled=True
-        ):
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=True):
             enc = vae.encode(chunk)
             dist = getattr(enc, "latent_dist", enc)
             lat = dist.sample() if hasattr(dist, "sample") else dist
@@ -129,15 +186,11 @@ def trace_handler(
     os.makedirs(output_dir, exist_ok=True)
     host_name = socket.gethostname()
     timestamp = datetime.now().strftime(TIME_FORMAT_STR)
-    file_prefix = os.path.join(
-        output_dir, f"{trace_name}_{host_name}_{timestamp}"
-    )
+    file_prefix = os.path.join(output_dir, f"{trace_name}_{host_name}_{timestamp}")
 
     prof.export_chrome_trace(f"{file_prefix}.json.gz")
     device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
-    prof.export_memory_timeline(
-        f"{file_prefix}_memory.html", device=device_str
-    )
+    prof.export_memory_timeline(f"{file_prefix}_memory.html", device=device_str)
 
 
 def profile_pipeline_breakdown(
@@ -146,10 +199,12 @@ def profile_pipeline_breakdown(
     profile_iters: int = 10,
     output_dir: str = "profiling_results",
     compile_model: bool = False,
+    pixel_training: bool = False,
+    train_only_output: bool = False,
 ) -> None:
     """
-    Benchmarks and breaks down per-component execution times, FLOPs,
-    and MFU across DataLoading, VAE encoding, TextEncoder, and DiT backbone.
+    Benchmarks execution times, FLOPs, and MFU across components:
+    DataLoader, Online VAE, TextEncoder, DiT backbone, and DiP LocalDecoder.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = (
@@ -165,6 +220,15 @@ def profile_pipeline_breakdown(
 
     model_type = getattr(cfg.models, "model_type", "dual_stream")
     is_dit = model_type in ["dual_stream", "sprint_dual"]
+    is_latent = (
+        cfg.data.get("is_latent", False)
+        or getattr(cfg.data, "dataset_type", "") == "streaming_latents"
+        or cfg.data.get("cache_latents_to_ram", False)
+    )
+
+    if pixel_training:
+        cfg.train.pixel_training = True
+        cfg.models.use_pixel_decoder = True
 
     unet, text_encoder, vae, tokenizer, ema = load_trainable_model(
         models_path=cfg.paths.models,
@@ -172,6 +236,7 @@ def profile_pipeline_breakdown(
         dtype=dtype,
         train_te=cfg.train.train_te,
         use_checkpointing=cfg.train.use_checkpointing,
+        train_only_output=train_only_output,
         model_type=model_type,
         model_cfg=cfg.models,
         autocast_dtype=autocast_dtype,
@@ -179,24 +244,20 @@ def profile_pipeline_breakdown(
 
     dataloader = create_dataloader(cfg, rank=0, tokenizer=tokenizer)
 
-    # VAE scaling constants
     vae_mean_val = getattr(cfg.models, "vae_mean", 0.0)
     vae_std_val = getattr(cfg.models, "vae_std", 1.0 / 0.18215)
-    vae_mean = torch.tensor(
-        vae_mean_val, device=device, dtype=dtype
-    ).view(1, -1, 1, 1)
-    vae_std = torch.tensor(
-        vae_std_val, device=device, dtype=dtype
-    ).view(1, -1, 1, 1)
+    vae_mean = torch.tensor(vae_mean_val, device=device, dtype=dtype).view(1, -1, 1, 1)
+    vae_std = torch.tensor(vae_std_val, device=device, dtype=dtype).view(1, -1, 1, 1)
     vae_batch_size = cfg.train.get(
         "vae_batch_size", cfg.models.get("vae_batch_size", 64)
     )
 
-    # Objective and Schedule
     if cfg.train.objective == "flow_matching":
         schedule = LinearSchedule(device=device)
         objective = FlowMatchingObjective(
             schedule=schedule,
+            prediction_target=getattr(cfg.train, "prediction_target", "v"),
+            loss_target=getattr(cfg.train, "loss_target", "v"),
             timestep_sampling=cfg.train.get("timestep_fn", "uniform"),
             shift=cfg.train.shift,
             use_ot=cfg.train.get("use_ot", False),
@@ -204,16 +265,10 @@ def profile_pipeline_breakdown(
         )
     else:
         schedule = DDPMSchedule(device=device)
-        objective = DDPMObjective(
-            schedule=schedule, min_snr_gamma=cfg.train.snr_gamma
-        )
+        objective = DDPMObjective(schedule=schedule, min_snr_gamma=cfg.train.snr_gamma)
 
     optimizer = create_optim(unet, text_encoder, cfg)
-    scaler = (
-        torch.cuda.amp.GradScaler()
-        if autocast_dtype == torch.float16
-        else None
-    )
+    scaler = torch.cuda.amp.GradScaler() if autocast_dtype == torch.float16 else None
 
     if compile_model and hasattr(torch, "compile"):
         print("Compiling backbone and text encoder with torch.compile...")
@@ -223,10 +278,8 @@ def profile_pipeline_breakdown(
         if cfg.train.train_te and text_encoder is not None:
             text_encoder = torch.compile(text_encoder)
 
-    # Backbone parameters and peak TFLOPS
-    backbone_params = sum(
-        p.numel() for p in unet.parameters() if p.requires_grad
-    )
+    trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in unet.parameters())
     peak_tflops = cfg.train.get("gpu_peak_tflops", 165.2)
     patch_size = getattr(unet, "patch_size", 2)
 
@@ -239,23 +292,23 @@ def profile_pipeline_breakdown(
     t_total_list: List[float] = []
     tokens_list: List[int] = []
 
-    print("\n" + "=" * 65)
-    print(f"Starting Profiling Breakdown ({model_type})")
+    print("\n" + "=" * 70)
+    print(f"PIPELINE PROFILING BREAKDOWN ({model_type.upper()})")
+    print(f"Mode: {'PIXEL (DiP)' if pixel_training else 'LATENT'}")
+    print(
+        f"Trainable Params: {trainable_params / 1e6:.2f}M / {total_params / 1e6:.2f}M"
+    )
     print(f"Warmup: {warmup_iters} steps | Active: {profile_iters} steps")
-    print("=" * 65)
+    print("=" * 70)
 
     data_iter = iter(dataloader)
     total_steps = warmup_iters + profile_iters
 
     for step in range(total_steps):
-        # 1. DataLoader Timing
         t_data_start = time.perf_counter()
         batch = next(data_iter)
         t_data_end = time.perf_counter()
         data_time_ms = (t_data_end - t_data_start) * 1000.0
-
-        is_streaming_batch = len(batch) >= 5
-        pos_map = None
 
         torch.cuda.synchronize()
         ev_start = torch.cuda.Event(enable_timing=True)
@@ -267,66 +320,40 @@ def profile_pipeline_breakdown(
 
         ev_start.record()
 
-        # 2. VAE Encoding Timing
-        if is_streaming_batch:
-            images, cond, mask, pos_map, tag_weights, *rest = batch
-            with torch.no_grad():
-                latents = encode_vae_latents_profiling(
-                    images=images,
-                    vae=vae,
-                    device=device,
-                    autocast_dtype=autocast_dtype,
-                    vae_mean=vae_mean,
-                    vae_std=vae_std,
-                    chunk_size=vae_batch_size,
-                )
-            attention_mask = mask.to(device, non_blocking=True)
-            cond = cond.to(device, non_blocking=True)
-            if pos_map is not None:
-                pos_map = pos_map.to(device, non_blocking=True)
-            tag_weights = tag_weights.to(
-                device, dtype=dtype, non_blocking=True
-            )
-        else:
-            latents = (
-                batch[0].to(device, dtype=dtype, non_blocking=True) * 0.18215
-            )
-            cond = batch[1].to(device, non_blocking=True)
-            tag_weights = batch[2].to(
-                device, dtype=dtype, non_blocking=True
-            )
-            attention_mask = batch[3].to(device, non_blocking=True)
-
+        # Unpack batch tensors
+        (
+            latents,
+            cond,
+            attention_mask,
+            tag_weights,
+            pos_map,
+        ) = unpack_batch(
+            batch=batch,
+            vae=vae,
+            device=device,
+            dtype=dtype,
+            autocast_dtype=autocast_dtype,
+            vae_mean=vae_mean,
+            vae_std=vae_std,
+            vae_batch_size=vae_batch_size,
+            is_latent=is_latent,
+            pixel_training=pixel_training,
+        )
         ev_vae_end.record()
 
-        # Mark dynamic dimensions to prevent torch.compile recompilations
+        # Dynamic shape marking for torch.compile
         if compile_model:
-            torch._dynamo.mark_dynamic(
-                latents, 0, min=1, max=MAX_BATCH_SIZE
-            )
-            torch._dynamo.mark_dynamic(
-                cond, 0, min=1, max=MAX_BATCH_SIZE
-            )
-            torch._dynamo.mark_dynamic(
-                cond, 1, min=16, max=512
-            )
+            torch._dynamo.mark_dynamic(latents, 0, min=1, max=MAX_BATCH_SIZE)
+            torch._dynamo.mark_dynamic(cond, 0, min=1, max=MAX_BATCH_SIZE)
+            torch._dynamo.mark_dynamic(cond, 1, min=16, max=512)
             if attention_mask is not None:
-                torch._dynamo.mark_dynamic(
-                    attention_mask, 0, min=1, max=MAX_BATCH_SIZE
-                )
-                torch._dynamo.mark_dynamic(
-                    attention_mask, 1, min=16, max=512
-                )
+                torch._dynamo.mark_dynamic(attention_mask, 0, min=1, max=MAX_BATCH_SIZE)
+                torch._dynamo.mark_dynamic(attention_mask, 1, min=16, max=512)
             if pos_map is not None:
-                torch._dynamo.mark_dynamic(
-                    pos_map, 0, min=1, max=MAX_BATCH_SIZE
-                )
+                torch._dynamo.mark_dynamic(pos_map, 0, min=1, max=MAX_BATCH_SIZE)
 
-        # 3. Text Encoder Timing
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(
-            device_type="cuda", dtype=autocast_dtype, enabled=True
-        ):
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=True):
             with torch.set_grad_enabled(cfg.train.train_te):
                 encoder_hidden_states, attention_mask = text_encoder(
                     cond,
@@ -335,10 +362,7 @@ def profile_pipeline_breakdown(
                 )
         ev_te_end.record()
 
-        # 4. Backbone Forward Pass
-        with torch.autocast(
-            device_type="cuda", dtype=autocast_dtype, enabled=True
-        ):
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=True):
             loss, metrics = objective.forward(
                 unet,
                 latents,
@@ -349,14 +373,12 @@ def profile_pipeline_breakdown(
             )
         ev_fwd_end.record()
 
-        # 5. Backward Pass
         if scaler:
             scaler.scale(loss).backward()
         else:
             loss.backward()
         ev_bwd_end.record()
 
-        # 6. Optimizer Step
         if scaler:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
@@ -378,13 +400,10 @@ def profile_pipeline_breakdown(
             t_total_gpu = ev_start.elapsed_time(ev_opt_end)
             t_total_step = data_time_ms + t_total_gpu
 
-            # Token calculation
-            bsz, _, h_lat, w_lat = latents.shape
-            img_tokens = (h_lat // patch_size) * (w_lat // patch_size)
+            bsz, _, h_sp, w_sp = latents.shape
+            img_tokens = (h_sp // patch_size) * (w_sp // patch_size)
             txt_tokens = (
-                attention_mask.bool().sum().item()
-                if attention_mask is not None
-                else 0
+                attention_mask.bool().sum().item() if attention_mask is not None else 0
             )
             step_tokens = (bsz * img_tokens) + txt_tokens
 
@@ -398,24 +417,21 @@ def profile_pipeline_breakdown(
             tokens_list.append(step_tokens)
 
             print(
-                f"Step {step - warmup_iters + 1:02d}/{profile_iters} -> "
-                f"Total: {t_total_step:.1f}ms | "
-                f"Data: {data_time_ms:.1f}ms | "
-                f"VAE: {t_vae:.1f}ms | "
-                f"TE: {t_te:.1f}ms | "
-                f"DiT Fwd: {t_fwd:.1f}ms | "
-                f"DiT Bwd: {t_bwd:.1f}ms | "
-                f"Opt: {t_opt:.1f}ms"
+                f"Step {step - warmup_iters + 1:02d}/{profile_iters} | "
+                f"Total: {t_total_step:6.1f}ms | "
+                f"Data: {data_time_ms:5.1f}ms | "
+                f"VAE: {t_vae:5.1f}ms | "
+                f"TE: {t_te:5.1f}ms | "
+                f"Fwd: {t_fwd:5.1f}ms | "
+                f"Bwd: {t_bwd:5.1f}ms | "
+                f"Opt: {t_opt:4.1f}ms"
             )
 
-    # Measure FLOPs without passing module to constructor
     print("\nMeasuring FLOPs using PyTorch FlopCounterMode...")
     flop_counter = FlopCounterMode(display=False)
     optimizer.zero_grad(set_to_none=True)
     with flop_counter:
-        with torch.autocast(
-            device_type="cuda", dtype=autocast_dtype, enabled=True
-        ):
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=True):
             loss, _ = objective.forward(
                 unet,
                 latents,
@@ -428,67 +444,63 @@ def profile_pipeline_breakdown(
 
     backbone_flops = flop_counter.get_total_flops()
 
-    # Summary Statistics
-    avg_data = np.mean(t_data_list)
-    avg_vae = np.mean(t_vae_list)
-    avg_te = np.mean(t_te_list)
-    avg_fwd = np.mean(t_fwd_list)
-    avg_bwd = np.mean(t_bwd_list)
-    avg_opt = np.mean(t_opt_list)
-    avg_total = np.mean(t_total_list)
-    avg_tokens = np.mean(tokens_list)
+    avg_data = float(np.mean(t_data_list))
+    avg_vae = float(np.mean(t_vae_list))
+    avg_te = float(np.mean(t_te_list))
+    avg_fwd = float(np.mean(t_fwd_list))
+    avg_bwd = float(np.mean(t_bwd_list))
+    avg_opt = float(np.mean(t_opt_list))
+    avg_total = float(np.mean(t_total_list))
+    avg_tokens = float(np.mean(tokens_list))
 
-    # Isolated vs System MFU
     t_backbone_s = (avg_fwd + avg_bwd) / 1000.0
     t_total_s = avg_total / 1000.0
 
-    isolated_tflops = (
-        (backbone_flops / t_backbone_s) / 1e12 if t_backbone_s > 0 else 0
-    )
-    isolated_mfu = (
-        (isolated_tflops / peak_tflops) * 100.0 if peak_tflops > 0 else 0
-    )
+    isolated_tflops = (backbone_flops / t_backbone_s) / 1e12 if t_backbone_s > 0 else 0
+    isolated_mfu = (isolated_tflops / peak_tflops) * 100.0 if peak_tflops > 0 else 0
 
-    std_model_flops = 6 * backbone_params * avg_tokens
-    system_tflops = (
-        (std_model_flops / t_total_s) / 1e12 if t_total_s > 0 else 0
+    # Calculate system MFU factoring in SPRINT token dropping if active
+    drop_factor = (
+        (1.0 - getattr(cfg.models, "drop_ratio", 0.0))
+        if model_type == "sprint_dual"
+        else 1.0
     )
-    system_mfu = (
-        (system_tflops / peak_tflops) * 100.0 if peak_tflops > 0 else 0
-    )
+    std_model_flops = 6 * trainable_params * avg_tokens * drop_factor
+    system_tflops = (std_model_flops / t_total_s) / 1e12 if t_total_s > 0 else 0
+    system_mfu = (system_tflops / peak_tflops) * 100.0 if peak_tflops > 0 else 0
 
     peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
 
-    print("\n" + "=" * 65)
+    print("\n" + "=" * 70)
     print("PROFILING & BOTTLENECK DIAGNOSTIC SUMMARY")
-    print("=" * 65)
-    print(f"Average Total Iteration Time : {avg_total:.2f} ms")
+    print("=" * 70)
+    print(f"Average Step Latency          : {avg_total:.2f} ms")
     print(f"Peak GPU Memory Allocated     : {peak_mem_mb:.2f} MB")
     print(
-        f"Data Loading Time (CPU/IO)    : {avg_data:.2f} ms "
-        f"({(avg_data / avg_total) * 100:.1f}%)"
+        f"Data Loading Time (CPU/IO)    : {avg_data:6.2f} ms "
+        f"({(avg_data / avg_total) * 100:4.1f}%)"
     )
     print(
-        f"In-Place VAE Encoding Time    : {avg_vae:.2f} ms "
-        f"({(avg_vae / avg_total) * 100:.1f}%)"
+        f"VAE Encode / Image Ingest     : {avg_vae:6.2f} ms "
+        f"({(avg_vae / avg_total) * 100:4.1f}%)"
     )
     print(
-        f"Text Encoder Forward Time     : {avg_te:.2f} ms "
-        f"({(avg_te / avg_total) * 100:.1f}%)"
+        f"Text Encoder Forward Time     : {avg_te:6.2f} ms "
+        f"({(avg_te / avg_total) * 100:4.1f}%)"
     )
     print(
-        f"Backbone Forward Pass Time    : {avg_fwd:.2f} ms "
-        f"({(avg_fwd / avg_total) * 100:.1f}%)"
+        f"Backbone Forward Pass Time    : {avg_fwd:6.2f} ms "
+        f"({(avg_fwd / avg_total) * 100:4.1f}%)"
     )
     print(
-        f"Backbone Backward Pass Time   : {avg_bwd:.2f} ms "
-        f"({(avg_bwd / avg_total) * 100:.1f}%)"
+        f"Backbone Backward Pass Time   : {avg_bwd:6.2f} ms "
+        f"({(avg_bwd / avg_total) * 100:4.1f}%)"
     )
     print(
-        f"Optimizer & Norm Clip Time    : {avg_opt:.2f} ms "
-        f"({(avg_opt / avg_total) * 100:.1f}%)"
+        f"Optimizer & Norm Clip Time    : {avg_opt:6.2f} ms "
+        f"({(avg_opt / avg_total) * 100:4.1f}%)"
     )
-    print("-" * 65)
+    print("-" * 70)
     print(f"Backbone FLOPs per Step       : {backbone_flops / 1e9:.2f} GFLOPs")
     print(f"Backbone Isolated Throughput  : {isolated_tflops:.2f} TFLOPS")
     print(
@@ -496,18 +508,19 @@ def profile_pipeline_breakdown(
         f"(Peak: {peak_tflops:.1f} TFLOPS)"
     )
     print(f"End-to-End System MFU         : {system_mfu:.2f}%")
-    print("=" * 65)
+    print("=" * 70)
 
     if (avg_data / avg_total) > 0.25:
         print(
             "[DIAGNOSTIC WARNING] DataLoader is consuming >25% of step time. "
-            "Consider increasing num_workers or caching pre-decoded images."
+            "Increase num_workers or cache latents to RAM/NVMe."
         )
-    if is_streaming_batch and (avg_vae / avg_total) > 0.25:
+    if not pixel_training and not is_latent and (avg_vae / avg_total) > 0.20:
         print(
-            "[DIAGNOSTIC WARNING] In-place VAE encoding is consuming >25% "
-            "of step time. Precomputing latents will immediately boost MFU."
+            "[DIAGNOSTIC WARNING] Online VAE encoding is consuming >20% "
+            "of step time. Precomputing latents to shards eliminates this cost."
         )
+
 
 def profile_pipeline_trace(
     cfg: DictConfig,
@@ -515,6 +528,8 @@ def profile_pipeline_trace(
     profile_iters: int = 5,
     output_dir: str = "profiling_results",
     compile_model: bool = False,
+    pixel_training: bool = False,
+    train_only_output: bool = False,
 ) -> None:
     """Captures an end-to-end PyTorch Profiler trace with operator scopes."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -531,6 +546,15 @@ def profile_pipeline_trace(
 
     model_type = getattr(cfg.models, "model_type", "dual_stream")
     is_dit = model_type in ["dual_stream", "sprint_dual"]
+    is_latent = (
+        cfg.data.get("is_latent", False)
+        or getattr(cfg.data, "dataset_type", "") == "streaming_latents"
+        or cfg.data.get("cache_latents_to_ram", False)
+    )
+
+    if pixel_training:
+        cfg.train.pixel_training = True
+        cfg.models.use_pixel_decoder = True
 
     unet, text_encoder, vae, tokenizer, ema = load_trainable_model(
         models_path=cfg.paths.models,
@@ -538,6 +562,7 @@ def profile_pipeline_trace(
         dtype=dtype,
         train_te=cfg.train.train_te,
         use_checkpointing=cfg.train.use_checkpointing,
+        train_only_output=train_only_output,
         model_type=model_type,
         model_cfg=cfg.models,
         autocast_dtype=autocast_dtype,
@@ -561,6 +586,8 @@ def profile_pipeline_trace(
         schedule = LinearSchedule(device=device)
         objective = FlowMatchingObjective(
             schedule=schedule,
+            prediction_target=getattr(cfg.train, "prediction_target", "v"),
+            loss_target=getattr(cfg.train, "loss_target", "v"),
             timestep_sampling=cfg.train.get("timestep_fn", "uniform"),
             shift=cfg.train.shift,
             use_ot=cfg.train.get("use_ot", False),
@@ -568,16 +595,10 @@ def profile_pipeline_trace(
         )
     else:
         schedule = DDPMSchedule(device=device)
-        objective = DDPMObjective(
-            schedule=schedule, min_snr_gamma=cfg.train.snr_gamma
-        )
+        objective = DDPMObjective(schedule=schedule, min_snr_gamma=cfg.train.snr_gamma)
 
     optimizer = create_optim(unet, text_encoder, cfg)
-    scaler = (
-        torch.cuda.amp.GradScaler()
-        if autocast_dtype == torch.float16
-        else None
-    )
+    scaler = torch.cuda.amp.GradScaler() if autocast_dtype == torch.float16 else None
 
     if compile_model and hasattr(torch, "compile"):
         patch_torch_compile()
@@ -586,7 +607,8 @@ def profile_pipeline_trace(
         if cfg.train.train_te and text_encoder is not None:
             text_encoder = torch.compile(text_encoder)
 
-    trace_name = f"{model_type}_{'compile' if compile_model else 'eager'}"
+    mode_prefix = "pixel" if pixel_training else "latent"
+    trace_name = f"{model_type}_{mode_prefix}_{'compile' if compile_model else 'eager'}"
     data_iter = iter(dataloader)
 
     print(f"Running PyTorch Profiler trace for {trace_name}...")
@@ -610,7 +632,7 @@ def profile_pipeline_trace(
             with torch.profiler.record_function("## dataloader ##"):
                 batch = next(data_iter)
 
-            with torch.profiler.record_function("## vae_encode ##"):
+            with torch.profiler.record_function("## ingest_or_vae ##"):
                 (
                     latents,
                     cond,
@@ -626,6 +648,8 @@ def profile_pipeline_trace(
                     vae_mean=vae_mean,
                     vae_std=vae_std,
                     vae_batch_size=vae_batch_size,
+                    is_latent=is_latent,
+                    pixel_training=pixel_training,
                 )
 
             optimizer.zero_grad(set_to_none=True)
@@ -673,6 +697,7 @@ def profile_pipeline_trace(
             prof.step()
 
     print(f"Trace profiling completed. Results exported to: {output_dir}")
+
 
 def flow_matching_step_min_rf(
     unet_model: torch.nn.Module,
@@ -1268,9 +1293,163 @@ def train_flow_matching_logging(
         print("Training finished.")
 
 
+@torch.inference_mode()
+def profile_sampling(
+    cfg: DictConfig,
+    num_samples: int = 16,
+    batch_size: int = 4,
+    steps: int = 30,
+    resolution: int = 512,
+    output_dir: str = "profiling_results",
+    compile_model: bool = False,
+    pixel_sampling: bool = False,
+) -> None:
+    """
+    Benchmarks generation latency across ODE trajectory steps, CFG
+    evaluations, VAE decoding, and host transfer to identify generation bottlenecks.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = (
+        torch.bfloat16
+        if getattr(cfg.train, "dtype", "bf16") == "bf16"
+        else torch.float32
+    )
+    autocast_dtype = (
+        torch.bfloat16
+        if getattr(cfg.train, "dtype", "bf16") == "bf16"
+        else torch.float16
+    )
+
+    model_type = getattr(cfg.models, "model_type", "dual_stream")
+    is_dit = model_type in ["dual_stream", "sprint_dual"]
+
+    unet, text_encoder, vae, tokenizer, _ = load_trainable_model(
+        models_path=cfg.paths.models,
+        device=device,
+        dtype=dtype,
+        train_te=False,
+        use_checkpointing=False,
+        model_type=model_type,
+        model_cfg=cfg.models,
+        autocast_dtype=autocast_dtype,
+    )
+    unet.eval().requires_grad_(False)
+    text_encoder.eval().requires_grad_(False)
+    if vae is not None:
+        vae.eval().requires_grad_(False)
+
+    if compile_model and hasattr(torch, "compile"):
+        print("Compiling sampling modules with torch.compile...")
+        patch_torch_compile()
+        unet = torch.compile(unet)
+        text_encoder = torch.compile(text_encoder)
+
+    schedule = LinearSchedule(device=device)
+
+    sample_configs = [
+        {
+            "prompt": (
+                "masterpiece, best quality, 1girl, hatsune miku, "
+                "vocaloid, looking at viewer, detailed background"
+            ),
+            "negative_prompt": "worst quality, low quality",
+            "height": resolution,
+            "width": resolution,
+            "sample_steps": steps,
+            "cfg_scale": 6.0,
+            "shift": 1.0,
+            "seed": 42 + i,
+        }
+        for i in range(num_samples)
+    ]
+
+    print("\n" + "=" * 70)
+    print(f"SAMPLING BENCHMARK ({num_samples} images, {steps} steps, {resolution}px)")
+    print(f"Mode: {'PIXEL' if pixel_sampling else 'LATENT + VAE DECODE'}")
+    print(f"Batch Size: {batch_size} | Device: {device}")
+    print("=" * 70)
+
+    # Warmup pass (2 samples)
+    _ = generate_samples(
+        unet=unet,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        vae=vae,
+        schedule=schedule,
+        sample_configs=sample_configs[:2],
+        global_batch_size=min(2, batch_size),
+        device=str(device),
+        dtype=dtype,
+        autocast_dtype=autocast_dtype,
+        use_unet_mult=False if is_dit else True,
+        pixel_sampling=pixel_sampling,
+    )
+    torch.cuda.synchronize()
+
+    # Active timed profiling
+    t_start = time.perf_counter()
+    ev_start = torch.cuda.Event(enable_timing=True)
+    ev_end = torch.cuda.Event(enable_timing=True)
+
+    torch.cuda.reset_peak_memory_stats(device)
+    ev_start.record()
+
+    images = generate_samples(
+        unet=unet,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        vae=vae,
+        schedule=schedule,
+        sample_configs=sample_configs,
+        global_batch_size=batch_size,
+        device=str(device),
+        dtype=dtype,
+        autocast_dtype=autocast_dtype,
+        use_unet_mult=False if is_dit else True,
+        pixel_sampling=pixel_sampling,
+    )
+
+    ev_end.record()
+    torch.cuda.synchronize()
+    t_end = time.perf_counter()
+
+    gpu_elapsed_ms = ev_start.elapsed_time(ev_end)
+    wall_elapsed_s = t_end - t_start
+
+    images_per_sec = num_samples / wall_elapsed_s
+    sec_per_image = wall_elapsed_s / num_samples
+    ms_per_step = (gpu_elapsed_ms / (num_samples * steps)) * batch_size
+    peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
+
+    print("\n" + "=" * 70)
+    print("SAMPLING PERFORMANCE SUMMARY")
+    print("=" * 70)
+    print(f"Total Wall Clock Time     : {wall_elapsed_s:.2f} s")
+    print(f"Total GPU Execution Time   : {gpu_elapsed_ms / 1000.0:.2f} s")
+    print(f"Overall Generation Rate    : {images_per_sec:.2f} images/sec")
+    print(f"Latency per Image          : {sec_per_image:.3f} s/image")
+    print(
+        f"Per-Step Trajectory Latency: {ms_per_step:.2f} ms/step (batch={batch_size})"
+    )
+    print(f"Peak VRAM Allocation       : {peak_mem_mb:.2f} MB")
+    print("=" * 70)
+
+    # Diagnostic projection for 97k dataset generation
+    projected_hours_97k = (97000.0 * sec_per_image) / 3600.0
+    print(
+        f"[SYSTEM PROJECTION] Generating 97,000 synthetic samples at this "
+        f"throughput requires: {projected_hours_97k:.2f} hours."
+    )
+    if not pixel_sampling and ms_per_step > 35.0:
+        print(
+            "[DIAGNOSTIC WARNING] High latency per step observed. Ensure "
+            "CFG interval clipping is active and batch_size is maximized."
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="CUDA & Pipeline Profiler for DiT / UNet Flow Matching."
+        description="CUDA & Pipeline Profiler for DiT / Pixel Flow Matching."
     )
     parser.add_argument(
         "--config",
@@ -1281,9 +1460,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["breakdown", "trace"],
+        choices=["breakdown", "trace", "sampling"],
         default="breakdown",
-        help="Profile mode: component breakdown or PyTorch profiler trace.",
+        help="Profile mode: component breakdown, Chrome trace, or sampling.",
     )
     parser.add_argument(
         "--output_dir",
@@ -1308,6 +1487,33 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable torch.compile during profiling.",
     )
+    parser.add_argument(
+        "--pixel_training",
+        action="store_true",
+        help="Enable pixel-space adaptation (DiP) profiling.",
+    )
+    parser.add_argument(
+        "--stage1",
+        action="store_true",
+        help="Profile Stage 1: train only x_embedder and pixel decoder.",
+    )
+    parser.add_argument(
+        "--online_vae",
+        action="store_true",
+        help="Force online VAE encoding profiling for raw images.",
+    )
+    parser.add_argument(
+        "--sample_steps",
+        type=int,
+        default=30,
+        help="Euler ODE steps for sampling mode benchmark.",
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=512,
+        help="Resolution for profiling runs.",
+    )
     parser.add_argument("opts", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -1316,7 +1522,6 @@ if __name__ == "__main__":
         cli_cfg = OmegaConf.from_cli(args.opts)
         cfg = OmegaConf.merge(base_cfg, cli_cfg)
     else:
-        # Fallback minimal configuration if run standalone
         cfg = OmegaConf.create(
             {
                 "paths": {"models": "models"},
@@ -1330,13 +1535,11 @@ if __name__ == "__main__":
                 },
                 "data": {
                     "dataset_type": "streaming",
-                    "streaming_dataset_name": (
-                        "aipracticecafe/curated-danbooru-2026"
-                    ),
-                    "resolution": 512,
+                    "streaming_dataset_name": ("aipracticecafe/curated-danbooru-2026"),
+                    "resolution": args.resolution,
                 },
                 "train": {
-                    "dtype": "bf16",
+                    "dtype": "fp32",
                     "batch_size": 4,
                     "train_te": False,
                     "use_checkpointing": True,
@@ -1349,6 +1552,9 @@ if __name__ == "__main__":
             }
         )
 
+    if args.online_vae:
+        cfg.data.is_latent = False
+
     if args.mode == "breakdown":
         profile_pipeline_breakdown(
             cfg=cfg,
@@ -1356,6 +1562,8 @@ if __name__ == "__main__":
             profile_iters=args.profile_iters,
             output_dir=args.output_dir,
             compile_model=args.compile,
+            pixel_training=args.pixel_training,
+            train_only_output=args.stage1,
         )
     elif args.mode == "trace":
         profile_pipeline_trace(
@@ -1364,122 +1572,22 @@ if __name__ == "__main__":
             profile_iters=args.profile_iters,
             output_dir=args.output_dir,
             compile_model=args.compile,
+            pixel_training=args.pixel_training,
+            train_only_output=args.stage1,
         )
+    elif args.mode == "sampling":
+        profile_sampling(
+            cfg=cfg,
+            num_samples=16,
+            batch_size=cfg.train.batch_size,
+            steps=args.sample_steps,
+            resolution=args.resolution,
+            output_dir=args.output_dir,
+            compile_model=args.compile,
+            pixel_sampling=args.pixel_training,
+        )
+
     exit()
-    # profiler = cProfile.Profile()
-    # profiler.enable()
-    seed = 46
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"Using device: {device}")
-
-    # Load model (U-Net part)
-    dtype = torch.float32
-    torch.cuda.empty_cache()
-    unet_model = unet = (
-        Unet(
-            UnetConfig(
-                block_out_channels=[dim // 2 for dim in [320, 640, 1280, 1280]],
-                cross_attention_dim=768,
-                norm_num_groups=16,
-                use_checkpointing=True,
-            )
-        )
-        .to(device)
-        .train()
-    )
-    # Enable gradients for all parameters in the U-Net part
-
-    for param in unet_model.parameters():
-        param.requires_grad = True
-    # only finetune output head
-    # unet_model.conv_norm_out.bias.requires_grad = True
-    # unet_model.conv_norm_out.weight.requires_grad = True
-    # unet_model.conv_out.bias.requires_grad = True
-    # unet_model.conv_out.weight.requires_grad = True
-
-    torch_compile_options = get_torch_compile_options(
-        epilogue_fusion=True,
-        max_autotune=True,
-        shape_padding=True,
-        debug=True,
-        cudagraphs=False,
-        coordinate_descent_tuning=False,
-        logging=True,
-        combo_kernels=False,
-        group_fusion=False,
-        memory_planning=False,
-        multi_kernel=False,
-        use_block_ptr=False,
-    )
-    patch_torch_compile(True)
-    patch_unsloth_smart_gradient_checkpointing(dtype=dtype)
-    patch_compiled_autograd()
-
-    def count_parameters(model):
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    print(f"Trainable parameters in unet: {count_parameters(unet) / 1e6} M")
-
-    # Memory stats
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated(device) / 1024**3  # Convert to GB
-        reserved = torch.cuda.memory_reserved(device) / 1024**3  # Convert to GB
-
-        print(f"\nAllocated memory: {allocated:.4f} GB")
-        print(f"Reserved memory: {reserved:.4f} GB\n")
-
-    # Dataset
-    METADATA_PATH = "latents/metadata.json"
-    H5_ROOT_DIR = "latents"
-    BASE_BATCH_SIZE = 4
-    BASE_AREA = 64 * 96  # latents base area 64*64
-    LENGTH_PENALTY = 0.1
-    DROP_LAST = False
-    SEED = 42
-    NUM_WORKERS = 1
-    PIN_MEMORY = True
-    PREFETCH_FACTOR = 2
-    PERSISTENT_WORKERS = True
-    INITIAL_EPOCH_FOCUS_LOW_RES = 2
-    LOW_RES_FOCUS_FACTOR = 3.0
-    LOW_RES_AREA_PERCENTILE = 0.4
-
-    world_size = torch.cuda.device_count()
-    rank = 0
-
-    dataset = H5LatentDataset(
-        metadata_path=METADATA_PATH,
-        h5_root_dir=H5_ROOT_DIR,
-    )
-
-    batch_sampler = BucketBatchSampler(
-        dataset=dataset,
-        base_batch_size=BASE_BATCH_SIZE,
-        base_resolution_area=BASE_AREA,
-        length_penalty_power=LENGTH_PENALTY,
-        drop_last=DROP_LAST,
-        seed=SEED,
-        world_size=world_size,
-        rank=rank,
-        initial_epoch_focus_low_res=INITIAL_EPOCH_FOCUS_LOW_RES,
-        low_res_focus_factor=LOW_RES_FOCUS_FACTOR,
-        low_res_area_percentile=LOW_RES_AREA_PERCENTILE,
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_sampler=batch_sampler,
-        num_workers=NUM_WORKERS,
-        pin_memory=PIN_MEMORY,
-        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
-        persistent_workers=PERSISTENT_WORKERS if NUM_WORKERS > 0 else False,
-        worker_init_fn=worker_init_fn,
-    )
-
     # train_flow_matching_min_rf(
     # model=unet_model, # Pass the U-Net part
     # train_loader=dataloader,

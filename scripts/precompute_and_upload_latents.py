@@ -12,6 +12,8 @@ import shutil
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 import time
+import math
+from PIL import Image
 
 from diffusers import AutoencoderKL
 from huggingface_hub import HfApi, hf_hub_download
@@ -35,15 +37,16 @@ logging.basicConfig(
 )
 
 
-def get_parquet_schema() -> pa.Schema:
+def get_parquet_schema(i1_dataset: bool = False) -> pa.Schema:
     """Defines PyArrow schema for precomputed latent shards."""
+    prompt_type = pa.list_(pa.string()) if i1_dataset else pa.string()
     return pa.schema(
         [
             ("booru_id", pa.string()),
             ("latent", pa.binary()),
             ("latent_shape", pa.list_(pa.int32())),
             ("latent_dtype", pa.string()),
-            ("prompt", pa.string()),
+            ("prompt", prompt_type),
             ("bucket_idx", pa.int32()),
             ("target_width", pa.int32()),
             ("target_height", pa.int32()),
@@ -57,9 +60,7 @@ def get_parquet_schema() -> pa.Schema:
     )
 
 
-def tensor_to_bytes(
-    tensor: torch.Tensor, dtype_str: str = "fp32"
-) -> bytes:
+def tensor_to_bytes(tensor: torch.Tensor, dtype_str: str = "fp32") -> bytes:
     """Fast conversion of a single tensor to raw bytes via NumPy."""
     t_cpu = tensor.detach().contiguous().cpu()
     dt = dtype_str.lower()
@@ -84,15 +85,16 @@ def batch_tensors_to_bytes(
         arr = t_cpu.to(torch.float32).numpy()
     return [arr[i].tobytes() for i in range(arr.shape[0])]
 
+
 def load_existing_shards(
-    dst_repo_id: str, hf_token: Optional[str] = None
+    dst_repo_id: str,
+    hf_token: Optional[str] = None,
+    **kwargs,
 ) -> Tuple[set, List[Dict[str, Any]], int]:
     """Loads completed sample IDs and metadata, deleting shards immediately."""
     api = HfApi(token=hf_token)
     try:
-        repo_files = api.list_repo_files(
-            repo_id=dst_repo_id, repo_type="dataset"
-        )
+        repo_files = api.list_repo_files(repo_id=dst_repo_id, repo_type="dataset")
     except Exception:
         return set(), [], 0
 
@@ -133,10 +135,7 @@ def load_existing_shards(
                         "sample_count": len(ids),
                     }
                 )
-                logging.info(
-                    f"Parsed {len(ids)} IDs from {sf}. "
-                    "Releasing disk space."
-                )
+                logging.info(f"Parsed {len(ids)} IDs from {sf}. Releasing disk space.")
             finally:
                 if local_path and os.path.exists(local_path):
                     os.remove(local_path)
@@ -147,6 +146,7 @@ def load_existing_shards(
     )
     next_shard_idx = len(shard_meta)
     return existing_ids, shard_meta, next_shard_idx
+
 
 def create_empty_columns() -> Dict[str, List[Any]]:
     """Creates columnar structure for fast PyArrow table instantiation."""
@@ -168,6 +168,171 @@ def create_empty_columns() -> Dict[str, List[Any]]:
     }
 
 
+def save_reconstruction_grid(
+    gt_imgs: torch.Tensor,
+    rec_imgs: torch.Tensor,
+    save_path: Path,
+) -> None:
+    """Saves a 2-row comparison grid (Row 0: GT, Row 1: VAE decoded)."""
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    # Map [-1, 1] range to uint8 [0, 255]
+    gt_clamped = (gt_imgs.clamp(-1.0, 1.0) * 0.5 + 0.5) * 255.0
+    rec_clamped = (rec_imgs.clamp(-1.0, 1.0) * 0.5 + 0.5) * 255.0
+
+    gt_u8 = gt_clamped.round().to(torch.uint8).cpu().permute(0, 2, 3, 1)
+    rec_u8 = rec_clamped.round().to(torch.uint8).cpu().permute(0, 2, 3, 1)
+
+    b, h, w, _ = gt_u8.shape
+    grid = Image.new("RGB", (b * w, 2 * h))
+
+    for idx in range(b):
+        im_gt = Image.fromarray(gt_u8[idx].numpy())
+        im_rec = Image.fromarray(rec_u8[idx].numpy())
+        grid.paste(im_gt, (idx * w, 0))
+        grid.paste(im_rec, (idx * w, h))
+
+    grid.save(save_path)
+    mse = torch.mean((gt_imgs - rec_imgs) ** 2).item()
+    psnr = 10.0 * math.log10(4.0 / max(mse, 1e-10))
+    logging.info(
+        f"Saved VAE reconstruction check grid to {save_path} "
+        f"(MSE: {mse:.6f}, PSNR: {psnr:.2f} dB)."
+    )
+
+
+@torch.no_grad()
+def verify_vae_reconstruction(
+    vae: torch.nn.Module,
+    sample_imgs: torch.Tensor,
+    vae_mean_t: torch.Tensor,
+    vae_std_t: torch.Tensor,
+    save_path: Path,
+    device: torch.device,
+    torch_dtype: torch.dtype,
+) -> None:
+    """Verifies latent encode/decode reconstruction fidelity."""
+    imgs_gpu = sample_imgs.to(device, non_blocking=True)
+    with torch.autocast(
+        device_type="cuda",
+        dtype=torch_dtype,
+        enabled=(device.type == "cuda"),
+    ):
+        enc = vae.encode(imgs_gpu)
+        dist = getattr(enc, "latent_dist", enc)
+        lats = dist.sample() if hasattr(dist, "sample") else dist
+
+        # Exact precomputation normalization and un-normalization
+        norm_lats = (lats - vae_mean_t) / vae_std_t
+        unnorm_lats = (norm_lats * vae_std_t) + vae_mean_t
+
+        vae_dtype = next(vae.parameters()).dtype
+        decoded = vae.decode(unnorm_lats.to(vae_dtype)).sample
+
+    save_reconstruction_grid(
+        gt_imgs=sample_imgs.float().cpu(),
+        rec_imgs=decoded.float().cpu(),
+        save_path=save_path,
+    )
+
+
+@torch.no_grad()
+def compute_online_vae_stats(
+    vae: torch.nn.Module,
+    stats_loader: DataLoader,
+    num_samples: int = 80000,
+    batch_size: int = 32,
+    device: torch.device = torch.device("cuda"),
+    torch_dtype: torch.dtype = torch.bfloat16,
+) -> Tuple[float, float, Optional[torch.Tensor]]:
+    """Computes empirical VAE mean and std via Chan's online algorithm."""
+    logging.info(
+        f"Calculating empirical statistics for latents across up to "
+        f"{num_samples} samples (batch_size={batch_size})..."
+    )
+    count = 0
+    mean = 0.0
+    m2 = 0.0
+    processed = 0
+    first_batch: Optional[torch.Tensor] = None
+
+    bucket_buffers: Dict[Tuple[int, int], List[torch.Tensor]] = defaultdict(list)
+    pbar = tqdm(total=num_samples, desc="Computing Empirical VAE Stats")
+
+    def _process_chunk(items: List[torch.Tensor]) -> None:
+        nonlocal count, mean, m2, processed, first_batch
+        if not items:
+            return
+
+        b_imgs = torch.stack(items, dim=0)
+        if first_batch is None:
+            first_batch = b_imgs[: min(len(b_imgs), 8)].clone().cpu()
+
+        imgs_gpu = b_imgs.to(device, non_blocking=True)
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch_dtype,
+            enabled=(device.type == "cuda"),
+        ):
+            enc = vae.encode(imgs_gpu)
+            dist = getattr(enc, "latent_dist", enc)
+            lats = dist.sample() if hasattr(dist, "sample") else dist
+
+        # Parallel combination update (Chan et al.) in float64
+        chunk_f64 = lats.detach().to(torch.float64)
+        n_b = chunk_f64.numel()
+        mean_b = chunk_f64.mean().item()
+        m2_b = ((chunk_f64 - mean_b) ** 2).sum().item()
+
+        if count == 0:
+            count = n_b
+            mean = mean_b
+            m2 = m2_b
+        else:
+            delta = mean_b - mean
+            count_next = count + n_b
+            mean = mean + delta * (n_b / count_next)
+            m2 = m2 + m2_b + (delta**2) * (count * n_b / count_next)
+            count = count_next
+
+        b_len = len(items)
+        processed += b_len
+        pbar.update(b_len)
+        items.clear()
+
+    for item in stats_loader:
+        img_tensor, res_h, res_w, _ = item
+        res_key = (int(res_h), int(res_w))
+        bucket_buffers[res_key].append(img_tensor)
+
+        if len(bucket_buffers[res_key]) >= batch_size:
+            _process_chunk(bucket_buffers[res_key])
+
+        if processed >= num_samples:
+            break
+
+    if processed < num_samples:
+        for res_key, items in list(bucket_buffers.items()):
+            if items and processed < num_samples:
+                take = min(len(items), num_samples - processed)
+                _process_chunk(items[:take])
+
+    pbar.close()
+
+    if count > 1:
+        emp_mean = float(mean)
+        emp_std = float(math.sqrt(m2 / (count - 1)))
+    else:
+        emp_mean = 0.0
+        emp_std = 1.0
+
+    emp_scale = 1.0 / emp_std if emp_std > 0 else 1.0
+    logging.info(f"Calculated Empirical Shift (Mean): {emp_mean:.4f}")
+    logging.info(f"Calculated Empirical Std: {emp_std:.4f}")
+    logging.info(f"Calculated Empirical Scale (1/Std): {emp_scale:.4f}")
+
+    return emp_mean, emp_std, first_batch
+
+
 class LatentExtractDataset(IterableDataset):
     """Worker-parallel dataset with ID-skip resume and session recovery."""
 
@@ -175,10 +340,12 @@ class LatentExtractDataset(IterableDataset):
         self,
         streaming_dataset: StreamingImageDataset,
         existing_ids: Optional[set] = None,
+        i1_dataset: bool = False,
     ):
         super().__init__()
         self.streaming_dataset = streaming_dataset
         self.existing_ids = existing_ids or set()
+        self.i1_dataset = i1_dataset
 
     def __iter__(self):
         max_retries = 5
@@ -192,30 +359,31 @@ class LatentExtractDataset(IterableDataset):
 
                     try:
                         img_tensor, res_h, res_w = (
-                            self.streaming_dataset._extract_resized_image(
-                                raw_sample
-                            )
+                            self.streaming_dataset._extract_resized_image(raw_sample)
                         )
                     except Exception as e:
-                        logging.warning(
-                            f"Worker failed to decode image: {e}"
-                        )
+                        logging.warning(f"Worker failed to decode image: {e}")
                         continue
 
                     orig_w = int(raw_sample.get("original_width", res_w))
                     orig_h = int(raw_sample.get("original_height", res_h))
-                    ar = float(
-                        raw_sample.get(
-                            "aspect_ratio", orig_w / max(1, orig_h)
-                        )
-                    )
+                    ar = float(raw_sample.get("aspect_ratio", orig_w / max(1, orig_h)))
 
+                    raw_prompt = raw_sample.get("prompt") or raw_sample.get("text", "")
+                    if self.i1_dataset:
+                        if isinstance(raw_prompt, (list, tuple)):
+                            prompt_val = [str(p) for p in raw_prompt]
+                        else:
+                            prompt_val = [str(raw_prompt)]
+                    else:
+                        # naive , join
+                        if isinstance(raw_prompt, (list, tuple)):
+                            prompt_val = ", ".join(str(p) for p in raw_prompt)
+                        else:
+                            prompt_val = str(raw_prompt)
                     meta = {
                         "booru_id": booru_id,
-                        "prompt": str(
-                            raw_sample.get("prompt")
-                            or raw_sample.get("text", "")
-                        ),
+                        "prompt": prompt_val,
                         "bucket_idx": int(raw_sample.get("bucket_idx", -1)),
                         "target_width": int(res_w),
                         "target_height": int(res_h),
@@ -223,12 +391,8 @@ class LatentExtractDataset(IterableDataset):
                         "original_height": orig_h,
                         "aspect_ratio": ar,
                         "tier": int(raw_sample.get("tier", 227)),
-                        "aesthetic_tier": int(
-                            raw_sample.get("aesthetic_tier", -1)
-                        ),
-                        "tag_weight": float(
-                            raw_sample.get("tag_weight", 1.0)
-                        ),
+                        "aesthetic_tier": int(raw_sample.get("aesthetic_tier", -1)),
+                        "tag_weight": float(raw_sample.get("tag_weight", 1.0)),
                     }
                     yield img_tensor, res_h, res_w, meta
                 break
@@ -258,11 +422,12 @@ class ShardUploader:
         hf_token: Optional[str] = None,
         compression: str = "SNAPPY",
         max_workers: int = 2,
+        i1_dataset: bool = False,
     ):
         self.dst_repo_id = dst_repo_id
         self.compression = compression
         self.api = HfApi(token=hf_token)
-        self.schema = get_parquet_schema()
+        self.schema = get_parquet_schema(i1_dataset=i1_dataset)
         self.temp_dir = Path(tempfile.mkdtemp(prefix="latent_shards_"))
         self.upload_executor = ThreadPoolExecutor(max_workers=max_workers)
         self.futures: List[Future] = []
@@ -367,40 +532,38 @@ def precompute_and_upload(
     num_workers: Optional[int] = None,
     device: str = "cuda",
     hf_token: Optional[str] = None,
+    i1_dataset: Optional[bool] = None,
+    compute_vae_stats: bool = False,
+    num_stat_samples: int = 80000,
+    save_dir: Optional[str] = None,
 ) -> None:
     """Executes high-throughput VAE precomputation and shard streaming."""
     device_obj, default_autocast_dtype = setup_cuda_environment(device)
 
+    is_i1 = i1_dataset if i1_dataset is not None else cfg.data.get("i1_dataset", False)
+
     src_ds = src_dataset or cfg.data.get(
         "streaming_dataset_name", "aipracticecafe/curated-danbooru-2026"
     )
-    dst_repo = (
-        dst_repo_id
-        or cfg.logging.get("hf_repo", None)
-        or f"{src_ds}-latents"
-    )
+    dst_repo = dst_repo_id or cfg.logging.get("hf_repo", None) or f"{src_ds}-latents"
     vae_path = (
         vae_pretrained
         or cfg.models.get("hf_vae", None)
         or cfg.models.get("vae_pretrained", "black-forest-labs/FLUX.1-dev")
     )
     res = cfg.data.get("resolution", 512)
-    bs = batch_size or cfg.models.get(
-        "vae_batch_size", cfg.train.get("batch_size", 32)
-    )
+    bs = batch_size or cfg.models.get("vae_batch_size", cfg.train.get("batch_size", 32))
     workers = (
         num_workers
         if num_workers is not None
-        else cfg.data.get(
-            "precompute_num_workers", cfg.train.get("num_workers", 8)
-        )
+        else cfg.data.get("precompute_num_workers", cfg.train.get("num_workers", 8))
     )
     prefetch = cfg.data.get(
         "precompute_prefetch_factor", cfg.train.get("prefetch_factor", 4)
     )
     logging.info(
         f"Precomputing latents with {workers} workers "
-        f"(Batch Size: {bs}, Prefetch: {prefetch})..."
+        f"(Batch Size: {bs}, Prefetch: {prefetch}), i1_dataset: {is_i1})......"
     )
     dt_str = dtype_str or cfg.train.get("dtype", "bf16")
     dtype_map = {
@@ -413,8 +576,6 @@ def precompute_and_upload(
     }
     torch_dtype = dtype_map.get(dt_str.lower(), default_autocast_dtype)
 
-    vae_mean = getattr(cfg.models, "vae_mean", 0.0)
-    vae_std = getattr(cfg.models, "vae_std", 1.0)
     in_channels = cfg.models.get("in_channels", 32)
     patch_size = cfg.data.get("patch_size", 2)
     vae_downsample = cfg.data.get("vae_downsample_factor", 8)
@@ -427,9 +588,6 @@ def precompute_and_upload(
     vae.eval()
     vae.requires_grad_(False)
 
-    vae_mean_t = torch.tensor(vae_mean, device=device_obj, dtype=torch_dtype)
-    vae_std_t = torch.tensor(vae_std, device=device_obj, dtype=torch_dtype)
-
     streaming_dataset = StreamingImageDataset(
         dataset_name=src_ds,
         dataset_path=cfg.data.get("dataset_path", None),
@@ -441,9 +599,80 @@ def precompute_and_upload(
         low_ram=getattr(cfg.data, "low_ram", False),
     )
 
+    verification_batch = None
+    if compute_vae_stats:
+        logging.info("Computing empirical VAE statistics in-place...")
+        stats_dataset = LatentExtractDataset(
+            streaming_dataset,
+            existing_ids=set(),
+            i1_dataset=is_i1,
+        )
+        stats_loader = DataLoader(
+            stats_dataset,
+            batch_size=None,
+            num_workers=workers,
+            pin_memory=(device_obj.type == "cuda"),
+            prefetch_factor=prefetch if workers > 0 else None,
+            persistent_workers=False,
+            worker_init_fn=_worker_init_fn,
+        )
+        vae_mean, vae_std, verification_batch = compute_online_vae_stats(
+            vae=vae,
+            stats_loader=stats_loader,
+            num_samples=num_stat_samples,
+            batch_size=bs,
+            device=device_obj,
+            torch_dtype=torch_dtype,
+        )
+        del stats_loader, stats_dataset
+        from src.data.streaming_dataset import _reset_http_sessions
+
+        _reset_http_sessions()
+        torch.cuda.empty_cache()
+    else:
+        vae_mean = getattr(cfg.models, "vae_mean", 0.0)
+        vae_std = getattr(cfg.models, "vae_std", 1.0)
+        logging.info(
+            f"Using configured VAE stats: Mean={vae_mean:.4f}, Std={vae_std:.4f}"
+        )
+
+    vae_mean_t = torch.tensor(vae_mean, device=device_obj, dtype=torch_dtype)
+    vae_std_t = torch.tensor(vae_std, device=device_obj, dtype=torch_dtype)
+
+    check_dir = Path(save_dir) if save_dir else Path("results/encode")
+    recon_save_path = check_dir / "vae_reconstruction_check.png"
+
+    if verification_batch is None:
+        probe_items = []
+        for raw_sample in streaming_dataset.iter_raw():
+            try:
+                img_t, _, _ = streaming_dataset._extract_resized_image(raw_sample)
+                probe_items.append(img_t)
+                if len(probe_items) >= min(bs, 8):
+                    break
+            except Exception:
+                continue
+        if probe_items:
+            verification_batch = torch.stack(probe_items, dim=0)
+
+    if verification_batch is not None and len(verification_batch) > 0:
+        logging.info(
+            "Executing VAE reconstruction validation check before precompute..."
+        )
+        verify_vae_reconstruction(
+            vae=vae,
+            sample_imgs=verification_batch,
+            vae_mean_t=vae_mean_t,
+            vae_std_t=vae_std_t,
+            save_path=recon_save_path,
+            device=device_obj,
+            torch_dtype=torch_dtype,
+        )
+
     uploader = ShardUploader(
         dst_repo_id=dst_repo,
         hf_token=hf_token,
+        i1_dataset=is_i1,
     )
     shard_metadata_list: List[Dict[str, Any]] = []
     shard_counter = 0
@@ -452,11 +681,10 @@ def precompute_and_upload(
     existing_ids, shard_metadata_list, shard_counter = load_existing_shards(
         dst_repo_id=dst_repo,
         hf_token=hf_token,
+        i1_dataset=is_i1,
     )
 
-    extract_dataset = LatentExtractDataset(
-        streaming_dataset, existing_ids=existing_ids
-    )
+    extract_dataset = LatentExtractDataset(streaming_dataset, existing_ids=existing_ids)
     prefetch_loader = DataLoader(
         extract_dataset,
         batch_size=None,
@@ -478,7 +706,6 @@ def precompute_and_upload(
     current_shard_columns: Dict[str, List[Any]] = create_empty_columns()
     current_shard_count = 0
 
-    
     def _flush_bucket(items: List[Any]) -> None:
         nonlocal shard_counter, current_shard_columns, current_shard_count
         if not items:
@@ -488,9 +715,7 @@ def precompute_and_upload(
         imgs = torch.stack([item[0] for item in items], dim=0)
         imgs_gpu = imgs.to(device_obj, non_blocking=True)
 
-        with torch.autocast(
-            device_type="cuda", dtype=torch_dtype, enabled=True
-        ):
+        with torch.autocast(device_type="cuda", dtype=torch_dtype, enabled=True):
             enc = vae.encode(imgs_gpu)
             dist = getattr(enc, "latent_dist", enc)
             lats = dist.sample() if hasattr(dist, "sample") else dist
@@ -503,23 +728,13 @@ def precompute_and_upload(
 
         # Vectorized batch extension to avoid per-element Python overhead
         metas = [item[1] for item in items]
-        current_shard_columns["booru_id"].extend(
-            [m["booru_id"] for m in metas]
-        )
+        current_shard_columns["booru_id"].extend([m["booru_id"] for m in metas])
         current_shard_columns["latent"].extend(raw_bytes_list)
-        current_shard_columns["latent_shape"].extend(
-            [shape_list] * b_size
-        )
+        current_shard_columns["latent_shape"].extend([shape_list] * b_size)
         current_shard_columns["latent_dtype"].extend([dt_str] * b_size)
-        current_shard_columns["prompt"].extend(
-            [m["prompt"] for m in metas]
-        )
-        current_shard_columns["bucket_idx"].extend(
-            [m["bucket_idx"] for m in metas]
-        )
-        current_shard_columns["target_width"].extend(
-            [m["target_width"] for m in metas]
-        )
+        current_shard_columns["prompt"].extend([m["prompt"] for m in metas])
+        current_shard_columns["bucket_idx"].extend([m["bucket_idx"] for m in metas])
+        current_shard_columns["target_width"].extend([m["target_width"] for m in metas])
         current_shard_columns["target_height"].extend(
             [m["target_height"] for m in metas]
         )
@@ -529,26 +744,18 @@ def precompute_and_upload(
         current_shard_columns["original_height"].extend(
             [m["original_height"] for m in metas]
         )
-        current_shard_columns["aspect_ratio"].extend(
-            [m["aspect_ratio"] for m in metas]
-        )
-        current_shard_columns["tier"].extend(
-            [m["tier"] for m in metas]
-        )
+        current_shard_columns["aspect_ratio"].extend([m["aspect_ratio"] for m in metas])
+        current_shard_columns["tier"].extend([m["tier"] for m in metas])
         current_shard_columns["aesthetic_tier"].extend(
             [m["aesthetic_tier"] for m in metas]
         )
-        current_shard_columns["tag_weight"].extend(
-            [m["tag_weight"] for m in metas]
-        )
+        current_shard_columns["tag_weight"].extend([m["tag_weight"] for m in metas])
 
         current_shard_count += b_size
         pbar.update(b_size)
 
         if current_shard_count >= samples_per_shard:
-            meta_info = uploader.stage_and_upload(
-                current_shard_columns, shard_counter
-            )
+            meta_info = uploader.stage_and_upload(current_shard_columns, shard_counter)
             shard_metadata_list.append(meta_info)
             shard_counter += 1
             current_shard_columns = create_empty_columns()
@@ -569,14 +776,11 @@ def precompute_and_upload(
             _flush_bucket(items)
 
     if current_shard_count > 0:
-        meta_info = uploader.stage_and_upload(
-            current_shard_columns, shard_counter
-        )
+        meta_info = uploader.stage_and_upload(current_shard_columns, shard_counter)
         shard_metadata_list.append(meta_info)
         shard_counter += 1
         current_shard_columns = create_empty_columns()
         current_shard_count = 0
-
 
     pbar.close()
 
@@ -585,6 +789,7 @@ def precompute_and_upload(
         "num_shards": len(shard_metadata_list),
         "samples_per_shard": samples_per_shard,
         "length_tiers": streaming_dataset.length_tiers,
+        "i1_dataset": is_i1,
         "shards": shard_metadata_list,
         "bucket_info": streaming_dataset.bucket_info,
         "vae_config": {
@@ -657,6 +862,24 @@ def main():
         default=os.environ.get("HF_TOKEN", None),
         help="Hugging Face write token.",
     )
+    parser.add_argument(
+        "--i1_dataset",
+        action="store_true",
+        default=None,
+        help="Use i1 multi-caption list schema (pa.list_(pa.string())).",
+    )
+    parser.add_argument(
+        "--compute_vae_stats",
+        action="store_true",
+        default=False,
+        help="Compute empirical VAE mean and std from dataset before encoding.",
+    )
+    parser.add_argument(
+        "--num_stat_samples",
+        type=int,
+        default=80000,
+        help="Number of samples to compute VAE statistics over.",
+    )
     args = parser.parse_args()
 
     cfg = (
@@ -682,8 +905,13 @@ def main():
         samples_per_shard=args.samples_per_shard,
         num_workers=args.num_workers,
         hf_token=args.hf_token,
+        i1_dataset=args.i1_dataset,
+        compute_vae_stats=args.compute_vae_stats,
+        num_stat_samples=args.num_stat_samples,
+        save_dir=save_dir,
     )
 
 
 if __name__ == "__main__":
     main()
+

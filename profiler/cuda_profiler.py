@@ -5,6 +5,7 @@ import socket
 import logging
 from datetime import datetime
 from typing import Dict, Any, Tuple, Optional, List
+import torch.multiprocessing as mp
 
 import torch
 import torch.nn as nn
@@ -126,54 +127,6 @@ def encode_vae_latents_profiling(
     return (lat - vae_mean) / vae_std
 
 
-def unpack_batch(
-    batch: Any,
-    vae: Optional[nn.Module],
-    device: torch.device,
-    dtype: torch.dtype,
-    autocast_dtype: torch.dtype,
-    vae_mean: torch.Tensor,
-    vae_std: torch.Tensor,
-    vae_batch_size: int = 64,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    Optional[torch.Tensor],
-]:
-    """
-    Unpacks batch tensors from either streaming (RGB) or H5 (latents) loaders.
-    """
-    pos_map = None
-    if len(batch) >= 5:
-        # StreamingImageDataset batch format
-        images, cond, mask, pos_map, tag_weights, *rest = batch
-        with torch.no_grad():
-            latents = encode_vae_latents_profiling(
-                images=images,
-                vae=vae,
-                device=device,
-                autocast_dtype=autocast_dtype,
-                vae_mean=vae_mean,
-                vae_std=vae_std,
-                chunk_size=vae_batch_size,
-            )
-        attention_mask = mask.to(device, non_blocking=True)
-        cond = cond.to(device, non_blocking=True)
-        if pos_map is not None:
-            pos_map = pos_map.to(device, non_blocking=True)
-        tag_weights = tag_weights.to(device, dtype=dtype, non_blocking=True)
-    else:
-        # H5LatentDataset batch format
-        latents = batch[0].to(device, dtype=dtype, non_blocking=True) * 0.18215
-        cond = batch[1].to(device, non_blocking=True)
-        tag_weights = batch[2].to(device, dtype=dtype, non_blocking=True)
-        attention_mask = batch[3].to(device, non_blocking=True)
-
-    return latents, cond, attention_mask, tag_weights, pos_map
-
-
 def trace_handler(
     prof: torch.profiler.profile,
     output_dir: str = "profiling_results",
@@ -292,9 +245,11 @@ def profile_pipeline_breakdown(
     t_total_list: List[float] = []
     tokens_list: List[int] = []
 
+    print(cfg)
     print("\n" + "=" * 70)
     print(f"PIPELINE PROFILING BREAKDOWN ({model_type.upper()})")
     print(f"Mode: {'PIXEL (DiP)' if pixel_training else 'LATENT'}")
+    print(f"Using latents {is_latent} and {cfg.data.get('is_latent', False)}")
     print(
         f"Trainable Params: {trainable_params / 1e6:.2f}M / {total_params / 1e6:.2f}M"
     )
@@ -1363,6 +1318,18 @@ def profile_sampling(
         for i in range(num_samples)
     ]
 
+    vae_mean = torch.tensor(
+        getattr(cfg.models, "vae_mean", 0.0), device=device, dtype=dtype
+    ).view(1, -1, 1, 1)
+    vae_std = torch.tensor(
+        getattr(cfg.models, "vae_std", 1.0 / 0.18215),
+        device=device,
+        dtype=dtype,
+    ).view(1, -1, 1, 1)
+    in_channels = cfg.models.get("in_channels", 4)
+    print(f"Using channels {in_channels}")
+    prediction_target = getattr(cfg.train, "prediction_target", "v")
+
     print("\n" + "=" * 70)
     print(f"SAMPLING BENCHMARK ({num_samples} images, {steps} steps, {resolution}px)")
     print(f"Mode: {'PIXEL' if pixel_sampling else 'LATENT + VAE DECODE'}")
@@ -1380,9 +1347,30 @@ def profile_sampling(
         global_batch_size=min(2, batch_size),
         device=str(device),
         dtype=dtype,
-        autocast_dtype=autocast_dtype,
+        diffusion_type=cfg.train.objective,
         use_unet_mult=False if is_dit else True,
+        vae_mean=vae_mean,
+        vae_std=vae_std,
+        vae_batch_size=1,
+        in_channels=in_channels,
         pixel_sampling=pixel_sampling,
+        prediction_target=prediction_target,
+        noise_scale=1.0 if not pixel_sampling else 2.0,
+        clip_prediction=getattr(
+            cfg.sampling,
+            "clip_prediction",
+            pixel_sampling,
+        ),
+        dynamic_thresholding=getattr(
+            cfg.sampling,
+            "dynamic_thresholding",
+            pixel_sampling,
+        ),
+        cfg_interval=getattr(
+            cfg.sampling,
+            "cfg_interval",
+            (0.0, 0.90) if pixel_sampling else (0.0, 1.0),
+        ),
     )
     torch.cuda.synchronize()
 
@@ -1448,6 +1436,18 @@ def profile_sampling(
 
 
 if __name__ == "__main__":
+    # Force 'fork' on Linux to prevent Python 3.14 forkserver crash
+    # with DataLoader workers (PyTorch reduction rebuild_storage_fd EINVAL)
+    try:
+        mp.set_start_method("fork", force=True)
+    except RuntimeError:
+        pass
+
+    try:
+        mp.set_sharing_strategy("file_system")
+    except RuntimeError:
+        pass
+
     parser = argparse.ArgumentParser(
         description="CUDA & Pipeline Profiler for DiT / Pixel Flow Matching."
     )
@@ -1531,7 +1531,7 @@ if __name__ == "__main__":
                     "depth": 16,
                     "num_heads": 12,
                     "patch_size": 2,
-                    "in_channels": 4,
+                    "in_channels": 32,
                 },
                 "data": {
                     "dataset_type": "streaming",
@@ -1551,6 +1551,7 @@ if __name__ == "__main__":
                 },
             }
         )
+        print("Using default config.")
 
     if args.online_vae:
         cfg.data.is_latent = False

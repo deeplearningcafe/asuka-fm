@@ -64,6 +64,9 @@ def generate_images_ui(
     y_shift: float,
     shift: float,
     output_dir: str,
+    noise_scale: Optional[float] = None,
+    dynamic_thresholding: Optional[bool] = None,
+    clip_prediction: Optional[bool] = None,
 ) -> List[Image.Image]:
     """Runs sampling through the diffusion pipeline and embeds metadata."""
     cfg = model_bundle["cfg"]
@@ -82,11 +85,27 @@ def generate_images_ui(
     coord_system = model_bundle["coord_system"]
     objective = cfg.train.get("objective", "flow_matching")
 
-    pixel_sampling = getattr(cfg.train, "pixel_training", False)
+    pixel_sampling = model_bundle.get(
+        "pixel_sampling",
+        getattr(cfg.train, "pixel_training", False),
+    )
     prediction_target = getattr(cfg.train, "prediction_target", "v")
-    noise_scale = float(getattr(cfg.train, "noise_scale", 1.0))
-    clip_prediction = getattr(cfg.sampling, "clip_prediction", pixel_sampling)
-    dynamic_thresholding = getattr(cfg.sampling, "dynamic_thresholding", pixel_sampling)
+
+    noise_scale = (
+        float(noise_scale)
+        if noise_scale is not None
+        else float(getattr(cfg.train, "noise_scale", 2.0 if pixel_sampling else 1.0))
+    )
+    dyn_thresh = (
+        bool(dynamic_thresholding)
+        if dynamic_thresholding is not None
+        else getattr(cfg.sampling, "dynamic_thresholding", pixel_sampling)
+    )
+    clip_pred = (
+        bool(clip_prediction)
+        if clip_prediction is not None
+        else getattr(cfg.sampling, "clip_prediction", pixel_sampling)
+    )
     cfg_interval = getattr(
         cfg.sampling,
         "cfg_interval",
@@ -163,6 +182,11 @@ def generate_images_ui(
             "objective": objective,
             "model_type": getattr(cfg.models, "model_type", "unet"),
             "checkpoint": getattr(cfg.models, "resume_from_checkpoint", "base"),
+            "pixel_sampling": pixel_sampling,
+            "noise_scale": noise_scale,
+            "dynamic_thresholding": dyn_thresh,
+            "clip_prediction": clip_pred,
+            "cfg_interval": cfg_interval,
         }
         png_info = PngInfo()
         png_info.add_text("parameters", json.dumps(meta_payload))
@@ -226,6 +250,18 @@ def send_to_generation(image: Optional[Image.Image]) -> List[Any]:
 
 def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
     """Builds Gradio UI Blocks application."""
+
+    cfg = model_bundle["cfg"]
+    pixel_sampling = model_bundle.get(
+        "pixel_sampling",
+        getattr(cfg.train, "pixel_training", False),
+    )
+
+    default_cfg_val = getattr(cfg.sampling, "cfg_scale", 6.0)
+    adjusted_default_cfg = (
+        min(float(default_cfg_val), 2.5) if pixel_sampling else float(default_cfg_val)
+    )
+
     theme = gr.themes.Soft(
         primary_hue="blue",
         neutral_hue="slate",
@@ -241,7 +277,8 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
     with gr.Blocks(
         title="Asuka Flow Matching Playground", theme=theme, js=js_func
     ) as demo:
-        gr.Markdown("# Flow Matching DiT / UNet Sampling Studio")
+        mode_str = "Pixel Space (Direct)" if pixel_sampling else "Latent Space"
+        gr.Markdown(f"# Flow Matching DiT / UNet Sampling Studio ({mode_str})")
 
         with gr.Tabs():
             with gr.Tab("Generation"):
@@ -276,7 +313,47 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
                                 1, 150, value=30, step=1, label="Sampling Steps"
                             )
                             cfg_scale = gr.Slider(
-                                1.0, 20.0, value=6.0, step=0.5, label="CFG Scale"
+                                1.0,
+                                20.0,
+                                value=adjusted_default_cfg,
+                                step=0.5,
+                                label="CFG Scale",
+                            )
+
+                        with gr.Row():
+                            noise_scale = gr.Slider(
+                                0.5,
+                                4.0,
+                                value=float(
+                                    getattr(
+                                        cfg.train,
+                                        "noise_scale",
+                                        2.0 if pixel_sampling else 1.0,
+                                    )
+                                ),
+                                step=0.1,
+                                label="Noise Scale",
+                            )
+                            shift = gr.Slider(
+                                0.1, 5.0, value=1.0, step=0.1, label="Time Shift"
+                            )
+
+                        with gr.Row():
+                            dynamic_thresh = gr.Checkbox(
+                                value=getattr(
+                                    cfg.sampling,
+                                    "dynamic_thresholding",
+                                    pixel_sampling,
+                                ),
+                                label="Dynamic Thresholding (Imagen)",
+                            )
+                            clip_pred = gr.Checkbox(
+                                value=getattr(
+                                    cfg.sampling,
+                                    "clip_prediction",
+                                    pixel_sampling,
+                                ),
+                                label="Static Clip [-1, 1]",
                             )
 
                         with gr.Row():
@@ -347,6 +424,9 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
             ys_val,
             shift_val,
             out_val,
+            noise_scale_val,
+            dynamic_thresh_val,
+            clip_pred_val,
         ):
             return generate_images_ui(
                 model_bundle=model_bundle,
@@ -364,6 +444,9 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
                 y_shift=float(ys_val),
                 shift=float(shift_val),
                 output_dir=out_val,
+                noise_scale=float(noise_scale_val),
+                dynamic_thresholding=bool(dynamic_thresh_val),
+                clip_prediction=bool(clip_pred_val),
             )
 
         generate_btn.click(
@@ -383,6 +466,9 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
                 y_shift,
                 shift,
                 output_dir,
+                noise_scale,
+                dynamic_thresh,
+                clip_pred,
             ],
             outputs=[gallery],
         )
@@ -485,6 +571,12 @@ def main():
     else:
         schedule = DDPMSchedule(device=device)
 
+    pixel_sampling = (
+        getattr(cfg.train, "pixel_training", False)
+        or getattr(cfg.models, "use_pixel_decoder", False)
+        or (getattr(cfg.models, "in_channels", 4) == 3)
+    )
+
     vae_mean = getattr(cfg.models, "vae_mean", 0.0)
     vae_std = getattr(cfg.models, "vae_std", 1.0 / 0.18215)
     vae_mean = torch.tensor(vae_mean, device=device, dtype=dtype).view(1, -1, 1, 1)
@@ -509,6 +601,7 @@ def main():
             if getattr(cfg.models, "use_calibrated_spatial", False)
             else "discrete"
         ),
+        "pixel_sampling": pixel_sampling,
     }
 
     timestamp_folder = datetime.now().strftime("%Y-%m-%d-%H-%M")

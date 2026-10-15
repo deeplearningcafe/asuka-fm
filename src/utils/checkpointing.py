@@ -42,8 +42,12 @@ def adapt_patch_embed_weight(
     if src_weight.shape == target_shape:
         return src_weight
 
-    # 4D Conv2d weights: [out_channels, in_channels, kh, kw]
     if src_weight.ndim == 4 and len(target_shape) == 4:
+        if src_weight.shape[:2] != target_shape[:2]:
+            raise ValueError(
+                f"Channel mismatch: src {src_weight.shape[:2]} vs "
+                f"target {target_shape[:2]}."
+            )
         k_h = target_shape[2] // src_weight.shape[2]
         k_w = target_shape[3] // src_weight.shape[3]
         if (
@@ -52,18 +56,26 @@ def adapt_patch_embed_weight(
             and target_shape[2] == src_weight.shape[2] * k_h
             and target_shape[3] == src_weight.shape[3] * k_w
         ):
-            return src_weight.repeat(1, 1, k_h, k_w) / float(k_h)
+            # Scale by 1/k_h (= 1/2 for 2x doubling) to preserve variance
+            scaled = src_weight.repeat(1, 1, k_h, k_w) / float(k_h)
+            return scaled.contiguous()
 
     # 2D Linear weights: [hidden_size, in_channels * p^2]
     if src_weight.ndim == 2 and len(target_shape) == 2:
+        if src_weight.shape[0] != target_shape[0]:
+            raise ValueError(
+                f"Hidden size mismatch: src {src_weight.shape[0]} vs "
+                f"target {target_shape[0]}."
+            )
         ratio = target_shape[1] // src_weight.shape[1]
         k = int(math.isqrt(ratio))
         if k * k == ratio and k > 1:
             d, in_features = src_weight.shape
-            p_old = int(math.isqrt(in_features // 3))
-            w_2d = src_weight.view(d, 3, p_old, p_old)
+            in_ch = 3 if in_features % 3 == 0 else 1
+            p_old = int(math.isqrt(in_features // in_ch))
+            w_2d = src_weight.view(d, in_ch, p_old, p_old)
             w_tiled = w_2d.repeat(1, 1, k, k) / float(k)
-            return w_tiled.reshape(d, target_shape[1])
+            return w_tiled.reshape(d, target_shape[1]).contiguous()
 
     raise ValueError(
         f"Cannot adapt patch embed weight from {src_weight.shape} to {target_shape}."

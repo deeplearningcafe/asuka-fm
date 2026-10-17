@@ -146,6 +146,23 @@ def generate_benchmark_images(
         torch.bfloat16 if cfg.train.get("dtype", "bf16") == "bf16" else torch.float32
     )
 
+    autocast_dtype = torch.bfloat16
+    capability = torch.cuda.get_device_capability()
+    if capability[0] >= 7 and capability[0] < 8:
+        autocast_dtype = torch.float16
+        torch.set_float32_matmul_precision("high")
+        logging.info("Using high precision for float32 matmul (tensor cores).")
+    elif capability[0] >= 8:
+        torch.set_float32_matmul_precision("medium")
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        logging.info("Using half precision for float32 matmul (tensor cores).")
+    else:
+        logging.info(
+            "Tensor cores for float32 matmul not optimally supported or GPU is older."
+        )
     logging.info("Loading model weights and components...")
     unet, text_encoder, vae, tokenizer, _ = load_trainable_model(
         models_path=cfg.paths.models,
@@ -158,11 +175,13 @@ def generate_benchmark_images(
         global_rank=0,
         model_type=getattr(cfg.models, "model_type", "dual_stream"),
         model_cfg=cfg.models,
-        autocast_dtype=torch.bfloat16,
+        autocast_dtype=autocast_dtype,
     )
     unet.eval().requires_grad_(False)
     text_encoder.eval().requires_grad_(False)
     vae.eval().requires_grad_(False)
+    unet = torch.compile(unet)
+    text_encoder = torch.compile(text_encoder)
 
     schedule = LinearSchedule(device=device_obj)
     vae_mean = getattr(cfg.models, "vae_mean", 0.0)
@@ -281,6 +300,7 @@ def main():
     cfg = OmegaConf.load(args.config)
     if args.checkpoint:
         cfg.models.resume_from_checkpoint = args.checkpoint
+    cfg.models.drop_ratio = 0.0
 
     generate_benchmark_images(
         cfg=cfg,

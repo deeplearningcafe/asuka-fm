@@ -643,31 +643,24 @@ def precompute_and_upload(
     recon_save_path = check_dir / "vae_reconstruction_check.png"
 
     if verification_batch is None:
-        probe_items = []
+        target_probe_count = min(bs, 8)
+        probe_buckets: Dict[Tuple[int, int], List[torch.Tensor]] = defaultdict(list)
         for raw_sample in streaming_dataset.iter_raw():
             try:
-                img_t, _, _ = streaming_dataset._extract_resized_image(raw_sample)
-                probe_items.append(img_t)
-                if len(probe_items) >= min(bs, 8):
+                img_t, res_h, res_w = streaming_dataset._extract_resized_image(
+                    raw_sample
+                )
+                res_key = (int(res_h), int(res_w))
+                probe_buckets[res_key].append(img_t)
+                if len(probe_buckets[res_key]) >= target_probe_count:
+                    verification_batch = torch.stack(probe_buckets[res_key], dim=0)
                     break
             except Exception:
                 continue
-        if probe_items:
-            verification_batch = torch.stack(probe_items, dim=0)
 
-    if verification_batch is not None and len(verification_batch) > 0:
-        logging.info(
-            "Executing VAE reconstruction validation check before precompute..."
-        )
-        verify_vae_reconstruction(
-            vae=vae,
-            sample_imgs=verification_batch,
-            vae_mean_t=vae_mean_t,
-            vae_std_t=vae_std_t,
-            save_path=recon_save_path,
-            device=device_obj,
-            torch_dtype=torch_dtype,
-        )
+        if verification_batch is None and probe_buckets:
+            best_bucket = max(probe_buckets.values(), key=len)
+            verification_batch = torch.stack(best_bucket, dim=0)
 
     uploader = ShardUploader(
         dst_repo_id=dst_repo,

@@ -67,6 +67,7 @@ def generate_images_ui(
     noise_scale: Optional[float] = None,
     dynamic_thresholding: Optional[bool] = None,
     clip_prediction: Optional[bool] = None,
+    cfg_interval: Optional[Tuple[float, float]] = None,
 ) -> List[Image.Image]:
     """Runs sampling through the diffusion pipeline and embeds metadata."""
     cfg = model_bundle["cfg"]
@@ -106,11 +107,13 @@ def generate_images_ui(
         if clip_prediction is not None
         else getattr(cfg.sampling, "clip_prediction", pixel_sampling)
     )
-    cfg_interval = getattr(
-        cfg.sampling,
-        "cfg_interval",
-        (0.11, 0.97) if pixel_sampling else (0.0, 1.0),
-    )
+
+    default_interval = (0.0, 0.9) if pixel_sampling else (0.0, 1.0)
+    if cfg_interval is not None:
+        res_cfg_interval = tuple(cfg_interval)
+    else:
+        cfg_conf = getattr(cfg.sampling, "cfg_interval", default_interval)
+        res_cfg_interval = tuple(cfg_conf)
 
     base_seed = (
         seed if (seed is not None and seed >= 0) else random.randint(0, 2**31 - 1)
@@ -156,7 +159,7 @@ def generate_images_ui(
         noise_scale=noise_scale,
         clip_prediction=clip_prediction,
         dynamic_thresholding=dynamic_thresholding,
-        cfg_interval=cfg_interval,
+        cfg_interval=res_cfg_interval,
     )
 
     grid_img = make_image_grid(all_images)
@@ -186,7 +189,7 @@ def generate_images_ui(
             "noise_scale": noise_scale,
             "dynamic_thresholding": dyn_thresh,
             "clip_prediction": clip_pred,
-            "cfg_interval": cfg_interval,
+            "cfg_interval": list(res_cfg_interval),
         }
         png_info = PngInfo()
         png_info.add_text("parameters", json.dumps(meta_payload))
@@ -231,6 +234,9 @@ def send_to_generation(image: Optional[Image.Image]) -> List[Any]:
         if not parameters:
             return [gr.skip()] * 11
         data = json.loads(parameters)
+        interval = data.get("cfg_interval", [gr.skip(), gr.skip()])
+        start_t = interval[0] if len(interval) > 0 else gr.skip()
+        end_t = interval[1] if len(interval) > 1 else gr.skip()
         return [
             data.get("prompt", gr.skip()),
             data.get("neg_prompt", gr.skip()),
@@ -243,6 +249,8 @@ def send_to_generation(image: Optional[Image.Image]) -> List[Any]:
             data.get("x_shift", gr.skip()),
             data.get("y_shift", gr.skip()),
             data.get("shift", gr.skip()),
+            start_t,
+            end_t,
         ]
     except Exception:
         return [gr.skip()] * 11
@@ -261,6 +269,13 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
     adjusted_default_cfg = (
         min(float(default_cfg_val), 2.5) if pixel_sampling else float(default_cfg_val)
     )
+
+    raw_interval = getattr(
+        cfg.sampling,
+        "cfg_interval",
+        (0.11, 0.97) if pixel_sampling else (0.0, 1.0),
+    )
+    default_interval = tuple(raw_interval)
 
     theme = gr.themes.Soft(
         primary_hue="blue",
@@ -318,6 +333,22 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
                                 value=adjusted_default_cfg,
                                 step=0.5,
                                 label="CFG Scale",
+                            )
+
+                        with gr.Row():
+                            cfg_start = gr.Slider(
+                                0.0,
+                                1.0,
+                                value=default_interval[0],
+                                step=0.01,
+                                label="CFG Interval Start (t)",
+                            )
+                            cfg_end = gr.Slider(
+                                0.0,
+                                1.0,
+                                value=default_interval[1],
+                                step=0.01,
+                                label="CFG Interval End (t)",
                             )
 
                         with gr.Row():
@@ -427,6 +458,8 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
             noise_scale_val,
             dynamic_thresh_val,
             clip_pred_val,
+            cfg_start_val,
+            cfg_end_val,
         ):
             return generate_images_ui(
                 model_bundle=model_bundle,
@@ -447,6 +480,7 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
                 noise_scale=float(noise_scale_val),
                 dynamic_thresholding=bool(dynamic_thresh_val),
                 clip_prediction=bool(clip_pred_val),
+                cfg_interval=(float(cfg_start_val), float(cfg_end_val)),
             )
 
         generate_btn.click(
@@ -469,6 +503,8 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
                 noise_scale,
                 dynamic_thresh,
                 clip_pred,
+                cfg_start,
+                cfg_end,
             ],
             outputs=[gallery],
         )
@@ -492,6 +528,8 @@ def create_ui(model_bundle: Dict[str, Any], default_out_dir: str):
                 x_shift,
                 y_shift,
                 shift,
+                cfg_start,
+                cfg_end,
             ],
         )
 

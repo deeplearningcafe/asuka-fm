@@ -47,13 +47,14 @@ def make_preview_grid(
     return grid
 
 
-def get_parquet_schema() -> pa.Schema:
+def get_parquet_schema(i1_dataset: bool = False) -> pa.Schema:
     """PyArrow schema for synthetic pixel image shards."""
+    prompt_type = pa.list_(pa.string()) if i1_dataset else pa.string()
     return pa.schema(
         [
             ("booru_id", pa.string()),
             ("image", pa.binary()),
-            ("prompt", pa.string()),
+            ("prompt", prompt_type),
             ("bucket_idx", pa.int32()),
             ("target_width", pa.int32()),
             ("target_height", pa.int32()),
@@ -161,11 +162,12 @@ class ShardUploader:
         hf_token: Optional[str] = None,
         compression: str = "SNAPPY",
         max_workers: int = 2,
+        i1_dataset: bool = False,
     ):
         self.dst_repo_id = dst_repo_id
         self.compression = compression
         self.api = HfApi(token=hf_token)
-        self.schema = get_parquet_schema()
+        self.schema = get_parquet_schema(i1_dataset=i1_dataset)
         self.temp_dir = Path(tempfile.mkdtemp(prefix="pixel_shards_"))
         self.upload_executor = ThreadPoolExecutor(max_workers=max_workers)
         self.futures: List[Future] = []
@@ -274,11 +276,13 @@ def generate_and_upload_synthetic(
     avif_quality: int = 80,
     avif_speed: int = 6,
     hf_token: Optional[str] = None,
+    i1_dataset: Optional[bool] = None,
     device: str = "cuda",
 ) -> None:
     """Generates synthetic images via latent model and streams to HF."""
     device_obj, default_autocast_dtype = setup_cuda_environment(device)
 
+    is_i1 = i1_dataset if i1_dataset is not None else cfg.data.get("i1_dataset", False)
     models_path = cfg.paths.models
     ckpt_path = checkpoint or cfg.models.get("resume_from_checkpoint", None)
     model_type = getattr(cfg.models, "model_type", "unet")
@@ -357,6 +361,7 @@ def generate_and_upload_synthetic(
     uploader = ShardUploader(
         dst_repo_id=dst_repo,
         hf_token=hf_token,
+        i1_dataset=is_i1,
     )
     existing_ids, shard_metadata_list, shard_counter = load_existing_shards(
         dst_repo_id=dst_repo,
@@ -500,9 +505,26 @@ def generate_and_upload_synthetic(
         if booru_id in existing_ids:
             continue
 
-        prompt = str(raw_sample.get("prompt") or raw_sample.get("text", "")).strip()
-        if not prompt:
-            continue
+        raw_prompt = raw_sample.get("prompt") or raw_sample.get("text", "")
+        if is_i1:
+            if isinstance(raw_prompt, (list, tuple)):
+                prompt_val = [str(p) for p in raw_prompt]
+            else:
+                prompt_val = [str(raw_prompt)]
+            valid_prompts = [p.strip() for p in prompt_val if p and p.strip()]
+            if not valid_prompts:
+                continue
+            # for synthetic gen we will use the first prompt, for reprod
+            gen_prompt = valid_prompts[0]
+            stored_prompt = prompt_val
+        else:
+            if isinstance(raw_prompt, (list, tuple)):
+                gen_prompt = ", ".join(str(p) for p in raw_prompt).strip()
+            else:
+                gen_prompt = str(raw_prompt).strip()
+            if not gen_prompt:
+                continue
+            stored_prompt = gen_prompt
 
         orig_w = int(raw_sample.get("original_width", target_res))
         orig_h = int(raw_sample.get("original_height", target_res))
@@ -511,9 +533,6 @@ def generate_and_upload_synthetic(
         aesthetic_tier = int(raw_sample.get("aesthetic_tier", -1))
         tag_weight = float(raw_sample.get("tag_weight", 1.0))
         bucket_idx = int(raw_sample.get("bucket_idx", -1))
-
-        #res_w = int(raw_sample.get("target_width", target_res))
-        #res_h = int(raw_sample.get("target_height", target_res))
 
         target_width = int(raw_sample.get("target_width", target_res))
         target_height = int(raw_sample.get("target_height", target_res))
@@ -527,7 +546,7 @@ def generate_and_upload_synthetic(
         res_h = (scaled_h // align_down) * align_down
         sample_seed += 1
         sample_cfg = {
-            "prompt": prompt,
+            "prompt": gen_prompt,
             "negative_prompt": negative_prompt,
             "height": res_h,
             "width": res_w,
@@ -538,7 +557,7 @@ def generate_and_upload_synthetic(
         }
         meta = {
             "booru_id": booru_id,
-            "prompt": prompt,
+            "prompt": stored_prompt,
             "bucket_idx": bucket_idx,
             "target_width": res_w,
             "target_height": res_h,
@@ -578,6 +597,7 @@ def generate_and_upload_synthetic(
         "samples_per_shard": samples_per_shard,
         "format": "avif",
         "resolution": target_res,
+        "i1_dataset": is_i1,
         "shards": shard_metadata_list,
         "generator_checkpoint": str(ckpt_path),
     }
@@ -647,7 +667,7 @@ def main():
         "--cfg_interval",
         nargs=2,
         type=float,
-        default=[0.08, 0.92],
+        default=[0.00, 0.92],
         help="Active interval [min, max] for CFG application.",
     )
     parser.add_argument(
@@ -705,6 +725,12 @@ def main():
         default="cuda",
         help="Target execution device.",
     )
+    parser.add_argument(
+        "--i1_dataset",
+        action="store_true",
+        default=None,
+        help="Store i1 multi-caption list schema (pa.list_(pa.string())).",
+    )
     args = parser.parse_args()
 
     cfg = (
@@ -738,6 +764,7 @@ def main():
         preview_dir=save_dir,
         avif_quality=args.avif_quality,
         hf_token=args.hf_token,
+        i1_dataset=args.i1_dataset,
         device=args.device,
     )
 

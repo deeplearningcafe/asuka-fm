@@ -401,6 +401,9 @@ def load_trainable_model(
                     if os.path.exists(cand):
                         ckpt_dit_path = cand
                         break
+            elif os.path.isfile(resume_from_checkpoint):
+                ckpt_dit_path = resume_from_checkpoint
+
             if ckpt_dit_path and os.path.exists(ckpt_dit_path):
                 if global_rank == 0:
                     logging.info(f"  -> Resuming DiT weights from: {ckpt_dit_path}")
@@ -410,24 +413,110 @@ def load_trainable_model(
                     for k, v in sd.items()
                     if not k.startswith("text_enc.")
                 }
-                unet.load_state_dict(sd, strict=False)
+                target_state = unet.state_dict()
+                target_map = {_normalize_param_key(k): k for k in target_state.keys()}
+                clean_sd = {}
+                skipped = []
 
-                # Load EMA weights
-                for ema_name in [
-                    "unet_ema.safetensors",
-                    "ema_model.safetensors",
-                ]:
-                    ema_path = os.path.join(resume_from_checkpoint, ema_name)
-                    if os.path.exists(ema_path) and ema.use_ema:
-                        ema_dict = load_file(ema_path, device="cpu")
-                        ema_dict = {
-                            _normalize_param_key(k): v
-                            for k, v in ema_dict.items()
-                            if not k.startswith("text_enc.")
-                        }
-                        if hasattr(ema, "ema_model") and ema.ema_model is not None:
-                            ema.ema_model.load_state_dict(ema_dict, strict=False)
-                        break
+                for k, v in sd.items():
+                    if k in target_map:
+                        real_k = target_map[k]
+                        if target_state[real_k].shape == v.shape:
+                            clean_sd[real_k] = v
+                        # Adapt patch embedder weight
+                        elif (
+                            "x_embedder.weight" in real_k or "conv_in.weight" in real_k
+                        ):
+                            try:
+                                clean_sd[real_k] = adapt_patch_embed_weight(
+                                    v, target_state[real_k].shape
+                                )
+                                if global_rank == 0:
+                                    logging.info(
+                                        f"  -> Adapted patch embed weight "
+                                        f"'{real_k}' from {v.shape} to "
+                                        f"{target_state[real_k].shape}."
+                                    )
+                            except ValueError as e:
+                                skipped.append(f"{real_k} ({e})")
+                        else:
+                            skipped.append(
+                                f"{real_k} ({v.shape} != {target_state[real_k].shape})"
+                            )
+
+                unet.load_state_dict(clean_sd, strict=False)
+                if global_rank == 0 and skipped:
+                    logging.info(
+                        f"  -> Safely skipped {len(skipped)} non-matching "
+                        f"layers: {skipped[:2]}..."
+                    )
+
+                if use_ema and ema is not None and getattr(ema, "use_ema", False):
+                    ema_loaded = False
+                    if os.path.isdir(resume_from_checkpoint):
+                        for ema_name in [
+                            "unet_ema.safetensors",
+                            "ema_model.safetensors",
+                        ]:
+                            ema_path = os.path.join(resume_from_checkpoint, ema_name)
+                            if os.path.exists(ema_path):
+                                if global_rank == 0:
+                                    logging.info(
+                                        f"  -> Resuming EMA weights: {ema_path}"
+                                    )
+                                ema_dict = load_file(ema_path, device="cpu")
+                                ema_dict = {
+                                    _normalize_param_key(k): v
+                                    for k, v in ema_dict.items()
+                                    if not k.startswith("text_enc.")
+                                }
+                                ema_target = (
+                                    ema.ema_model.state_dict()
+                                    if hasattr(ema, "ema_model")
+                                    and ema.ema_model is not None
+                                    else target_state
+                                )
+                                ema_map = {
+                                    _normalize_param_key(k): k
+                                    for k in ema_target.keys()
+                                }
+                                clean_ema = {}
+                                for k, v in ema_dict.items():
+                                    if k in ema_map:
+                                        real_k = ema_map[k]
+                                        if ema_target[real_k].shape == v.shape:
+                                            clean_ema[real_k] = v
+                                        elif (
+                                            "x_embedder.weight" in real_k
+                                            or "conv_in.weight" in real_k
+                                        ):
+                                            try:
+                                                clean_ema[real_k] = (
+                                                    adapt_patch_embed_weight(
+                                                        v,
+                                                        ema_target[real_k].shape,
+                                                    )
+                                                )
+                                            except ValueError:
+                                                pass
+                                if (
+                                    hasattr(ema, "ema_model")
+                                    and ema.ema_model is not None
+                                ):
+                                    ema.ema_model.load_state_dict(
+                                        clean_ema, strict=False
+                                    )
+                                ema_loaded = True
+                                break
+
+                    # Synchronize EMA shadow parameters if no EMA file was loaded
+                    if not ema_loaded and hasattr(ema, "initialize"):
+                        if global_rank == 0:
+                            logging.info(
+                                "  -> Initialized EMA shadow model from "
+                                "adapted DiT weights."
+                            )
+                        ema.initialize(unet)
 
         # 3. Load Stage-1 pixel adaptation weights if provided
         active_pixel_dir = pixel_dir or output_head_path

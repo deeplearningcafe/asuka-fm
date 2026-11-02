@@ -27,9 +27,9 @@ class BaseSchedule(ABC):
 class LinearSchedule(BaseSchedule):
     """
     Rectified Flow / Flow Matching Schedule.
-    alpha(t) = 1 - t
-    sigma(t) = t
-    (Assuming t=0 is Data, t=1 is Noise)
+    alpha(t) = t
+    sigma(t) = 1 - t
+    (Assuming t=1 is Data, t=0 is Noise)
     """
 
     def __init__(self, device="cpu", is_inverted: bool = False):

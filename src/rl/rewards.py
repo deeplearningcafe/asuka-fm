@@ -129,8 +129,8 @@ class AnimeMultiReward(nn.Module):
         self,
         swin_dir: str,
         four_cls_path: str,
-        pair_model_path: str,
-        device: torch.device,
+        pair_model_path: str = None,
+        device: torch.device = "cuda",
         yolo_model_path: Optional[str] = None,
         feature_dim: int = 1024,
         eval_batch_size: int = 16,
@@ -313,6 +313,8 @@ class AnimeMultiReward(nn.Module):
 
         for i in range(0, b, self.eval_batch_size):
             chunk = images[i : i + self.eval_batch_size]
+            if isinstance(chunk, torch.Tensor):
+                chunk = chunk.to(self.device, non_blocking=True)
             x = self.prepare_images(
                 chunk,
                 target_size=self.tagger_input_size,
@@ -443,19 +445,23 @@ class AnimeMultiReward(nn.Module):
         if self.yolo is None:
             return torch.ones(b, device=self.device, dtype=torch.float32)
 
-        # Convert [0, 1] float tensor to uint8 for YOLO inference
-        imgs_uint8 = (images.clamp(0, 1) * 255.0).to(torch.uint8)
         scores = torch.ones(b, device=self.device, dtype=torch.float32)
 
         for i in range(0, b, self.eval_batch_size):
-            chunk = imgs_uint8[i : i + self.eval_batch_size]
+            # Convert and transfer only the micro-chunk to GPU uint8
+            raw_chunk = images[i : i + self.eval_batch_size]
+            chunk_uint8 = (
+                (raw_chunk.clamp(0, 1) * 255.0)
+                .to(dtype=torch.uint8)
+                .to(self.device, non_blocking=True)
+            )
+
             results = self.yolo(
-                chunk,
+                chunk_uint8,
                 conf=self.yolo_conf,
                 device=self.device,
                 verbose=False,
             )
-            print(len(results))
 
             for local_idx, res in enumerate(results):
                 global_idx = i + local_idx
@@ -516,8 +522,6 @@ def multi_score(device: torch.device, reward_config: Dict):
         prompt_metadata: List[Dict],
         only_strict: bool = False,
     ) -> Tuple[Dict[str, np.ndarray], Dict]:
-        images = images.to(device)
-
         features, tag_logits = model.forward_features(images)
 
         r_tag = model.compute_tag_reward(tag_logits, prompts, prompt_metadata)

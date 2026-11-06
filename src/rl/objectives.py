@@ -4,6 +4,84 @@ import torch.nn as nn
 from typing import Optional, Tuple, Dict, Any
 
 
+# from https://github.com/yifan123/flow_grpo/blob/main/flow_grpo/diffusers_patch/sd3_sde_with_logprob.py#L11
+def cps_step_with_logprob(
+    sample: torch.Tensor,
+    model_output: torch.Tensor,
+    t: torch.Tensor,
+    dt: float,
+    noise_level: float = 0.7,
+    prev_sample: Optional[torch.Tensor] = None,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Coefficients-Preserving Sampling (CPS) step for Flow Matching.
+
+    Interpolates deterministically along probability flow while preserving
+    exact schedule variance when injecting stochasticity.
+    Convention: t=0 is pure noise, t=1 is clean data; dt > 0 integrates
+    forward towards clean data.
+    """
+    sample_f32 = sample.float()
+    v_f32 = model_output.float()
+    prev_f32 = prev_sample.float() if prev_sample is not None else None
+
+    if isinstance(t, torch.Tensor):
+        t_val = t.view(-1, *([1] * (sample.ndim - 1))).float()
+    else:
+        t_val = float(t)
+
+    t_next = t_val + dt
+    sigma_curr = 1.0 - t_val
+    sigma_next = (1.0 - t_next).clamp(min=0.0)
+    alpha_next = t_next.clamp(max=1.0)
+
+    # Predicted clean data (x1) and noise (x0) from velocity v = x1 - x0
+    pred_x1 = sample_f32 + sigma_curr * v_f32
+    pred_x0 = sample_f32 - t_val * v_f32
+
+    # CPS angle: eta in [0, 1] maps to [0, pi / 2]
+    angle = float(noise_level) * (math.pi / 2.0)
+    cos_theta = math.cos(angle)
+    sin_theta = math.sin(angle)
+
+    # Transition mean: linear blend of predicted data and noise
+    prev_mean = alpha_next * pred_x1 + sigma_next * cos_theta * pred_x0
+    std_dev_step = sigma_next * sin_theta
+
+    if prev_f32 is None:
+        if sin_theta > 1e-5 and std_dev_step.max() > 1e-6:
+            eps = torch.randn(
+                sample_f32.shape,
+                generator=generator,
+                device=sample_f32.device,
+                dtype=torch.float32,
+            )
+            prev_sample_out = prev_mean + std_dev_step * eps
+        else:
+            prev_sample_out = prev_mean
+    else:
+        prev_sample_out = prev_f32
+
+    # Gaussian log-probability density calculation
+    variance = (std_dev_step**2).clamp(min=1e-7)
+    diff_sq = (prev_sample_out.detach() - prev_mean) ** 2
+    log_prob = (
+        -0.5 * diff_sq / variance
+        - torch.log(std_dev_step.clamp(min=1e-5))
+        - 0.5 * math.log(2.0 * math.pi)
+    )
+
+    dim_indices = tuple(range(1, log_prob.ndim))
+    log_prob = log_prob.mean(dim=dim_indices)
+
+    return (
+        prev_sample_out.to(sample.dtype),
+        log_prob,
+        prev_mean.to(sample.dtype),
+        std_dev_step,
+    )
+
+
 def sde_step_with_logprob(
     sample: torch.Tensor,
     model_output: torch.Tensor,
@@ -33,8 +111,7 @@ def sde_step_with_logprob(
 
     sigma = 1.0 - t_val
 
-    # At t=0 (sigma=1), 1 - sigma is 0. Following Flow-GRPO,
-    # replace denominator (1 - sigma) with dt (i.e. 1 - sigma_max)
+    # At t=0 (sigma=1), 1 - sigma is 0.
     denom_1_minus_sigma = torch.where(
         sigma >= 1.0 - 1e-5,
         torch.tensor(dt, device=sample.device, dtype=torch.float32),
@@ -93,6 +170,7 @@ class FlowGRPOObjective(nn.Module):
         adv_clip_max: float = 5.0,
         beta: float = 0.0,
         noise_level: float = 0.7,
+        sde_type: str = "sde",
         use_unet_mult: bool = True,
     ):
         super().__init__()
@@ -100,7 +178,13 @@ class FlowGRPOObjective(nn.Module):
         self.adv_clip_max = float(adv_clip_max)
         self.beta = float(beta)
         self.noise_level = float(noise_level)
+        self.sde_type = str(sde_type).lower()
         self.use_unet_mult = use_unet_mult
+
+    def _step_fn(self, **kwargs):
+        if self.sde_type == "cps":
+            return cps_step_with_logprob(**kwargs)
+        return sde_step_with_logprob(**kwargs)
 
     def forward(
         self,
@@ -128,7 +212,7 @@ class FlowGRPOObjective(nn.Module):
         v_pred = model(latents, t_model, **model_kwargs)
 
         # Transition log-prob under current policy
-        _, log_prob, prev_mean, std_dev_step = sde_step_with_logprob(
+        _, log_prob, prev_mean, std_dev_step = self._step_fn(
             sample=latents,
             model_output=v_pred,
             t=timesteps,
@@ -151,7 +235,7 @@ class FlowGRPOObjective(nn.Module):
         if self.beta > 0.0 and ref_model is not None:
             with torch.no_grad():
                 v_ref = ref_model(latents, t_model, **model_kwargs)
-                _, _, mean_ref, _ = sde_step_with_logprob(
+                _, _, mean_ref, _ = self._step_fn(
                     sample=latents,
                     model_output=v_ref,
                     t=timesteps,

@@ -1020,9 +1020,15 @@ def create_scheduler(
     total_steps_override: Optional[int] = None,
 ):
     """Creates a flexible LR scheduler supporting WSD, Cosine, and Constant."""
-    # TODO: is this redundant?
     for group in optim.param_groups:
-        group["initial_lr"] = group["lr"]
+        if "base_lr" in group:
+            group["lr"] = group["base_lr"]
+            group["initial_lr"] = group["base_lr"]
+        else:
+            base = group.get("initial_lr", group["lr"])
+            group["base_lr"] = base
+            group["initial_lr"] = base
+            group["lr"] = base
 
     if total_steps_override is not None:
         total_steps = max(1, total_steps_override)
@@ -1033,8 +1039,18 @@ def create_scheduler(
         update_steps_epoch = len(train_loader) // grad_accum
         total_steps = conf.train.epochs * update_steps_epoch
 
-    warmup_ratio = conf.train.get("warmup", 0.04)
-    warmup_steps = int(warmup_ratio * total_steps)
+    warmup_steps = None
+    if hasattr(conf, "rl") and conf.rl is not None:
+        warmup_steps = conf.rl.get("warmup_steps", None)
+    if warmup_steps is None and hasattr(conf, "train") and conf.train is not None:
+        warmup_steps = conf.train.get("warmup_steps", None)
+
+    if warmup_steps is not None:
+        warmup_steps = int(warmup_steps)
+    else:
+        warmup_ratio = conf.train.get("warmup", 0.04)
+        warmup_steps = int(warmup_ratio * total_steps)
+
     warmup_steps = min(warmup_steps, total_steps - 1) if total_steps > 1 else 0
 
     decay_ratio = conf.train.get("decay_ratio", 0.0)
@@ -1043,8 +1059,7 @@ def create_scheduler(
 
     stable_steps = max(0, total_steps - warmup_steps - decay_steps)
 
-    # Resolve schedule type with backward compatibility
-    sched_type = conf.train.get("scheduler_type", None)
+    sched_type = conf.train.get("sched_type", None)
     if sched_type is None:
         if conf.train.get("use_cos_scheduler", False):
             sched_type = "cosine"

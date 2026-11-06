@@ -5,8 +5,9 @@ import random
 import logging
 import contextlib
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -21,15 +22,50 @@ from src.diffusion.sampling import (
     compute_inference_pos_map,
     generate_samples,
 )
-from src.rl.objectives import FlowGRPOObjective, sde_step_with_logprob
+from src.rl.objectives import (
+    FlowGRPOObjective,
+    sde_step_with_logprob,
+    cps_step_with_logprob,
+)
 from src.rl.rewards import multi_score
 from src.utils.logging import (
     log_metrics,
+    log_image,
     init_wandb,
     init_hfapi,
     is_wandb_initialized,
 )
 from src.utils.checkpointing import save_checkpoint
+from src.models.factory import create_scheduler
+
+
+# from https://github.com/yifan123/flow_grpo/blob/main/scripts/train_sd3.py#L133
+def calculate_zero_std_ratio(
+    prompts: List[str],
+    rewards: np.ndarray,
+) -> Tuple[float, float, List[str]]:
+    """
+    Computes zero reward std ratio across prompt groups and identifies
+    prompts with zero variance.
+    """
+    prompt_array = np.array(prompts)
+    unique_prompts, inverse_indices, counts = np.unique(
+        prompt_array, return_inverse=True, return_counts=True
+    )
+    grouped_rewards = rewards[np.argsort(inverse_indices)]
+    split_indices = np.cumsum(counts)[:-1]
+    reward_groups = np.split(grouped_rewards, split_indices)
+
+    prompt_stds = np.array([float(np.std(g)) for g in reward_groups])
+    zero_std_mask = prompt_stds < 1e-6
+    zero_std_count = int(np.count_nonzero(zero_std_mask))
+    zero_std_ratio = (
+        float(zero_std_count / len(prompt_stds)) if len(prompt_stds) > 0 else 0.0
+    )
+    zero_std_prompts = unique_prompts[zero_std_mask].tolist()
+    mean_std = float(prompt_stds.mean()) if len(prompt_stds) > 0 else 0.0
+
+    return zero_std_ratio, mean_std, zero_std_prompts
 
 
 class RLTrainer(Trainer):
@@ -44,6 +80,7 @@ class RLTrainer(Trainer):
         self.num_sde_steps = getattr(cfg.rl, "num_sde_steps", 10)
         self.noise_level = getattr(cfg.rl, "noise_level", 0.7)
         self.timestep_fraction = getattr(cfg.rl, "timestep_fraction", 0.99)
+        self.sde_type = getattr(cfg.rl, "sde_type", "sde").lower()
         self.clip_range = getattr(cfg.rl, "clip_range", 0.2)
         self.adv_clip_max = getattr(cfg.rl, "adv_clip_max", 5.0)
         self.beta = getattr(cfg.rl, "beta", 0.0)
@@ -53,19 +90,62 @@ class RLTrainer(Trainer):
             cfg.train, "batch_size", getattr(cfg.rl, "train_batch_size", 4)
         )
         self.sample_interval = getattr(cfg.sampling, "interval", 2500)
+        self.rollout_log_interval = getattr(cfg.logging, "rollout_log_interval", 10)
 
-        # Avoid degenerate zero-variance at final boundary (t=1, sigma=0)
-        self.num_train_timesteps = max(
-            1, int(self.num_sde_steps * self.timestep_fraction)
+        # MixGRPO & Flow-GRPO-Fast
+        self.window_size = int(getattr(cfg.rl, "window_size", 0))
+        self.shift_interval = int(getattr(cfg.rl, "shift_interval", 25))
+        self.window_stride = int(getattr(cfg.rl, "window_stride", 1))
+        self.window_strategy = getattr(cfg.rl, "window_strategy", "progressive").lower()
+        self.sde_window_range = getattr(
+            cfg.rl, "sde_window_range", (0, self.num_sde_steps)
         )
+
+        if self.window_size > 0:
+            self.num_train_timesteps = self.window_size
+        else:
+            self.num_train_timesteps = max(
+                1, int(self.num_sde_steps * self.timestep_fraction)
+            )
         self.dt = 1.0 / self.num_sde_steps
+
+        # Recalibrate LR scheduler
+        total_rollout = self.rollout_num_prompts * self.group_num_samples
+        batches_per_inner = math.ceil(total_rollout / self.train_batch_size)
+        accum_steps = max(1, self.cfg.train.gradient_accumulation_steps)
+        updates_per_inner = math.ceil(batches_per_inner / accum_steps)
+        updates_per_epoch = updates_per_inner * self.num_inner_epochs
+
+        rl_epochs = getattr(
+            self.cfg.rl,
+            "epochs",
+            getattr(self.cfg.rl, "max_iterations", None),
+        )
+        if rl_epochs is not None:
+            num_rl_epochs = int(rl_epochs)
+        else:
+            total_epochs = getattr(self.cfg.train, "epochs", 300)
+            num_rl_epochs = max(1, total_epochs - self.start_epoch)
+
+        total_rl_steps = getattr(
+            self.cfg.rl,
+            "max_steps",
+            num_rl_epochs * updates_per_epoch,
+        )
+
+        self.lr_scheduler = create_scheduler(
+            self.optimizer,
+            self.dataloader,
+            self.cfg,
+            total_steps_override=total_rl_steps,
+        )
 
         if self.beta > 0.0:
             raw_unet = self.unet.module if self.is_ddp else self.unet
             if hasattr(raw_unet, "_orig_mod"):
                 raw_unet = raw_unet._orig_mod
 
-            self.ref_model = copy.deepcopy(raw_unet)
+            self.ref_model = copy.deepcopy(raw_unet).to(self.device)
             self.ref_model.eval()
             self.ref_model.requires_grad_(False)
 
@@ -84,6 +164,7 @@ class RLTrainer(Trainer):
             adv_clip_max=self.adv_clip_max,
             beta=self.beta,
             noise_level=self.noise_level,
+            sde_type=self.sde_type,
             use_unet_mult=False if self.is_dit else True,
         )
 
@@ -126,6 +207,27 @@ class RLTrainer(Trainer):
             )
             logging.info(f"  Evaluation Sample Interval: {self.sample_interval}")
             logging.info("=" * 60)
+
+    def _get_active_window(self, iteration: int) -> Tuple[int, int]:
+        """Calculates sliding window interval [l, r) along trajectory."""
+        if self.window_size <= 0:
+            return 0, self.num_train_timesteps
+
+        max_l = max(0, self.num_sde_steps - self.window_size)
+        if self.window_strategy == "random":
+            # Flow-GRPO-Fast: randomly sampled window per iteration
+            low = max(0, int(self.sde_window_range[0]))
+            high = min(max_l, int(self.sde_window_range[1]) - self.window_size)
+            l_start = random.randint(low, high) if high >= low else low
+        elif self.window_strategy == "frozen":
+            # MixGRPO-Frozen: static start at beginning
+            l_start = min(getattr(self.cfg.rl, "frozen_start", 0), max_l)
+        else:
+            # MixGRPO-Progressive: shifts along trajectory
+            shift_idx = (iteration - 1) // self.shift_interval
+            l_start = min(shift_idx * self.window_stride, max_l)
+
+        return l_start, l_start + self.window_size
 
     def _prompt_generator(self):
         """
@@ -185,10 +287,15 @@ class RLTrainer(Trainer):
                     yield gen_prompt
 
     @torch.no_grad()
-    def sample_and_evaluate(self, epoch: int, step: int):
+    def sample_and_evaluate(
+        self,
+        epoch: int,
+        step: int,
+        io_executor: Optional[ThreadPoolExecutor] = None,
+    ):
         """
         Samples validation images from sample_configs, computes reward metrics,
-        and logs preview images with reward breakdown captions to WandB.
+        and logs preview images asynchronously.
         """
         if self.global_rank != 0 or not self.sample_configs:
             return
@@ -266,7 +373,7 @@ class RLTrainer(Trainer):
                 arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
                 tensor_list.append(torch.from_numpy(arr).permute(2, 0, 1))
 
-            img_tensor = torch.stack(tensor_list, dim=0).to(self.device)
+            img_tensor = torch.stack(tensor_list, dim=0)
             rewards_dict, _ = self.reward_fn(img_tensor, b_prompts, b_meta)
 
             b_avg = rewards_dict.get("avg", np.zeros(len(b_imgs)))
@@ -289,39 +396,45 @@ class RLTrainer(Trainer):
         log_metrics(eval_metrics, step=step, commit=False)
         torch.cuda.empty_cache()
 
-        if is_wandb_initialized():
-            wandb_images = []
-            for idx, (img, prompt) in enumerate(zip(images, prompts)):
-                img_path = os.path.join(
-                    self.sample_dir,
-                    f"sample_ep{epoch + 1}_step{step}_{idx}.png",
-                )
-                img.save(img_path)
-                caption = (
-                    f"{prompt[:120]} | "
-                    f"R_avg: {avg_r[idx]:.2f} "
-                    f"(Tag: {tag_r[idx]:.2f}, "
-                    f"Aes: {aes_r[idx]:.2f}, "
-                    f"Cnt: {cnt_r[idx]:.2f})"
-                )
-                wandb_images.append(wandb.Image(img_path, caption=caption))
+        caption_prompts = [
+            f"{p[:240]} | R_avg: {avg_r[i]:.2f} "
+            f"(Tag: {tag_r[i]:.2f}, Aes: {aes_r[i]:.2f}, Cnt: {cnt_r[i]:.2f})"
+            for i, p in enumerate(prompts)
+        ]
 
-            wandb.log({"eval/samples": wandb_images}, step=step)
+        if io_executor is not None:
+            io_executor.submit(
+                log_image,
+                images,
+                caption_prompts,
+                epoch + 1,
+                step,
+                False,
+                self.sample_dir,
+            )
+        else:
+            log_image(
+                images,
+                caption_prompts,
+                epoch + 1,
+                step,
+                False,
+                self.sample_dir,
+            )
 
         unet_infer.train()
         if self.train_te:
             self.text_encoder.train()
 
     @torch.no_grad()
-    def rollout_sampling(self, epoch: int) -> Dict[str, torch.Tensor]:
-        """
-        Samples SDE trajectories across prompt groups and computes rewards.
-        """
+    def rollout_sampling(self, iteration: int) -> Dict[str, torch.Tensor]:
+        """Generates mixed ODE-SDE rollouts and computes rewards."""
         unet_base = self.unet.module if self.is_ddp else self.unet
         unet_base.eval()
         if self.train_te:
             self.text_encoder.eval()
 
+        l_win, r_win = self._get_active_window(iteration)
         prompts = [next(self._prompt_stream) for _ in range(self.rollout_num_prompts)]
         if self.global_rank == 0:
             logging.info(f"Rollout Prompts Sampled ({len(prompts)}): {prompts[:2]}")
@@ -329,19 +442,14 @@ class RLTrainer(Trainer):
         expanded_prompts = [p for p in prompts for _ in range(self.group_num_samples)]
         num_samples = len(expanded_prompts)
 
-        all_latents = []
-        all_next_latents = []
-        all_log_probs = []
-        all_timesteps = []
-        all_enc_states = []
-        all_attn_masks = []
-        all_pos_maps = []
+        all_latents, all_next_latents = [], []
+        all_log_probs, all_timesteps = [], []
+        all_enc_states, all_attn_masks, all_pos_maps = [], [], []
         final_latents_cpu = []
 
         h = getattr(self.cfg.data, "resolution", 512)
         w = getattr(self.cfg.data, "resolution", 512)
-        h_lat = h // 8
-        w_lat = w // 8
+        h_lat, w_lat = h // 8, w // 8
 
         chunk_size = self.train_batch_size
         for start_idx in range(0, num_samples, chunk_size):
@@ -420,37 +528,47 @@ class RLTrainer(Trainer):
                 pos_map=pos_map,
             )
 
-            chunk_lats, chunk_next_lats = [], []
-            chunk_log_probs, chunk_ts = [], []
+            step_fn = (
+                cps_step_with_logprob
+                if self.sde_type == "cps"
+                else sde_step_with_logprob
+            )
 
-            # SDE rollout trajectory loop
+            chunk_lats, chunk_next_lats = [], []
+            chunk_lps, chunk_ts = [], []
+
             z_curr = z
             for step_idx in range(self.num_sde_steps):
                 t_val = step_idx * self.dt
                 t_tensor = torch.full((curr_bs,), t_val, device=self.device)
+
                 with torch.autocast(device_type="cuda", dtype=self.autocast_dtype):
                     v_pred = wrapper(z_curr, t_tensor)
 
-                z_next, log_p, _, _ = sde_step_with_logprob(
+                in_window = l_win <= step_idx < r_win
+                cur_noise = self.noise_level if in_window else 0.0
+
+                z_next, log_p, _, _ = step_fn(
                     sample=z_curr,
                     model_output=v_pred,
                     t=t_tensor,
                     dt=self.dt,
-                    noise_level=self.noise_level,
+                    noise_level=cur_noise,
                 )
 
-                chunk_lats.append(z_curr.cpu())
-                chunk_next_lats.append(z_next.cpu())
-                chunk_log_probs.append(log_p.cpu())
-                chunk_ts.append(t_tensor.cpu())
-                z_curr = z_next
+                if in_window:
+                    chunk_lats.append(z_curr.cpu())
+                    chunk_next_lats.append(z_next.cpu())
+                    chunk_lps.append(log_p.cpu())
+                    chunk_ts.append(t_tensor.cpu())
+
                 z_curr = z_next
 
             final_latents_cpu.append(z_curr.cpu())
 
             all_latents.append(torch.stack(chunk_lats, dim=1))
             all_next_latents.append(torch.stack(chunk_next_lats, dim=1))
-            all_log_probs.append(torch.stack(chunk_log_probs, dim=1))
+            all_log_probs.append(torch.stack(chunk_lps, dim=1))
             all_timesteps.append(torch.stack(chunk_ts, dim=1))
             all_enc_states.append(enc_states.cpu())
             all_attn_masks.append(attn_mask.cpu())
@@ -478,33 +596,42 @@ class RLTrainer(Trainer):
         meta = [{"tag_weights": {}} for _ in expanded_prompts]
 
         rewards_dict, _ = self.reward_fn(images, expanded_prompts, meta)
-        print(rewards_dict)
-
         raw_rewards = torch.as_tensor(rewards_dict["avg"], dtype=torch.float32)
 
-        # Compute group-relative normalized advantages
+        raw_rewards_np = raw_rewards.cpu().numpy()
+        zero_std_ratio, mean_reward_std, zero_prompts = calculate_zero_std_ratio(
+            expanded_prompts, raw_rewards_np
+        )
+
+        if zero_prompts and self.global_rank == 0:
+            logging.info(
+                f"[RL] Zero reward std detected on {len(zero_prompts)} "
+                f"prompts: {zero_prompts[:2]}"
+            )
+        # Prompt-grouped advantage normalization
         advantages = torch.zeros_like(raw_rewards)
         for i in range(len(prompts)):
-            s_idx = i * self.group_num_samples
-            e_idx = s_idx + self.group_num_samples
-            grp = raw_rewards[s_idx:e_idx]
-            advantages[s_idx:e_idx] = (grp - grp.mean()) / (grp.std() + 1e-4)
+            s_i = i * self.group_num_samples
+            e_i = s_i + self.group_num_samples
+            grp = raw_rewards[s_i:e_i]
+            std = grp.std()
+            advantages[s_i:e_i] = (grp - grp.mean()) / (std + 1e-4)
 
         adv_matrix = advantages.unsqueeze(1).repeat(1, self.num_train_timesteps)
         torch.cuda.empty_cache()
 
         return {
-            "latents": torch.cat(all_latents, dim=0)[:, : self.num_train_timesteps],
-            "next_latents": torch.cat(all_next_latents, dim=0)[
-                :, : self.num_train_timesteps
-            ],
-            "log_probs": torch.cat(all_log_probs, dim=0)[:, : self.num_train_timesteps],
-            "timesteps": torch.cat(all_timesteps, dim=0)[:, : self.num_train_timesteps],
+            "latents": torch.cat(all_latents, dim=0),
+            "next_latents": torch.cat(all_next_latents, dim=0),
+            "log_probs": torch.cat(all_log_probs, dim=0),
+            "timesteps": torch.cat(all_timesteps, dim=0),
             "advantages": adv_matrix,
             "encoder_hidden_states": torch.cat(all_enc_states, dim=0),
             "attention_mask": torch.cat(all_attn_masks, dim=0),
             "pos_map": torch.cat(all_pos_maps, dim=0),
             "rewards": raw_rewards,
+            "zero_std_ratio": zero_std_ratio,
+            "mean_reward_std": mean_reward_std,
             "preview_images": images[: min(4, len(images))],
             "preview_prompts": expanded_prompts[: min(4, len(images))],
         }
@@ -555,9 +682,7 @@ class RLTrainer(Trainer):
         return metrics
 
     def fit(self, timestamp: Optional[str] = None):
-        """
-        Main Flow-GRPO outer optimization loop.
-        """
+        """Main Flow-GRPO outer optimization loop."""
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -586,173 +711,210 @@ class RLTrainer(Trainer):
 
         if is_wandb_initialized():
             wandb.define_metric("epoch")
-            wandb.define_metric("global_step")
-            wandb.define_metric("train/*", step_metric="global_step")
-            wandb.define_metric("eval/*", step_metric="global_step")
+            wandb.define_metric("train/iteration")
+            wandb.define_metric("train/image_log_step")
+            wandb.define_metric("epoch_samples/*", step_metric="train/image_log_step")
 
-        for epoch in range(self.start_epoch, self.cfg.train.epochs):
-            if self.global_rank == 0:
-                logging.info(
-                    f"--- Epoch {epoch + 1}/{self.cfg.train.epochs}: "
-                    f"Generating Rollouts ---"
-                )
+        dataset_len = getattr(self.dataloader.dataset, "total_samples", 20000)
+        total_epochs = getattr(self.cfg.train, "epochs", 300)
+        prompts_seen = 0
 
-            rollout_data = self.rollout_sampling(epoch)
+        with ThreadPoolExecutor(max_workers=1) as io_executor:
+            for epoch in range(self.start_epoch, total_epochs):
+                iteration = epoch - self.start_epoch + 1
+                prompts_seen += self.rollout_num_prompts
+                prompt_epoch_float = prompts_seen / max(1, dataset_len)
+                l_win, r_win = self._get_active_window(iteration)
 
-            if self.global_rank == 0 and is_wandb_initialized():
-                rollout_log = {
-                    "train/rollout_mean_reward": (
-                        rollout_data["rewards"].mean().item()
-                    ),
-                    "epoch": epoch + 1,
-                }
-                # Log rollout preview images to WandB every epoch
-                if "preview_images" in rollout_data:
-                    preview_wandb = [
-                        wandb.Image(
-                            img.permute(1, 2, 0).numpy(),
-                            caption=f"Epoch {epoch + 1}: {p[:100]}",
-                        )
-                        for img, p in zip(
-                            rollout_data["preview_images"],
-                            rollout_data["preview_prompts"],
-                        )
-                    ]
-                    rollout_log["train/rollout_previews"] = preview_wandb
-
-                log_metrics(rollout_log, step=self.global_step, commit=True)
-
-            # Policy training over collected trajectories
-            self.unet.train()
-            if self.train_te:
-                self.text_encoder.train()
-
-            total_samples = rollout_data["latents"].shape[0]
-
-            for inner in range(self.num_inner_epochs):
-                perm = torch.randperm(total_samples, device=self.device)
-                shuffled = {
-                    k: v[perm]
-                    for k, v in rollout_data.items()
-                    if isinstance(v, torch.Tensor)
-                }
-
-                batch_slices = list(range(0, total_samples, self.train_batch_size))
-                accum_steps = self.cfg.train.gradient_accumulation_steps
-
-                pbar = tqdm(
-                    batch_slices,
-                    desc=f"Epoch {epoch + 1}.{inner + 1} Training",
-                    disable=self.global_rank != 0,
-                    leave=False,
-                    dynamic_ncols=True,
-                )
-
-                self.optimizer.zero_grad(set_to_none=True)
-
-                for idx, b_idx in enumerate(pbar):
-                    b_slice = {
-                        k: v[b_idx : b_idx + self.train_batch_size]
-                        for k, v in shuffled.items()
-                    }
-                    is_accum_step = (idx + 1) % accum_steps == 0 or (idx + 1) == len(
-                        batch_slices
+                if self.global_rank == 0:
+                    logging.info(
+                        f"--- Epoch {epoch + 1}/{total_epochs} "
+                        f"[Coverage: {prompt_epoch_float:.3f} | "
+                        f"Window: [{l_win}:{r_win})] ---"
                     )
 
-                    for j in range(self.num_train_timesteps):
-                        sync_context = (
-                            self.unet.no_sync()
-                            if self.is_ddp
-                            and not (
-                                is_accum_step and j == self.num_train_timesteps - 1
+                rollout_data = self.rollout_sampling(iteration)
+
+                preview_images = rollout_data.pop("preview_images", None)
+                preview_prompts = rollout_data.pop("preview_prompts", None)
+                zero_std_ratio = rollout_data.pop("zero_std_ratio", 0.0)
+                mean_reward_std = rollout_data.pop("mean_reward_std", 0.0)
+
+                if (
+                    self.global_rank == 0
+                    and is_wandb_initialized()
+                    and iteration % self.rollout_log_interval == 0
+                ):
+                    rollout_log = {
+                        "train/rollout_mean_reward": (
+                            rollout_data["rewards"].mean().item()
+                        ),
+                        "train/zero_std_ratio": zero_std_ratio,
+                        "train/reward_std_mean": mean_reward_std,
+                        "epoch": epoch + 1,
+                    }
+                    if preview_images is not None and preview_prompts is not None:
+                        preview_wandb = [
+                            wandb.Image(
+                                img.float().permute(1, 2, 0).numpy(),
+                                caption=f"Epoch {epoch + 1}: {p[:100]}",
                             )
-                            else contextlib.nullcontext()
-                        )
-                        with sync_context:
-                            step_metrics = self.train_step(b_slice, j)
+                            for img, p in zip(preview_images, preview_prompts)
+                        ]
+                        rollout_log["train/rollout_previews"] = preview_wandb
 
-                    if is_accum_step:
-                        if self.scaler:
-                            self.scaler.unscale_(self.optimizer)
-                            norm = torch.nn.utils.clip_grad_norm_(
-                                self.unet.parameters(), self.clip_norm
+                    log_metrics(rollout_log, step=self.global_step, commit=False)
+
+                self.unet.train()
+                if self.train_te:
+                    self.text_encoder.train()
+
+                total_samples = rollout_data["latents"].shape[0]
+
+                for inner in range(self.num_inner_epochs):
+                    perm = torch.randperm(total_samples, device="cpu")
+                    shuffled = {
+                        k: v[perm]
+                        for k, v in rollout_data.items()
+                        if isinstance(v, torch.Tensor) and v.shape[0] == total_samples
+                    }
+
+                    batch_slices = list(range(0, total_samples, self.train_batch_size))
+                    accum_steps = self.cfg.train.gradient_accumulation_steps
+
+                    pbar = tqdm(
+                        batch_slices,
+                        desc=f"Epoch {epoch + 1}.{inner + 1} Training",
+                        disable=self.global_rank != 0,
+                        leave=False,
+                        dynamic_ncols=True,
+                    )
+
+                    self.optimizer.zero_grad(set_to_none=True)
+
+                    for idx, b_idx in enumerate(pbar):
+                        b_slice = {
+                            k: v[b_idx : b_idx + self.train_batch_size]
+                            for k, v in shuffled.items()
+                        }
+                        is_accum_step = (idx + 1) % accum_steps == 0 or (
+                            idx + 1
+                        ) == len(batch_slices)
+
+                        for j in range(self.num_train_timesteps):
+                            sync_context = (
+                                self.unet.no_sync()
+                                if self.is_ddp
+                                and not (
+                                    is_accum_step and j == self.num_train_timesteps - 1
+                                )
+                                else contextlib.nullcontext()
                             )
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                        else:
-                            norm = torch.nn.utils.clip_grad_norm_(
-                                self.unet.parameters(), self.clip_norm
-                            )
-                            self.optimizer.step()
+                            with sync_context:
+                                step_metrics = self.train_step(b_slice, j)
 
-                        self.optimizer.zero_grad(set_to_none=True)
-                        if self.lr_scheduler:
-                            self.lr_scheduler.step()
-                        if self.ema:
-                            base = self.unet.module if self.is_ddp else self.unet
-                            self.ema.update(base)
+                        if is_accum_step:
+                            if self.scaler:
+                                self.scaler.unscale_(self.optimizer)
+                                norm = torch.nn.utils.clip_grad_norm_(
+                                    self.unet.parameters(), self.clip_norm
+                                )
+                                self.scaler.step(self.optimizer)
+                                self.scaler.update()
+                            else:
+                                norm = torch.nn.utils.clip_grad_norm_(
+                                    self.unet.parameters(), self.clip_norm
+                                )
+                                self.optimizer.step()
 
-                        self.global_step += 1
+                            self.optimizer.zero_grad(set_to_none=True)
+                            if self.lr_scheduler:
+                                self.lr_scheduler.step()
+                            if self.ema:
+                                base = self.unet.module if self.is_ddp else self.unet
+                                self.ema.update(base)
 
-                        if self.global_rank == 0:
-                            pbar.set_postfix(
-                                {
-                                    "step": f"{self.global_step}",
-                                    "loss": f"{step_metrics['loss']:.4f}",
-                                    "kl": f"{step_metrics['kl_loss']:.4f}",
-                                    "norm": f"{norm:.3f}",
-                                }
-                            )
+                            # Increment global_step after optimizer step
+                            self.global_step += 1
 
-                        if is_wandb_initialized():
-                            log_payload = {
-                                "train/loss": step_metrics["loss"].item(),
-                                "train/policy_loss": step_metrics["policy_loss"].item(),
-                                "train/kl_loss": step_metrics["kl_loss"].item(),
-                                "train/approx_kl": step_metrics["approx_kl"].item(),
-                                "train/clipfrac": step_metrics["clipfrac"].item(),
-                                "train/ratio_mean": step_metrics["ratio_mean"].item(),
-                                "train/adv_mean": step_metrics["adv_mean"].item(),
-                                "train/grad_norm": (
-                                    norm.item()
-                                    if isinstance(norm, torch.Tensor)
-                                    else float(norm)
-                                ),
-                                "learning_rate": (self.optimizer.param_groups[0]["lr"]),
-                            }
-                            log_metrics(
-                                log_payload,
-                                step=self.global_step,
-                                commit=True,
-                            )
+                            if self.global_rank == 0:
+                                pbar.set_postfix(
+                                    {
+                                        "step": f"{self.global_step}",
+                                        "loss": f"{step_metrics['loss']:.4f}",
+                                        "kl": f"{step_metrics['kl_loss']:.4f}",
+                                        "norm": f"{norm:.3f}",
+                                    }
+                                )
 
-                        if (
-                            self.sample_configs
-                            and self.global_step % self.sample_interval == 0
-                        ):
-                            self.sample_and_evaluate(epoch, self.global_step)
+                                if is_wandb_initialized():
+                                    log_payload = {
+                                        "train/loss": (step_metrics["loss"].item()),
+                                        "train/policy_loss": (
+                                            step_metrics["policy_loss"].item()
+                                        ),
+                                        "train/kl_loss": (
+                                            step_metrics["kl_loss"].item()
+                                        ),
+                                        "train/approx_kl": (
+                                            step_metrics["approx_kl"].item()
+                                        ),
+                                        "train/clipfrac": (
+                                            step_metrics["clipfrac"].item()
+                                        ),
+                                        "train/ratio_mean": (
+                                            step_metrics["ratio_mean"].item()
+                                        ),
+                                        "train/adv_mean": (
+                                            step_metrics["adv_mean"].item()
+                                        ),
+                                        "train/grad_norm": (
+                                            norm.item()
+                                            if isinstance(norm, torch.Tensor)
+                                            else float(norm)
+                                        ),
+                                        "train/iteration": iteration,
+                                        "epoch": epoch + 1,
+                                        "learning_rate": (
+                                            self.optimizer.param_groups[0]["lr"]
+                                        ),
+                                    }
+                                    log_metrics(
+                                        log_payload,
+                                        step=self.global_step,
+                                        commit=False,
+                                    )
 
-            if (
-                epoch + 1
-            ) % self.cfg.logging.save_interval == 0 and self.global_rank == 0:
-                u_save = self.unet.module if self.is_ddp else self.unet
-                t_save = (
-                    self.text_encoder.module
-                    if self.is_ddp and self.train_te
-                    else self.text_encoder
-                )
-                save_checkpoint(
-                    epoch=epoch,
-                    step=self.global_step,
-                    unet=u_save,
-                    text_encoder=t_save,
-                    optimizer=self.optimizer,
-                    lr_scheduler=self.lr_scheduler,
-                    train_te=self.train_te,
-                    repo_id=self.cfg.logging.hf_repo,
-                    ema=self.ema,
-                    config=self.cfg,
-                )
+                                if (
+                                    self.sample_configs
+                                    and self.global_step % self.sample_interval == 0
+                                ):
+                                    self.sample_and_evaluate(
+                                        epoch,
+                                        self.global_step,
+                                        io_executor=io_executor,
+                                    )
+
+                save_interval = getattr(self.cfg.logging, "save_iteration_interval", 50)
+                if iteration % save_interval == 0 and self.global_rank == 0:
+                    u_save = self.unet.module if self.is_ddp else self.unet
+                    t_save = (
+                        self.text_encoder.module
+                        if self.is_ddp and self.train_te
+                        else self.text_encoder
+                    )
+                    save_checkpoint(
+                        epoch=epoch + 1,
+                        global_step=self.global_step,
+                        unet=u_save,
+                        text_encoder=t_save,
+                        optimizer=self.optimizer,
+                        scheduler=self.lr_scheduler,
+                        train_te=self.train_te,
+                        hf_repo=self.cfg.logging.hf_repo,
+                        ema=self.ema,
+                        config=self.cfg,
+                    )
 
         if self.global_rank == 0 and is_wandb_initialized():
             wandb.finish()
